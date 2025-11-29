@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import os
 
-# ------------- CONFIG: DB PATH PROMPT -------------
+# ------------- CONFIG: DB PATH & BOT TOKEN PROMPT -------------
 
 DEFAULT_DB_PATH = r"C:\Users\srini\Options_chain_data\oi_data.db"
 
@@ -25,9 +25,14 @@ def ask_db_path():
 
 DB_PATH = ask_db_path()
 
-# ------------- BOT TOKEN -------------
+def ask_bot_token():
+    token = input("Enter your Telegram bot token: ").strip()
+    if not token:
+        print("ERROR: Bot token is required.")
+        raise SystemExit(1)
+    return token
 
-BOT_TOKEN = '***REMOVED_TELEGRAM_TOKEN***'  # ----> use your real token
+BOT_TOKEN = ask_bot_token()
 
 nest_asyncio.apply()
 
@@ -96,14 +101,7 @@ def get_font(fontsize=17):
         return ImageFont.truetype("arial.ttf", fontsize)
 
 
-# ----------- MACRO BLOCK: NIFTY/BANKNIFTY WITH IMAGE -------------------
-
-def format_summary(top3_values, top3_strikes, impacts, avg_impact, label, avg_label):
-    vals = [f"{v:,}({s})" for v, s in zip(top3_values, top3_strikes)]
-    imp_string = ', '.join(vals) if vals else "NA"
-    avg_s = f"{avg_label}: {avg_impact:,}" if avg_impact else f"{avg_label}: NA"
-    return f"{label}: {imp_string}\n{avg_s}"
-
+# ----------- MACRO BLOCK: NIFTY/BANKNIFTY + STOCKS IMAGE -------------------
 
 def render_one_table_image(
     headers, rows, nearest_idx,
@@ -512,7 +510,7 @@ def table_with_summary(
     return "\n".join(lines)
 
 
-# -------- LAYER-4 FROM STO1: UndrlygPric + VOL_RANK + Total_Trading_Volume --------
+# -------- LAYER-4 FROM STO1 --------
 
 def get_top3_from_sto1(symbol):
     symbol_upper = symbol.upper()
@@ -529,7 +527,7 @@ def get_top3_from_sto1(symbol):
     oi_col = "Open_Interest"
     und_col = "UndrlygPric"
     volrank_col = "VOL_RANK"
-    vol_col = "Total_Trading_Volume"  # adjust if different
+    vol_col = "Total_Trading_Volume"
 
     cursor.execute(f"""
         SELECT MIN(FininstrmActlXpryDt)
@@ -978,7 +976,7 @@ async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             strike_val = float(context.args[1])
         except:
-            await update.message.reply_text("Usage: /SR <INDEX> <STRIKE>")
+            await update.message.reply_text("Usage: /SR <INDEX/STOCK> <STRIKE>")
             return
 
         lot_sizes = {'NIFTY': 75, 'BANKNIFTY': 35, 'SENSEX': 20}
@@ -997,6 +995,10 @@ async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pe_top3idx_cg, pe_top3_impacts_cg, pe_top3_strikes_cg,
             pe_top3_impact_chgoi, pe_avg_impact_cg
         ) = prepare_table_data_for_plot(symbol, lot_size, strike_val)
+
+        if not ce_rows and not pe_rows:
+            await update.message.reply_text("No option chain data found for this symbol/strike.")
+            return
 
         render_both_tables_stacked(
             headers,
@@ -1040,10 +1042,9 @@ async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update
         )
 
-        log_line(f"USER {user_id} CMD {raw_command} -> INDEX MODE symbol={symbol}, strike={strike_val}")
-        log_line(f"INDEX TEXT CE:\n{ce_text}")
-        log_line(f"INDEX TEXT PE:\n{pe_text}")
-
+        log_line(f"USER {user_id} CMD {raw_command} -> STRIKE MODE symbol={symbol}, strike={strike_val}")
+        log_line(f"TEXT CE:\n{ce_text}")
+        log_line(f"TEXT PE:\n{pe_text}")
         return
 
     elif len(context.args) == 1:
@@ -1081,9 +1082,8 @@ async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         log_line(f"USER {user_id} CMD {raw_command} -> STOCK MODE ticker={ticker}")
         log_line("STOCK TEXT:\n" + reply)
-
     else:
-        await update.message.reply_text("Use /SR <TICKER> or /SR NIFTY <STRIKE>")
+        await update.message.reply_text("Use /SR <TICKER> or /SR <SYMBOL> <STRIKE>")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1092,24 +1092,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "Available commands and inputs:\n\n"
+        "Available commands:\n\n"
         "/start\n"
         "  - Check that the bot is running.\n\n"
         "/help\n"
         "  - Show this help message.\n\n"
-        "/SR <INDEX> <STRIKE>\n"
-        "  - Example: /SR NIFTY 26500\n"
-        "  - Response: index options image and text tables around that strike.\n\n"
+        "/SR <INDEX/STOCK> <STRIKE>\n"
+        "  - Example: /SR NIFTY 26500 or /SR WIPRO 320\n"
+        "  - Response: options image and text tables around that strike.\n\n"
         "/SR <STOCK>\n"
         "  - Example: /SR INFY\n"
         "  - Response:\n"
         "    • LAYER-1: PCR2 S/R & OHLC.\n"
         "    • LAYER-2: CMS_Analysis price/volume/PCR.\n"
         "    • LAYER-3: Pivot/CPR.\n"
-        "    • LAYER-4: Options snapshot from STO1 using UndrlygPric, VOL_RANK, and total volume.\n\n"
-        "/SR <STOCK> <STRIKE>\n"
-        "  - Example: /SR INFY 1500\n"
-        "  - Response: options image/text around that strike using STO1."
+        "    • LAYER-4: Options snapshot from STO1."
     )
     await update.message.reply_text(text)
 
