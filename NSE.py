@@ -7,14 +7,53 @@ import plotly.graph_objects as go
 from datetime import datetime
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+import os
 
-DB_PATH = r'C:\Users\srini\Options_chain_data\oi_data.db'
+# ------------- CONFIG: DB PATH PROMPT -------------
+
+DEFAULT_DB_PATH = r"C:\Users\srini\Options_chain_data\oi_data.db"
+
+def ask_db_path():
+    print("Enter full path to oi_data.db (press Enter to use default):")
+    print(f"Default: {DEFAULT_DB_PATH}")
+    user_in = input("DB path: ").strip()
+    path = user_in if user_in else DEFAULT_DB_PATH
+    if not os.path.isfile(path):
+        print(f"WARNING: File not found at: {path}")
+        print("The bot will still start, but DB queries may fail.")
+    return path
+
+DB_PATH = ask_db_path()
+
+# ------------- BOT TOKEN -------------
+
 BOT_TOKEN = '8018716820:AAEMAtRy6D0B0xt7SJgJB-bj7VF07ld4aVA'  # ----> use your real token
 
 nest_asyncio.apply()
 
 MAX_LEN = 3700
 MAX_COL_WIDTH = 18
+
+# ------------- LOGGING UTILS -------------
+
+LOG_DIR = "logs"
+
+def ensure_log_dir():
+    if not os.path.isdir(LOG_DIR):
+        os.makedirs(LOG_DIR, exist_ok=True)
+
+def get_log_path():
+    ensure_log_dir()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pid = os.getpid()
+    return os.path.join(LOG_DIR, f"bot_log_{stamp}_pid{pid}.txt")
+
+LOG_PATH = get_log_path()
+
+def log_line(text: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"[{ts}] {text}\n")
 
 
 async def send_in_blocks(text, update):
@@ -140,7 +179,6 @@ def render_one_table_image(
     sumf = get_font(18)
     bigf = get_font(36)
 
-    # OpenInt summary
     draw.text((38, summary_y), "Top 3 MONEYOI:", font=sumf, fill='#1543b0')
     draw.text(
         (56, summary_y + 32),
@@ -153,7 +191,6 @@ def render_one_table_image(
         font=bigf, fill='#1749e3'
     )
 
-    # ChgOI summary
     draw.text((38, summary_y + 135), "Top 3 MONEYCOI:", font=sumf, fill='#2451aa')
     draw.text(
         (56, summary_y + 167),
@@ -223,7 +260,6 @@ def prepare_table_data_for_plot(symbol, lot_size, target_strike):
     symbol_upper = symbol.upper()
 
     if symbol_upper in index_tables:
-        # INDEX: use original <symbol>fo logic
         table_name = index_tables[symbol_upper]
 
         cursor.execute(f"""
@@ -261,7 +297,6 @@ def prepare_table_data_for_plot(symbol, lot_size, target_strike):
         cursor.execute(query, [symbol_upper] + strikes_sel)
 
     else:
-        # STOCK: use STO1
         table_name = "STO1"
         symbol_col = "Symbol"
         opttype_col = "Option_Type"
@@ -364,7 +399,6 @@ def prepare_table_data_for_plot(symbol, lot_size, target_strike):
         filtered_sorted = sorted(filtered, key=lambda r: float(r[1]), reverse=sort_desc)
 
         data_rows, nearest_idx = [], []
-
         openint_list = []
         chgoi_list = []
 
@@ -476,6 +510,184 @@ def table_with_summary(
 
     lines += ["", s_oi, s_oi_avg, "", s_cg, s_cg_avg]
     return "\n".join(lines)
+
+
+# -------- LAYER-4 FROM STO1: UndrlygPric + VOL_RANK + Total_Trading_Volume --------
+
+def get_top3_from_sto1(symbol):
+    symbol_upper = symbol.upper()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    table_name = "STO1"
+    symbol_col = "Symbol"
+    opttype_col = "Option_Type"
+    date_col = "Trade_Date"
+    strike_col = "StrkPric"
+    close_col = "ClsPric"
+    chg_oi_col = "Change_in_OI"
+    oi_col = "Open_Interest"
+    und_col = "UndrlygPric"
+    volrank_col = "VOL_RANK"
+    vol_col = "Total_Trading_Volume"  # adjust if different
+
+    cursor.execute(f"""
+        SELECT MIN(FininstrmActlXpryDt)
+        FROM {table_name}
+        WHERE {symbol_col} = ?
+          AND FininstrmActlXpryDt IS NOT NULL
+    """, (symbol_upper,))
+    exp_row = cursor.fetchone()
+    nearest_exp = exp_row[0] if exp_row and exp_row[0] is not None else None
+    if not nearest_exp:
+        conn.close()
+        return "", "No expiry found in STO1 for this symbol."
+
+    cursor.execute(f"""
+        SELECT MAX({date_col})
+        FROM {table_name}
+        WHERE {symbol_col} = ?
+          AND FininstrmActlXpryDt = ?
+    """, (symbol_upper, nearest_exp))
+    dt_row = cursor.fetchone()
+    latest_dt = dt_row[0] if dt_row and dt_row[0] is not None else None
+    if not latest_dt:
+        conn.close()
+        return "", "No trade date found in STO1 for this expiry."
+
+    cursor.execute(f"""
+        SELECT {opttype_col}, {strike_col}, {close_col}, {chg_oi_col}, {oi_col},
+               {und_col}, {volrank_col}, {vol_col}
+        FROM {table_name}
+        WHERE {symbol_col} = ?
+          AND FininstrmActlXpryDt = ?
+          AND {date_col} = ?
+          AND {strike_col} IS NOT NULL
+        ORDER BY {strike_col}, {opttype_col}
+    """, (symbol_upper, nearest_exp, latest_dt))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return "", "No STO1 rows found for this symbol/expiry/date."
+
+    und_values = [float(r[5]) for r in rows if r[5] is not None and float(r[5]) > 0]
+    if not und_values:
+        return "", "No UndrlygPric values in STO1 to use as underlying."
+
+    underlying = und_values[0]
+    low = underlying * 0.9
+    high = underlying * 1.1
+
+    ce_rows_band = []
+    pe_rows_band = []
+
+    for opttype, strike, close, chg_oi, oi_val, und_val, vol_rank, total_vol in rows:
+        if strike is None:
+            continue
+        strike_f = float(strike)
+        close_val = float(close) if close is not None else 0.0
+        chg_oi_val = int_clean(chg_oi)
+        oi_clean = int_clean(oi_val)
+        moneycoi = chg_oi_val * close_val
+        moneyoi = oi_clean * close_val
+        vr = int_clean(vol_rank)
+        tot_vol = int_clean(total_vol)
+
+        if not (low <= strike_f <= high):
+            continue
+
+        data = (strike_f, close_val, chg_oi_val, oi_clean, moneycoi, moneyoi, vr, tot_vol)
+        if opttype == "CE":
+            ce_rows_band.append(data)
+        elif opttype == "PE":
+            pe_rows_band.append(data)
+
+    ce_rows = ce_rows_band[:]
+    pe_rows = pe_rows_band[:]
+
+    if ce_rows or pe_rows:
+        ce_rows = sorted(ce_rows, key=lambda x: x[6])[:3] if ce_rows else []
+        pe_rows = sorted(pe_rows, key=lambda x: x[6])[:3] if pe_rows else []
+        reason = ""
+    else:
+        all_ce = []
+        all_pe = []
+        for opttype, strike, close, chg_oi, oi_val, und_val, vol_rank, total_vol in rows:
+            if strike is None:
+                continue
+            strike_f = float(strike)
+            close_val = float(close) if close is not None else 0.0
+            chg_oi_val = int_clean(chg_oi)
+            oi_clean = int_clean(oi_val)
+            moneycoi = chg_oi_val * close_val
+            moneyoi = oi_clean * close_val
+            vr = int_clean(vol_rank)
+            tot_vol = int_clean(total_vol)
+            data = (strike_f, close_val, chg_oi_val, oi_clean, moneycoi, moneyoi, vr, tot_vol)
+            if opttype == "CE":
+                all_ce.append(data)
+            elif opttype == "PE":
+                all_pe.append(data)
+
+        def closest_above_below(data_list):
+            if not data_list:
+                return []
+            below = [d for d in data_list if d[0] <= underlying]
+            above = [d for d in data_list if d[0] > underlying]
+            chosen = []
+            if below:
+                chosen.append(max(below, key=lambda x: x[0]))
+            if above:
+                chosen.append(min(above, key=lambda x: x[0]))
+            return chosen
+
+        ce_rows = closest_above_below(all_ce)
+        pe_rows = closest_above_below(all_pe)
+        ce_rows = sorted(ce_rows, key=lambda x: x[6])[:3]
+        pe_rows = sorted(pe_rows, key=lambda x: x[6])[:3]
+        reason = "Used closest strikes above/below underlying (no rows in ±10% band)."
+
+    if not ce_rows and not pe_rows:
+        return "", "No CE/PE rows found even for closest strikes."
+
+    expiry_str = nearest_exp
+
+    def format_table(title, data_rows):
+        if not data_rows:
+            return title + "\n(No data)\n"
+        headers = ["Strike", "Close", "ChgOI", "OpenInt", "MONEYCOI", "MONEYOI", "VOL_RANK", "TotVol"]
+        str_rows = [
+            [
+                str(int(round(r[0]))),
+                f"{r[1]:.1f}",
+                str(r[2]),
+                str(r[3]),
+                int_comma(r[4]),
+                int_comma(r[5]),
+                str(r[6]),
+                int_comma(r[7])
+            ]
+            for r in data_rows
+        ]
+        col_widths = [
+            max(len(headers[i]), max(len(row[i]) for row in str_rows))
+            for i in range(len(headers))
+        ]
+        header_line = " | ".join(headers[i].ljust(col_widths[i]) for i in range(len(headers)))
+        lines = [header_line]
+        for row in str_rows:
+            line = " | ".join(row[i].ljust(col_widths[i]) for i in range(len(headers)))
+            lines.append(line)
+        return title + "\n" + "\n".join(lines) + "\n"
+
+    txt_ce = format_table(f"Top CALLS (nearest expiry: {expiry_str})", ce_rows)
+    txt_pe = format_table(f"Top PUTS  (nearest expiry: {expiry_str})", pe_rows)
+
+    if reason:
+        txt_ce = "(Fallback) " + reason + "\n\n" + txt_ce
+
+    return txt_ce + "\n" + txt_pe, ""
 
 
 # ----------- STOCK LAYER ANALYTICS + CHART -----------
@@ -757,7 +969,10 @@ def build_layer1_plotly_chart(rows):
 # ----------- HANDLERS -----------
 
 async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Macro index functionality
+    user = update.effective_user
+    user_id = user.id if user else "unknown"
+    raw_command = update.message.text if update.message else ""
+
     if len(context.args) == 2:
         symbol = context.args[0].upper()
         try:
@@ -800,32 +1015,37 @@ async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_photo(open("both_tables.png", "rb"))
 
+        ce_text = table_with_summary(
+            headers, ce_rows, ce_nearest,
+            ce_top3idx_oi, ce_top3_impacts_oi, ce_top3_strikes_oi,
+            ce_top3_impact_openint, ce_avg_impact_oi,
+            ce_top3idx_cg, ce_top3_impacts_cg, ce_top3_strikes_cg,
+            ce_top3_impact_chgoi, ce_avg_impact_cg
+        )
+        pe_text = table_with_summary(
+            headers, pe_rows, pe_nearest,
+            pe_top3idx_oi, pe_top3_impacts_oi, pe_top3_strikes_oi,
+            pe_top3_impact_openint, pe_avg_impact_oi,
+            pe_top3idx_cg, pe_top3_impacts_cg, pe_top3_strikes_cg,
+            pe_top3_impact_chgoi, pe_avg_impact_cg
+        )
+
         await send_in_blocks(
-            f"{supheading}\n\nCALLS (CE):\n" +
-            table_with_summary(
-                headers, ce_rows, ce_nearest,
-                ce_top3idx_oi, ce_top3_impacts_oi, ce_top3_strikes_oi,
-                ce_top3_impact_openint, ce_avg_impact_oi,
-                ce_top3idx_cg, ce_top3_impacts_cg, ce_top3_strikes_cg,
-                ce_top3_impact_chgoi, ce_avg_impact_cg
-            ),
+            f"{supheading}\n\nCALLS (CE):\n" + ce_text,
             update
         )
 
         await send_in_blocks(
-            f"{supheading}\n\nPUTS (PE):\n" +
-            table_with_summary(
-                headers, pe_rows, pe_nearest,
-                pe_top3idx_oi, pe_top3_impacts_oi, pe_top3_strikes_oi,
-                pe_top3_impact_openint, pe_avg_impact_oi,
-                pe_top3idx_cg, pe_top3_impacts_cg, pe_top3_strikes_cg,
-                pe_top3_impact_chgoi, pe_avg_impact_cg
-            ),
+            f"{supheading}\n\nPUTS (PE):\n" + pe_text,
             update
         )
+
+        log_line(f"USER {user_id} CMD {raw_command} -> INDEX MODE symbol={symbol}, strike={strike_val}")
+        log_line(f"INDEX TEXT CE:\n{ce_text}")
+        log_line(f"INDEX TEXT PE:\n{pe_text}")
+
         return
 
-    # Individual stock logic
     elif len(context.args) == 1:
         ticker = context.args[0].upper()
         layer1_rows = fetch_layer1_rows(ticker)
@@ -844,12 +1064,24 @@ async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_parts.append(layer2)
         message_parts.append(format_layer3(pivots, date_str))
 
+        top3_text, l4_debug = get_top3_from_sto1(ticker)
+        if top3_text:
+            message_parts.append("——————— LAYER-4 (Options Snapshot) ———————\n" + top3_text)
+        else:
+            if l4_debug:
+                message_parts.append("——————— LAYER-4 (Options Snapshot) ———————\n" +
+                                     f"(No data for Layer-4: {l4_debug})")
+
         reply = "\n\n".join(message_parts)
         await send_in_blocks(reply, update)
 
         chart_file = build_layer1_plotly_chart(layer1_rows)
         await update.message.reply_photo(open(chart_file, "rb"),
                                          caption=f"{ticker} Support/Resist & OHLC")
+
+        log_line(f"USER {user_id} CMD {raw_command} -> STOCK MODE ticker={ticker}")
+        log_line("STOCK TEXT:\n" + reply)
+
     else:
         await update.message.reply_text("Use /SR <TICKER> or /SR NIFTY <STRIKE>")
 
@@ -858,10 +1090,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot is running and responding!")
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Available commands and inputs:\n\n"
+        "/start\n"
+        "  - Check that the bot is running.\n\n"
+        "/help\n"
+        "  - Show this help message.\n\n"
+        "/SR <INDEX> <STRIKE>\n"
+        "  - Example: /SR NIFTY 26500\n"
+        "  - Response: index options image and text tables around that strike.\n\n"
+        "/SR <STOCK>\n"
+        "  - Example: /SR INFY\n"
+        "  - Response:\n"
+        "    • LAYER-1: PCR2 S/R & OHLC.\n"
+        "    • LAYER-2: CMS_Analysis price/volume/PCR.\n"
+        "    • LAYER-3: Pivot/CPR.\n"
+        "    • LAYER-4: Options snapshot from STO1 using UndrlygPric, VOL_RANK, and total volume.\n\n"
+        "/SR <STOCK> <STRIKE>\n"
+        "  - Example: /SR INFY 1500\n"
+        "  - Response: options image/text around that strike using STO1."
+    )
+    await update.message.reply_text(text)
+
+
 async def main():
     print("Bot is running and responding!")
+    print(f"Using DB_PATH: {DB_PATH}")
+    print(f"Logging to: {LOG_PATH}")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("sr", sr_command))
     await app.run_polling()
 
