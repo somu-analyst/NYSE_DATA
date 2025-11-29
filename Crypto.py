@@ -1,12 +1,15 @@
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
+
 
 # Deribit public HTTP API base
 BASE_URL = "https://www.deribit.com/api/v2"
 
+
 # Edit this list any time to add/remove underlyings Deribit supports
 CRYPTO_UNDERLYINGS = ["BTC", "ETH"]
+
 
 
 def deribit_get(path, params=None):
@@ -16,24 +19,32 @@ def deribit_get(path, params=None):
     """
     url = f"{BASE_URL}{path}"
     resp = requests.get(url, params=params or {}, timeout=10)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError:
+        print("Status:", resp.status_code)
+        print("URL:", resp.url)
+        print("Body:", resp.text)
+        raise
     data = resp.json()
     if "result" not in data:
         raise RuntimeError(f"Unexpected response: {data}")
     return data["result"]
 
 
+
 def fetch_deribit_instruments(underlying):
     """
     Get all active option instruments for one underlying (e.g. BTC or ETH).
-    Uses base_currency to filter by underlying.
+    Uses currency to filter by underlying, per current Deribit API.
     """
     params = {
         "kind": "option",
-        "base_currency": underlying,
+        "currency": underlying,  # Changed from base_currency
         "expired": False
     }
     return deribit_get("/public/get_instruments", params=params)
+
 
 
 def fetch_deribit_summary(instrument_name):
@@ -47,6 +58,7 @@ def fetch_deribit_summary(instrument_name):
     return result_list[0]
 
 
+
 def parse_instrument_name(name):
     """
     Parse Deribit option instrument name, e.g. BTC-27DEC24-50000-C
@@ -56,10 +68,12 @@ def parse_instrument_name(name):
     if len(parts) < 4:
         return None, None, None, None
 
+
     underlying = parts[0]
     expiry_raw = parts[1]
     strike_raw = parts[2]
     opt_type = parts[3]
+
 
     # Convert expiry DMMMYY -> YYYY-MM-DD if possible
     try:
@@ -68,13 +82,16 @@ def parse_instrument_name(name):
     except Exception:
         expiry_str = expiry_raw
 
+
     try:
         strike_val = float(strike_raw)
     except Exception:
         strike_val = None
 
+
     kind = "C" if opt_type.upper().startswith("C") else "P"
     return underlying, expiry_str, strike_val, kind
+
 
 
 def collect_deribit_options(underlyings=None):
@@ -85,13 +102,16 @@ def collect_deribit_options(underlyings=None):
     if underlyings is None:
         underlyings = CRYPTO_UNDERLYINGS
 
+
     rows = []
-    trade_date = datetime.utcnow().strftime("%Y-%m-%d")
+    trade_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")  # Fixed deprecated utcnow()
+
 
     for cur in underlyings:
         print(f"Fetching instruments for {cur} on Deribit...")
         instruments = fetch_deribit_instruments(cur)
         print(f"  Found {len(instruments)} instruments")
+
 
         for inst in instruments:
             inst_name = inst["instrument_name"]
@@ -99,11 +119,13 @@ def collect_deribit_options(underlyings=None):
             if underlying is None:
                 continue
 
+
             try:
                 summary = fetch_deribit_summary(inst_name)
             except Exception as e:
                 print(f"  Summary error for {inst_name}: {e}")
                 continue
+
 
             row = {
                 "underlying": underlying,
@@ -121,21 +143,23 @@ def collect_deribit_options(underlyings=None):
             }
             rows.append(row)
 
+
     if not rows:
         print("No Deribit options data collected.")
         return pd.DataFrame()
+
 
     df = pd.DataFrame(rows)
     return df
 
 
+
 if __name__ == "__main__":
     df = collect_deribit_options()
     if not df.empty:
-        out_name = f"Crypto_Options_Deribit_{datetime.utcnow().strftime('%d%b%Y')}.csv"
+        out_name = f"Crypto_Options_Deribit_{datetime.now(timezone.utc).strftime('%d%b%Y')}.csv"
         df.to_csv(out_name, index=False)
         print(f"\n✅ Saved Deribit crypto options to {out_name}")
         print(df.head().to_string(index=False))
     else:
         print("\n❌ No data to save")
-
