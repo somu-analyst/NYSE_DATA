@@ -8,19 +8,13 @@ from datetime import datetime
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-
 DB_PATH = r'C:\Users\srini\Options_chain_data\oi_data.db'
-BOT_TOKEN = '***REMOVED_TELEGRAM_TOKEN***'  # <-- paste valid token from BotFather
+BOT_TOKEN = '***REMOVED_TELEGRAM_TOKEN***'  # ----> use your real token
 
 nest_asyncio.apply()
 
 MAX_LEN = 3700
 MAX_COL_WIDTH = 18
-
-# HARD LIMITS TO AVOID Photo_invalid_dimensions
-MAX_IMG_W = 1500
-MAX_IMG_H = 1500
-MAX_ROWS_PER_SIDE = 25  # limit visible rows for CE and PE to keep image height reasonable
 
 
 async def send_in_blocks(text, update):
@@ -63,8 +57,7 @@ def get_font(fontsize=17):
         return ImageFont.truetype("arial.ttf", fontsize)
 
 
-# ----------- MACRO BLOCK: INDEX + STOCKS WITH IMAGE -------------------
-
+# ----------- MACRO BLOCK: NIFTY/BANKNIFTY WITH IMAGE -------------------
 
 def format_summary(top3_values, top3_strikes, impacts, avg_impact, label, avg_label):
     vals = [f"{v:,}({s})" for v, s in zip(top3_values, top3_strikes)]
@@ -79,17 +72,16 @@ def render_one_table_image(
     top3_chgoi, imp_chgoi, strikes_chgoi, impact_chgoi, avg_impact_chgoi,
     heading, filename
 ):
-    rows = rows[:MAX_ROWS_PER_SIDE]
     ncols = len(headers)
     nrows = len(rows)
     font = get_font(13)
 
-    def cell_text_width(text, font_obj):
-        bbox = font_obj.getbbox(str(text))
+    def cell_text_width(text, font):
+        bbox = font.getbbox(str(text))
         return bbox[2] - bbox[0]
 
-    def cell_text_height(font_obj):
-        bbox = font_obj.getbbox("X")
+    def cell_text_height(font):
+        bbox = font.getbbox("X")
         return bbox[3] - bbox[1]
 
     cell_widths = [
@@ -102,11 +94,8 @@ def render_one_table_image(
     summary_h = 280
     table_h = row_h * (nrows + 1)
 
-    img_w = min(MAX_IMG_W, col_sum + 32)
-    img_h = min(MAX_IMG_H, pad_top + table_h + summary_h + 20)
-    img_w = max(300, img_w)
-    img_h = max(300, img_h)
-
+    img_w = min(2100, col_sum + 32)
+    img_h = pad_top + table_h + summary_h + 20
     img = Image.new('RGB', (img_w, img_h), 'white')
     draw = ImageDraw.Draw(img)
 
@@ -116,27 +105,18 @@ def render_one_table_image(
     w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
     draw.text(((img_w - w) // 2, 12), heading, font=hf, fill=blue)
 
-    max_table_height = img_h - pad_top - summary_h - 20
-    max_rows_fit = max(1, min(nrows, max_table_height // row_h))
-    rows_to_draw = rows[:max_rows_fit]
-
     y = pad_top
     for c, h_ in enumerate(headers):
         x = sum(cell_widths[:c]) + 8
-        if x >= img_w:
-            break
-        x2 = min(x + cell_widths[c], img_w - 1)
-        draw.rectangle([x, y, x2, y + row_h], fill='#e6f5ff')
-        draw.rectangle([x, y, x2, y + row_h], outline="black", width=2)
+        draw.rectangle([x, y, x + cell_widths[c], y + row_h], fill='#e6f5ff')
+        draw.rectangle([x, y, x + cell_widths[c], y + row_h], outline="black", width=2)
         draw.text((x + 8, y + 9), str(h_)[:MAX_COL_WIDTH], font=font, fill='black')
     y += row_h
 
-    for r, vals in enumerate(rows_to_draw):
+    for r, vals in enumerate(rows):
         is_nearest = r in nearest_idx
         for c, val in enumerate(vals):
             x = sum(cell_widths[:c]) + 8
-            if x >= img_w:
-                break
             cell_col = '#fff'
             fill = 'black'
             bold = False
@@ -149,18 +129,18 @@ def render_one_table_image(
                 fill = 'red'
                 bold = True
 
-            x2 = min(x + cell_widths[c], img_w - 1)
-            draw.rectangle([x, y, x2, y + row_h], fill=cell_col)
-            draw.rectangle([x, y, x2, y + row_h], outline="black", width=1)
+            draw.rectangle([x, y, x + cell_widths[c], y + row_h], fill=cell_col)
+            draw.rectangle([x, y, x + cell_widths[c], y + row_h], outline="black", width=1)
             vtxt = str(val) if len(str(val)) < MAX_COL_WIDTH else str(val)[:MAX_COL_WIDTH]
             fontrow = get_font(18) if bold or is_nearest else font
             draw.text((x + 8, y + 9), vtxt, font=fontrow, fill=fill)
         y += row_h
 
-    summary_y = min(pad_top + table_h + 17, img_h - 230)
+    summary_y = pad_top + table_h + 17
     sumf = get_font(18)
-    bigf = get_font(28)
+    bigf = get_font(36)
 
+    # OpenInt summary
     draw.text((38, summary_y), "Top 3 MONEYOI:", font=sumf, fill='#1543b0')
     draw.text(
         (56, summary_y + 32),
@@ -173,14 +153,15 @@ def render_one_table_image(
         font=bigf, fill='#1749e3'
     )
 
-    draw.text((38, summary_y + 120), "Top 3 MONEYCOI:", font=sumf, fill='#2451aa')
+    # ChgOI summary
+    draw.text((38, summary_y + 135), "Top 3 MONEYCOI:", font=sumf, fill='#2451aa')
     draw.text(
-        (56, summary_y + 152),
+        (56, summary_y + 167),
         ", ".join([f"{v:,}({s})" for v, s in zip(imp_chgoi, strikes_chgoi)]),
         font=sumf, fill='#2451aa'
     )
     draw.text(
-        (38, summary_y + 188),
+        (38, summary_y + 203),
         f"AVG IMPACT (ChgOI): {avg_impact_chgoi:,}",
         font=bigf, fill='#a10ae3'
     )
@@ -214,10 +195,8 @@ def render_both_tables_stacked(
     img_ce = Image.open("ce_table.png")
     img_pe = Image.open("pe_table.png")
 
-    img_w = min(MAX_IMG_W, max(img_ce.width, img_pe.width))
-    img_h = min(MAX_IMG_H, img_ce.height + img_pe.height + 70)
-    img_w = max(300, img_w)
-    img_h = max(300, img_h)
+    img_w = max(img_ce.width, img_pe.width)
+    img_h = img_ce.height + img_pe.height + 70
 
     combo = Image.new('RGB', (img_w, img_h), 'white')
     draw = ImageDraw.Draw(combo)
@@ -239,32 +218,18 @@ def prepare_table_data_for_plot(symbol, lot_size, target_strike):
     index_tables = {
         "NIFTY": "niftyfo",
         "BANKNIFTY": "bankniftyfo",
-        "FINNIFTY": "finniftyfo",
         "SENSEX": "sensexfo",
     }
-    stock_table = "STO1"
-
     symbol_upper = symbol.upper()
-    is_index = symbol_upper in index_tables
 
-    if is_index:
+    if symbol_upper in index_tables:
+        # INDEX: use original <symbol>fo logic
         table_name = index_tables[symbol_upper]
-        symbol_col = "TckrSymb"
-        opttype_col = "OptnTp"
-        oi_col = "OpnIntrst"
-        chg_oi_col = "ChngInOpnIntrst"
-        date_col = "TradDt"
-        strike_col = "StrkPric"
-        open_col = "OpnPric"
-        high_col = "HghPric"
-        low_col = "LwPric"
-        close_col = "ClsPric"
-        prevclose_col = "PrvsClsgPric"
 
         cursor.execute(f"""
-            SELECT DISTINCT {strike_col}
+            SELECT DISTINCT StrkPric
             FROM {table_name}
-            WHERE {symbol_col} = ? AND {strike_col} IS NOT NULL
+            WHERE TckrSymb = ? AND StrkPric IS NOT NULL
         """, (symbol_upper,))
         strikes = sorted(float(row[0]) for row in cursor.fetchall() if row[0] is not None)
 
@@ -286,21 +251,20 @@ def prepare_table_data_for_plot(symbol, lot_size, target_strike):
 
         phs = ",".join("?" * len(strikes_sel))
         query = f"""
-            SELECT {date_col}, {strike_col}, {opttype_col},
-                   {open_col}, {high_col}, {low_col}, {close_col}, {prevclose_col},
-                   {oi_col}, {chg_oi_col}
+            SELECT TradDt, StrkPric, OptnTp,
+                   OpnPric, HghPric, LwPric, ClsPric, PrvsClsgPric,
+                   OpnIntrst, ChngInOpnIntrst
             FROM {table_name}
-            WHERE {symbol_col} = ? AND {strike_col} IN ({phs})
-            ORDER BY {strike_col} ASC, {opttype_col}
+            WHERE TckrSymb=? AND StrkPric IN ({phs})
+            ORDER BY StrkPric ASC, OptnTp
         """
         cursor.execute(query, [symbol_upper] + strikes_sel)
 
     else:
-        table_name = stock_table
+        # STOCK: use STO1
+        table_name = "STO1"
         symbol_col = "Symbol"
         opttype_col = "Option_Type"
-        oi_col = "Open_Interest"
-        chg_oi_col = "Change_in_OI"
         date_col = "Trade_Date"
         strike_col = "StrkPric"
         open_col = "OpnPric"
@@ -308,6 +272,8 @@ def prepare_table_data_for_plot(symbol, lot_size, target_strike):
         low_col = "LwPric"
         close_col = "ClsPric"
         prevclose_col = "PrvsClsgPric"
+        oi_col = "Open_Interest"
+        chg_oi_col = "Change_in_OI"
 
         cursor.execute(f"""
             SELECT MIN(FininstrmActlXpryDt)
@@ -398,6 +364,7 @@ def prepare_table_data_for_plot(symbol, lot_size, target_strike):
         filtered_sorted = sorted(filtered, key=lambda r: float(r[1]), reverse=sort_desc)
 
         data_rows, nearest_idx = [], []
+
         openint_list = []
         chgoi_list = []
 
@@ -492,7 +459,7 @@ def table_with_summary(
     header_line = " | ".join(headers[i].ljust(show_width[i]) for i in range(len(headers)))
     lines = [header_line]
 
-    for idx, vals in enumerate(rows[:MAX_ROWS_PER_SIDE]):
+    for idx, vals in enumerate(rows):
         pre = "→" if idx in nearest_idx else " "
         line = " | ".join(vals[i].ljust(show_width[i]) for i in range(len(headers)))
         lines.append(pre + line)
@@ -511,22 +478,295 @@ def table_with_summary(
     return "\n".join(lines)
 
 
-async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if len(context.args) != 2:
-            await update.message.reply_text(
-                "Usage: /SR <SYMBOL> <STRIKE>\nExample: /SR NIFTY 26500 or /SR WIPRO 320"
-            )
-            return
+# ----------- STOCK LAYER ANALYTICS + CHART -----------
 
+def fetch_layer1_rows(ticker):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT S1, S12, S2, S22, S3, S32,
+               R1, R12, R2, R22, R3, R32,
+               OpnPric, HghPric, LwPric, ClsPric, TradDt
+        FROM PCR2
+        WHERE UPPER(TckrSymb) = ?
+        ORDER BY TradDt DESC
+        LIMIT 5
+    """, (ticker.upper(),))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def format_layer1_ohlc_from_above(rows):
+    headers = [
+        "Date", "S1", "S12", "S2", "S22", "S3", "S32",
+        "R1", "R12", "R2", "R22", "R3", "R32",
+        "Open", "HIGH", "LOW", "Close"
+    ]
+    table_rows = []
+    for i, row in enumerate(rows):
+        date = datetime.strptime(row[16], '%Y-%m-%d').strftime('%d-%m')
+        rvals = [f"{row[j]:.1f}" if row[j] is not None else "NA" for j in range(12)]
+        if i > 0:
+            prev = rows[i - 1]
+            ohlc = [f"{prev[j]:.1f}" if prev[j] is not None else "NA" for j in range(12, 16)]
+        else:
+            ohlc = ["", "", "", ""]
+        table_rows.append([date] + rvals + ohlc)
+
+    col_widths = [
+        max(len(headers[i]), max(len(r[i]) for r in table_rows))
+        for i in range(len(headers))
+    ]
+    output = " | ".join(headers[i].ljust(col_widths[i]) for i in range(len(headers))) + " |\n"
+    for r in table_rows:
+        output += " | ".join(r[i].ljust(col_widths[i]) for i in range(len(headers))) + " |\n"
+    return output
+
+
+def fetch_layer2_and_prices(ticker):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT TradDt
+        FROM CMS_Analysis
+        WHERE TckrSymb = ?
+        ORDER BY TradDt DESC
+        LIMIT 25
+    """, (ticker,))
+    dates = [r[0] for r in cursor.fetchall()]
+    if len(dates) < 20:
+        conn.close()
+        return None, None, None, None, None
+
+    last5_dates = dates[:5]
+    latest_date = last5_dates[0]
+
+    table_rows = []
+    high, low, close = None, None, None
+
+    for idx, d in enumerate(last5_dates):
+        short_date = d[5:]
+
+        cursor.execute("""
+            SELECT OpnPric, HghPric, LwPric, ClsPric, TtlTradgVol, PERCENT_CHANGE
+            FROM CMS_Analysis
+            WHERE TckrSymb = ? AND TradDt = ?
+            ORDER BY TradDt DESC
+            LIMIT 1
+        """, (ticker, d))
+        row = cursor.fetchone()
+        opn, hgh, lw, cls, vol, chg = row if row else (None,) * 6
+        if idx == 0 and row:
+            high, low, close = hgh, lw, cls
+
+        cursor.execute("""
+            SELECT PCR
+            FROM PCR2
+            WHERE UPPER(TckrSymb) = ? AND TradDt = ?
+            ORDER BY TradDt DESC
+            LIMIT 1
+        """, (ticker.upper(), d))
+        pcr_row = cursor.fetchone()
+        pcr = f"{pcr_row[0]:.2f}" if pcr_row and pcr_row[0] is not None else "NA"
+
+        cursor.execute("""
+            SELECT Open_Interest, Change_in_OI
+            FROM STF1
+            WHERE UPPER(Symbol) = ? AND Trade_Date = ?
+            ORDER BY Trade_Date DESC
+            LIMIT 1
+        """, (ticker.upper(), d))
+        stf_row = cursor.fetchone()
+        foi = "{:,}".format(stf_row[0]) if stf_row and stf_row[0] is not None else "NA"
+        fcoi = str(stf_row[1]) if stf_row and stf_row[1] is not None else "NA"
+
+        previous_10 = dates[idx + 1:idx + 11]
+        previous_20 = dates[idx + 1:idx + 21]
+
+        if len(previous_10) < 10 or len(previous_20) < 20 or vol is None:
+            vol10 = vol20 = "NA"
+        else:
+            cursor.execute(f"""
+                SELECT TtlTradgVol
+                FROM CMS_Analysis
+                WHERE TckrSymb = ? AND TradDt IN ({','.join(['?'] * len(previous_10))})
+            """, (ticker, *previous_10))
+            vols10 = [r[0] for r in cursor.fetchall()]
+            avg10 = sum(vols10) / len(vols10) if vols10 else None
+            vol10 = f"{(vol / avg10):.2f}" if (vol and avg10) else "NA"
+
+            cursor.execute(f"""
+                SELECT TtlTradgVol
+                FROM CMS_Analysis
+                WHERE TckrSymb = ? AND TradDt IN ({','.join(['?'] * len(previous_20))})
+            """, (ticker, *previous_20))
+            vols20 = [r[0] for r in cursor.fetchall()]
+            avg20 = sum(vols20) / len(vols20) if vols20 else None
+            vol20 = f"{(vol / avg20):.2f}" if (vol and avg20) else "NA"
+
+        opn_s = f"{opn:.1f}" if opn is not None else "NA"
+        hgh_s = f"{hgh:.1f}" if hgh is not None else "NA"
+        lw_s = f"{lw:.1f}" if lw is not None else "NA"
+        cls_s = f"{cls:.1f}" if cls is not None else "NA"
+        chg_s = f"{chg:.2f}%" if chg is not None else "NA"
+
+        table_rows.append([
+            short_date, opn_s, hgh_s, lw_s, cls_s,
+            pcr, foi, fcoi, vol10, vol20, chg_s
+        ])
+
+    conn.close()
+
+    headers = [
+        "Dates", "OpnPric", "HghPric", "LwPric", "ClsPric",
+        "PCR", "FOI", "FCOI", "Volume(10d)", "Volume(20d)", "Price %Chg"
+    ]
+    col_widths = [
+        max(len(headers[i]), max(len(str(row[i])) for row in table_rows))
+        for i in range(len(headers))
+    ]
+    header_line = "| " + " | ".join(headers[i].ljust(col_widths[i]) for i in range(len(headers))) + " |"
+    layer2_rows = [header_line]
+    for row in table_rows:
+        row_line = "| " + " | ".join(str(row[i]).ljust(col_widths[i]) for i in range(len(headers))) + " |"
+        layer2_rows.append(row_line)
+
+    layer2_text = (
+        f"——————— LAYER-2 (Latest: {latest_date}) ———————\n" +
+        "\n".join(layer2_rows)
+    )
+    return layer2_text, high, low, close, latest_date
+
+
+def calc_pivot_points(high, low, close):
+    if high is None or low is None or close is None:
+        return None
+
+    P = (high + low + close) / 3
+    R1 = 2 * P - low
+    S1 = 2 * P - high
+    R2 = P + (high - low)
+    S2 = P - (high - low)
+    R3 = high + 2 * (P - low)
+    S3 = low - 2 * (high - P)
+    TC = (P + high) / 2
+    BC = (P + low) / 2
+
+    pivots = {
+        "S3": round(S3, 2),
+        "S2": round(S2, 2),
+        "S1": round(S1, 2),
+        "BC": round(BC, 2),
+        "P": round(P, 2),
+        "TC": round(TC, 2),
+        "R1": round(R1, 2),
+        "R2": round(R2, 2),
+        "R3": round(R3, 2)
+    }
+    return pivots
+
+
+def format_layer3(pivots, date_str=""):
+    if not pivots:
+        return "Pivot points not available for Layer-3.\n"
+
+    headers = ["S3", "S2", "S1", "BC", "P", "TC", "R1", "R2", "R3"]
+    values = [
+        str(pivots["S3"]), str(pivots["S2"]), str(pivots["S1"]),
+        str(pivots["BC"]), str(pivots["P"]), str(pivots["TC"]),
+        str(pivots["R1"]), str(pivots["R2"]), str(pivots["R3"])
+    ]
+    col_widths = [max(len(headers[i]), len(values[i])) for i in range(len(headers))]
+    header_line = "| " + " | ".join(headers[i].ljust(col_widths[i]) for i in range(len(headers))) + " |"
+    value_line = "| " + " | ".join(values[i].ljust(col_widths[i]) for i in range(len(values))) + " |"
+
+    return (
+        f"——————— LAYER-3 (Pivot/CPR from {date_str}) ———————\n" +
+        header_line + "\n" + value_line + "\n"
+    )
+
+
+def build_layer1_plotly_chart(rows):
+    dates = [datetime.strptime(row[16], '%Y-%m-%d').strftime("%dth %b'%y") for row in rows]
+    current_price = rows[0][15]
+
+    def val(idx):
+        return [row[idx] for row in rows]
+
+    S1, S12, S2, S22, S3, S32 = val(0), val(1), val(2), val(3), val(4), val(5)
+    R1, R12, R2, R22, R3, R32 = val(6), val(7), val(8), val(9), val(10), val(11)
+    Open, High, Low, Close = val(12), val(13), val(14), val(15)
+
+    gaps = lambda arr: [x - current_price for x in arr]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=dates, y=gaps(S1), name='S1', marker_color='#2E8B57',
+                         offsetgroup=0, base=current_price, showlegend=True))
+    fig.add_trace(go.Bar(x=dates, y=gaps(R1), name='R1', marker_color='#DB4545',
+                         offsetgroup=0, base=current_price, showlegend=True))
+
+    fig.add_trace(go.Bar(x=dates, y=gaps(S12), name='S12', marker_color='#2E8B57',
+                         offsetgroup=1, base=current_price, showlegend=False))
+    fig.add_trace(go.Bar(x=dates, y=gaps(R12), name='R12', marker_color='#DB4545',
+                         offsetgroup=1, base=current_price, showlegend=False))
+
+    fig.add_trace(go.Bar(x=dates, y=gaps(S2), name='S2', marker_color='#2E8B57',
+                         offsetgroup=2, base=current_price, showlegend=False))
+    fig.add_trace(go.Bar(x=dates, y=gaps(R2), name='R2', marker_color='#DB4545',
+                         offsetgroup=2, base=current_price, showlegend=False))
+
+    fig.add_trace(go.Bar(x=dates, y=gaps(S22), name='S22', marker_color='#2E8B57',
+                         offsetgroup=3, base=current_price, showlegend=False))
+    fig.add_trace(go.Bar(x=dates, y=gaps(R22), name='R22', marker_color='#DB4545',
+                         offsetgroup=3, base=current_price, showlegend=False))
+
+    fig.add_trace(go.Bar(x=dates, y=gaps(S3), name='S3', marker_color='#2E8B57',
+                         offsetgroup=4, base=current_price, showlegend=False))
+    fig.add_trace(go.Bar(x=dates, y=gaps(R3), name='R3', marker_color='#DB4545',
+                         offsetgroup=4, base=current_price, showlegend=False))
+
+    fig.add_trace(go.Bar(x=dates, y=gaps(S32), name='S32', marker_color='#2E8B57',
+                         offsetgroup=5, base=current_price, showlegend=False))
+    fig.add_trace(go.Bar(x=dates, y=gaps(R32), name='R32', marker_color='#DB4545',
+                         offsetgroup=5, base=current_price, showlegend=False))
+
+    fig.add_trace(go.Scatter(x=dates, y=Open, mode='lines', name='Open',
+                             line=dict(color='#1FB8CD', width=2)))
+    fig.add_trace(go.Scatter(x=dates, y=High, mode='lines', name='High',
+                             line=dict(color='#D2BA4C', width=2)))
+    fig.add_trace(go.Scatter(x=dates, y=Low, mode='lines', name='Low',
+                             line=dict(color='#5D878F', width=2)))
+    fig.add_trace(go.Scatter(x=dates, y=Close, mode='lines', name='Close',
+                             line=dict(color='#B4413C', width=2)))
+
+    fig.update_layout(
+        title='Support/Resist & OHLC',
+        xaxis_title='Date',
+        yaxis_title='Price',
+        barmode='group',
+        bargap=0.15,
+        bargroupgap=0.05
+    )
+    fig.update_traces(cliponaxis=False)
+    fig.write_image('chart.png', width=900, height=550)
+    return 'chart.png'
+
+
+# ----------- HANDLERS -----------
+
+async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Macro index functionality
+    if len(context.args) == 2:
         symbol = context.args[0].upper()
         try:
             strike_val = float(context.args[1])
         except:
-            await update.message.reply_text("Strike must be a number. Usage: /SR <SYMBOL> <STRIKE>")
+            await update.message.reply_text("Usage: /SR <INDEX> <STRIKE>")
             return
 
-        lot_sizes = {'NIFTY': 75, 'BANKNIFTY': 35, 'FINNIFTY': 40, 'SENSEX': 20}
+        lot_sizes = {'NIFTY': 75, 'BANKNIFTY': 35, 'SENSEX': 20}
         lot_size = lot_sizes.get(symbol, 1)
 
         supheading = f"{symbol} Nearest Strikes (lot {lot_size}, strike {int(strike_val)})"
@@ -542,10 +782,6 @@ async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pe_top3idx_cg, pe_top3_impacts_cg, pe_top3_strikes_cg,
             pe_top3_impact_chgoi, pe_avg_impact_cg
         ) = prepare_table_data_for_plot(symbol, lot_size, strike_val)
-
-        if not ce_rows and not pe_rows:
-            await update.message.reply_text("No option chain data found for this symbol/strike.")
-            return
 
         render_both_tables_stacked(
             headers,
@@ -587,9 +823,35 @@ async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             update
         )
+        return
 
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+    # Individual stock logic
+    elif len(context.args) == 1:
+        ticker = context.args[0].upper()
+        layer1_rows = fetch_layer1_rows(ticker)
+        if not layer1_rows or len(layer1_rows) < 2:
+            await update.message.reply_text("Not enough Layer-1 data found.")
+            return
+
+        layer1_ohlc_from_above = format_layer1_ohlc_from_above(layer1_rows)
+        layer2, high, low, close, date_str = fetch_layer2_and_prices(ticker)
+        pivots = calc_pivot_points(high, low, close) if (high and low and close) else None
+
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        message_parts = [f"***STOCK - {ticker} Analytics ({now_str})***"]
+        message_parts.append("——————— LAYER-1 ———————\n" + layer1_ohlc_from_above)
+        if layer2:
+            message_parts.append(layer2)
+        message_parts.append(format_layer3(pivots, date_str))
+
+        reply = "\n\n".join(message_parts)
+        await send_in_blocks(reply, update)
+
+        chart_file = build_layer1_plotly_chart(layer1_rows)
+        await update.message.reply_photo(open(chart_file, "rb"),
+                                         caption=f"{ticker} Support/Resist & OHLC")
+    else:
+        await update.message.reply_text("Use /SR <TICKER> or /SR NIFTY <STRIKE>")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
