@@ -9,13 +9,29 @@ from datetime import datetime, timedelta
 import yfinance as yf
 import pytz
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO  # for pd.read_html on HTML string
+import pandas_market_calendars as mcal  # NYSE calendar
+from curl_cffi import requests as curl_requests  # curl_cffi session
+
+# ============= RUNTIME START =============
+SCRIPT_START_TIME = time.time()
 
 # ================== CONFIG ==================
 
 DATA_DIR = r"C:\Users\srini\Options_chain_data"
+UNIVERSE_FILE = os.path.join(DATA_DIR, "ticker_universe.csv")
+LOG_DIR = DATA_DIR
 
-# Include IBIT with ETFs/Indexes
+CATEGORY_SP500     = "sp500"
+CATEGORY_NON_SP500 = "non_s&p"
+CATEGORY_INDEX     = "index"
+CATEGORY_METAL     = "metal"
+CATEGORY_COMMODITY = "commodity"
+CATEGORY_BOND      = "bond"
+CATEGORY_CRYPTO    = "crypto"
+CATEGORY_OTHER     = "other"
+
 INDEX_TICKERS = [
     "QQQ", "SPY", "IWM", "DIA", "IVV", "VOO", "SPLG", "SPYG", "SPYV", "IBIT"
 ]
@@ -23,57 +39,15 @@ INDEX_TICKERS = [
 METALS_TICKERS = ["GLD", "IAU", "SGOL", "PHYS", "SLV", "SIVR", "PSLV", "SIL"]
 COMMODITY_TICKERS = ["USO", "CPER"]
 BOND_TICKERS = ["AGG", "BND", "SCHZ", "FBND", "IUSB", "SPAB", "VTEB"]
-CRYPTO_TICKERS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD", "DOGE-USD", "TRX-USD"]
+CRYPTO_TICKERS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
+                  "XRP-USD", "ADA-USD", "DOGE-USD", "TRX-USD"]
 
-# S&P 500 stocks (partial list shown - use full S&P list as in your original)
-SP500_TICKERS = [
-    "MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A","APD","ABNB","AKAM","ALB","ARE","ALGN","ALLE","LNT","ALL",
-    "GOOGL","GOOG","MO","AMZN","AMCR","AEE","AEP","AXP","AIG","AMT","AWK","AMP","AME","AMGN","APH","ADI","AON","APA","APO","AAPL",
-    "AMAT","APP","APTV","ACGL","ADM","ANET","AJG","AIZ","T","ATO","ADSK","ADP","AZO","AVB","AVY","AXON","BKR","BALL","BAC","BAX",
-    "BDX","BRK.B","BBY","TECH","BIIB","BLK","BX","XYZ","BK","BA","BKNG","BSX","BMY","AVGO","BR","BRO","BF.B","BLDR","BG","BXP",
-    "CHRW","CDNS","CPT","CPB","COF","CAH","KMX","CCL","CARR","CAT","CBOE","CBRE","CDW","COR","CNC","CNP","CF","CRL","SCHW","CHTR",
-    "CVX","CMG","CB","CHD","CI","CINF","CTAS","CSCO","C","CFG","CLX","CME","CMS","KO","CTSH","COIN","CL","CMCSA","CAG","COP","ED",
-    "STZ","CEG","COO","CPRT","GLW","CPAY","CTVA","CSGP","COST","CTRA","CRWD","CCI","CSX","CMI","CVS","DHR","DRI","DDOG","DVA","DAY",
-    "DECK","DE","DELL","DAL","DVN","DXCM","FANG","DLR","DG","DLTR","D","DPZ","DASH","DOV","DOW","DHI","DTE","DUK","DD","EMN","ETN",
-    "EBAY","ECL","EIX","EW","EA","ELV","EME","EMR","ETR","EOG","EPAM","EQT","EFX","EQIX","EQR","ERIE","ESS","EL","EG","EVRG","ES",
-    "EXC","EXE","EXPE","EXPD","EXR","XOM","FFIV","FDS","FICO","FAST","FRT","FDX","FIS","FITB","FSLR","FE","FI","F","FTNT","FTV","FOXA",
-    "FOX","BEN","FCX","GRMN","IT","GE","GEHC","GEV","GEN","GNRC","GD","GIS","GM","GPC","GILD","GPN","GL","GDDY","GS","HAL","HIG",
-    "HAS","HCA","DOC","HSIC","HSY","HPE","HLT","HOLX","HD","HON","HRL","HST","HWM","HPQ","HUBB","HUM","HBAN","HII","IBM","IEX",
-    "IDXX","ITW","INCY","IR","PODD","INTC","IBKR","ICE","IFF","IP","IPG","INTU","ISRG","IVZ","INVH","IQV","IRM","JBHT","JBL","JKHY",
-    "J","JNJ","JCI","JPM","K","KVUE","KDP","KEY","KEYS","KMB","KIM","KMI","KKR","KLAC","KHC","KR","LHX","LH","LRCX","LW","LVS",
-    "LDOS","LEN","LII","LLY","LIN","LYV","LKQ","LMT","L","LOW","LULU","LYB","MTB","MPC","MAR","MMC","MLM","MAS","MA","MTCH","MKC",
-    "MCD","MCK","MDT","MRK","META","MET","MTD","MGM","MCHP","MU","MSFT","MAA","MRNA","MHK","MOH","TAP","MDLZ","MPWR","MNST","MCO",
-    "MS","MOS","MSI","MSCI","NDAQ","NTAP","NFLX","NEM","NWSA","NWS","NEE","NKE","NI","NDSN","NSC","NTRS","NOC","NCLH","NRG","NUE",
-    "NVDA","NVR","NXPI","ORLY","OXY","ODFL","OMC","ON","OKE","ORCL","OTIS","PCAR","PKG","PLTR","PANW","PSKY","PH","PAYX","PAYC",
-    "PYPL","PNR","PEP","PFE","PCG","PM","PSX","PNW","PNC","POOL","PPG","PPL","PFG","PG","PGR","PLD","PRU","PEG","PTC","PSA","PHM",
-    "PWR","QCOM","DGX","RL","RJF","RTX","O","REG","REGN","RF","RSG","RMD","RVTY","HOOD","ROK","ROL","ROP","ROST","RCL","SPGI","CRM",
-    "SBAC","SLB","STX","SRE","NOW","SHW","SPG","SWKS","SJM","SW","SNA","SOLV","SO","LUV","SWK","SBUX","STT","STLD","STE","SYK",
-    "SMCI","SYF","SNPS","SYY","TMUS","TROW","TTWO","TPR","TRGP","TGT","TEL","TDY","TER","TSLA","TXN","TPL","TXT","TMO","TJX","TKO",
-    "TTD","TSCO","TT","TDG","TRV","TRMB","TFC","TYL","TSN","USB","UBER","UDR","ULTA","UNP","UAL","UPS","URI","UNH","UHS","VLO",
-    "VTR","VLTO","VRSN","VRSK","VZ","VRTX","VTRS","VICI","V","VST","VMC","WRB","GWW","WAB","WMT","DIS","WBD","WM","WAT","WEC",
-    "WFC","WELL","WST","WDC","WY","WSM","WMB","WTW","WDAY","WYNN","XEL","XYL","YUM","ZBRA","ZBH","ZTS","IBIT"
-]
+EXTRA_STOCKS = ["SOFI"]
 
-# ========= HELPER: ticker normalization & asset type ==========
+# ========= HELPER: ticker normalization & progress bar ==========
 
 def yf_ticker_fix(ticker):
-    """Convert dot-tickers to yfinance dash format."""
     return ticker.replace('.', '-')
-
-ALL_TICKERS = [yf_ticker_fix(t) for t in (
-    INDEX_TICKERS + METALS_TICKERS + COMMODITY_TICKERS + BOND_TICKERS + CRYPTO_TICKERS + SP500_TICKERS
-)]
-OPTIONABLE_TICKERS = set([yf_ticker_fix(t) for t in SP500_TICKERS + INDEX_TICKERS])
-
-ASSET_TYPE_MAP = {}
-for t in INDEX_TICKERS:     ASSET_TYPE_MAP[yf_ticker_fix(t)] = "index"
-for t in METALS_TICKERS:    ASSET_TYPE_MAP[yf_ticker_fix(t)] = "gold" if "G" in t else "silver"
-for t in COMMODITY_TICKERS: ASSET_TYPE_MAP[yf_ticker_fix(t)] = "crude" if t == "USO" else "copper"
-for t in BOND_TICKERS:      ASSET_TYPE_MAP[yf_ticker_fix(t)] = "bond"
-for t in CRYPTO_TICKERS:    ASSET_TYPE_MAP[yf_ticker_fix(t)] = "crypto"
-for t in SP500_TICKERS:     ASSET_TYPE_MAP[yf_ticker_fix(t)] = "stock"
-
-# =============== PROGRESS BAR ===============
 
 def print_progress_bar(current, total, bar_length=50, prefix="Progress"):
     percent = (current / total) * 100 if total > 0 else 0
@@ -84,10 +58,30 @@ def print_progress_bar(current, total, bar_length=50, prefix="Progress"):
     if current == total:
         print()
 
-# ========== NAME RESOLUTION: Yahoo -> Wikipedia -> ticker ==========
+# ========== UNIVERSE CSV HELPERS ==========
+
+def load_universe(path):
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["ticker", "name", "category"])
+    try:
+        df = pd.read_csv(path, dtype=str)
+        for col in ["ticker", "name", "category"]:
+            if col not in df.columns:
+                df[col] = ""
+        df["ticker"] = df["ticker"].astype(str)
+        df["name"] = df["name"].astype(str)
+        df["category"] = df["category"].astype(str)
+        return df[["ticker", "name", "category"]]
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "name", "category"])
+
+def save_universe(df, path):
+    if df.empty:
+        return
+    df = df.sort_values("ticker")
+    df.to_csv(path, index=False)
 
 def yahoo_name_from_ticker(symbol):
-    """Try to get name from Yahoo search/autocomplete API."""
     url = "https://query2.finance.yahoo.com/v1/finance/search"
     headers = {"User-Agent": "Mozilla/5.0"}
     params = {"q": symbol, "quotes_count": 1, "lang": "en-US"}
@@ -103,9 +97,6 @@ def yahoo_name_from_ticker(symbol):
     return None
 
 def get_sp500_name_map():
-    """
-    Return a dict {ticker: company_name} from Wikipedia's S&P 500 page.
-    """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {
         "User-Agent": (
@@ -116,7 +107,6 @@ def get_sp500_name_map():
     }
     resp = requests.get(url, headers=headers, timeout=10)
     resp.raise_for_status()
-    # Use StringIO to avoid FutureWarning
     tables = pd.read_html(StringIO(resp.text))
 
     target = None
@@ -125,7 +115,6 @@ def get_sp500_name_map():
         if "symbol" in cols and "security" in cols:
             target = t
             break
-
     if target is None:
         raise RuntimeError("Could not find S&P 500 table with Symbol/Security columns")
 
@@ -140,92 +129,225 @@ def get_sp500_name_map():
     df = target[["ticker", "name"]]
     return dict(zip(df["ticker"], df["name"]))
 
-def build_company_name_map_all(ALL_TICKERS):
-    """
-    Build {ticker: name} for all tickers using:
-    1) Yahoo search
-    2) S&P 500 Wikipedia
-    3) Fallback to ticker
-    """
-    print("🔍 Building S&P 500 name map from Wikipedia...")
-    try:
-        sp500_map = get_sp500_name_map()
-    except Exception as e:
-        print("⚠️ Could not load S&P 500 Wikipedia table:", e)
-        sp500_map = {}
+def classify_category(ticker, current_sp500_set):
+    if ticker in [yf_ticker_fix(t) for t in INDEX_TICKERS]:
+        return CATEGORY_INDEX
+    if ticker in [yf_ticker_fix(t) for t in METALS_TICKERS]:
+        return CATEGORY_METAL
+    if ticker in [yf_ticker_fix(t) for t in COMMODITY_TICKERS]:
+        return CATEGORY_COMMODITY
+    if ticker in [yf_ticker_fix(t) for t in BOND_TICKERS]:
+        return CATEGORY_BOND
+    if ticker in [yf_ticker_fix(t) for t in CRYPTO_TICKERS]:
+        return CATEGORY_CRYPTO
+    if ticker in current_sp500_set:
+        return CATEGORY_SP500
+    return CATEGORY_NON_SP500
 
-    name_map = {}
-    total = len(ALL_TICKERS)
-    for i, t in enumerate(ALL_TICKERS, 1):
-        # 1) Yahoo
+def prepare_universe_and_name_map():
+    print("📁 Loading existing ticker universe ...")
+    universe_df = load_universe(UNIVERSE_FILE)
+    existing_tickers = set(universe_df["ticker"])
+
+    current_sp500_set = set(universe_df.loc[universe_df["category"] == CATEGORY_SP500, "ticker"])
+
+    base_tickers = (
+        [yf_ticker_fix(t) for t in INDEX_TICKERS] +
+        [yf_ticker_fix(t) for t in METALS_TICKERS] +
+        [yf_ticker_fix(t) for t in COMMODITY_TICKERS] +
+        [yf_ticker_fix(t) for t in BOND_TICKERS] +
+        [yf_ticker_fix(t) for t in CRYPTO_TICKERS] +
+        [yf_ticker_fix(t) for t in EXTRA_STOCKS]
+    )
+    target_set = set(base_tickers) | existing_tickers
+
+    new_tickers = sorted(target_set - existing_tickers)
+    if new_tickers:
+        print(f"🆕 Found {len(new_tickers)} new tickers to add to universe")
+
+    sp500_wiki_map = {}
+    try:
+        if new_tickers:
+            sp500_wiki_map = get_sp500_name_map()
+    except Exception as e:
+        print("⚠️ Could not load S&P 500 Wikipedia table for universe enrichment:", e)
+        sp500_wiki_map = {}
+
+    new_rows = []
+    total = len(new_tickers)
+    for i, t in enumerate(new_tickers, 1):
         name = yahoo_name_from_ticker(t)
-        if not name:
-            # 2) Wikipedia S&P 500 (handle dot vs dash)
+        if not name and sp500_wiki_map:
             base = t.replace('-', '.')
-            name = sp500_map.get(base)
-        # 3) Fallback
+            name = sp500_wiki_map.get(base)
         if not name:
             name = t
-        name_map[t] = name
-        print_progress_bar(i, total, prefix="🏢 Name Mapping")
 
-    print("\n✅ Completed company name mapping.")
-    return name_map
+        cat = classify_category(t, current_sp500_set)
+        new_rows.append({"ticker": t, "name": name, "category": cat})
+        print_progress_bar(i, total, prefix="🏢 Universe (new)")
 
-# ============= TRADING DAY (EOD‑safe) =============
+    if new_rows:
+        universe_df = pd.concat([universe_df, pd.DataFrame(new_rows)], ignore_index=True)
+
+    save_universe(universe_df, UNIVERSE_FILE)
+    print(f"\n💾 Universe saved with {len(universe_df)} total tickers")
+
+    name_map = dict(zip(universe_df["ticker"], universe_df["name"]))
+    all_tickers = sorted(universe_df["ticker"])
+    return name_map, all_tickers
+
+# ============= TRADING DAY USING NYSE CALENDAR =============
 
 def get_eod_trading_day(max_back=10):
-    print("📅 Determining end-of-day trading date...")
+    print("📅 Determining end-of-day trading date using NYSE calendar ...")
     eastern = pytz.timezone('US/Eastern')
     now = datetime.now(eastern)
+
     market_close_hour = 16
     market_close_minute = 10
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    after_close = (now.hour > market_close_hour or (now.hour == market_close_hour and now.minute >= market_close_minute))
-    print(f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')} Market closed: {'Yes' if after_close else 'No'}")
 
-    if today.weekday() < 5 and after_close:
-        next_day = today + timedelta(days=1)
-        valid = True
-        for t in INDEX_TICKERS[:1]:
-            df = yf.download(yf_ticker_fix(t), start=today.strftime('%Y-%m-%d'),
-                             end=next_day.strftime('%Y-%m-%d'), auto_adjust=False)
-            if df.empty:
-                valid = False
-                break
-        if valid:
-            print(f"✅ Using today's date: {today.strftime('%Y-%m-%d')}")
-            return today
+    nyse = mcal.get_calendar('NYSE')
+    end = now.date()
+    start = end - timedelta(days=max_back + 7)
+    sched = nyse.schedule(start_date=start, end_date=end)
 
-    for delta in range(1, max_back + 1):
-        day = today - timedelta(days=delta)
-        next_day = day + timedelta(days=1)
-        if day.weekday() < 5:
-            for t in INDEX_TICKERS[:1]:
-                df = yf.download(yf_ticker_fix(t), start=day.strftime('%Y-%m-%d'),
-                                 end=next_day.strftime('%Y-%m-%d'), auto_adjust=False)
-                if df.empty:
-                    break
-            else:
-                print(f"✅ Using trading day: {day.strftime('%Y-%m-%d')}")
-                return day
-    raise Exception(f"No EOD found for all tickers in last {max_back} days")
+    sched_index = sched.index.tz_localize(nyse.tz)
+    trading_days = sched_index.tz_convert(eastern).date
+
+    if len(trading_days) == 0:
+        raise Exception("No NYSE trading days in range; check dates/calendar.")
+
+    today_date = now.date()
+    after_close = (now.hour > market_close_hour or
+                   (now.hour == market_close_hour and now.minute >= market_close_minute))
+
+    if today_date in trading_days and after_close:
+        use_day = today_date
+    else:
+        valid_days = [d for d in trading_days if d < today_date or (d == today_date and after_close)]
+        if not valid_days:
+            use_day = trading_days[-1]
+        else:
+            use_day = valid_days[-1]
+
+    print(f"✅ Using NYSE trading day: {use_day.isoformat()}")
+    return eastern.localize(datetime(use_day.year, use_day.month, use_day.day))
+
+# ============= ENRICHMENT WITH OHLC (PARALLEL, UNIQUE CONTRACTS) =============
+
+def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
+                                     call_symbol_col="contractSymbol_Call",
+                                     put_symbol_col="contractSymbol_Put",
+                                     max_workers=32) -> pd.DataFrame:
+    call_syms = df[call_symbol_col].dropna().astype(str).unique() if call_symbol_col in df.columns else []
+    put_syms  = df[put_symbol_col].dropna().astype(str).unique() if put_symbol_col in df.columns else []
+    all_syms = np.unique(np.concatenate([call_syms, put_syms])) if len(call_syms) + len(put_syms) > 0 else []
+    print(f"🔁 Enriching {len(all_syms)} unique option contracts with OHLC snapshot...")
+
+    # Use single curl_cffi session for all contract lookups (issue 2422 fix)
+    session = curl_requests.Session(impersonate="chrome")
+
+    def fetch_info(sym):
+        try:
+            tk = yf.Ticker(sym, session=session)
+            info = tk.info
+            return sym, {
+                "open": info.get("regularMarketOpen"),
+                "high": info.get("regularMarketDayHigh"),
+                "low":  info.get("regularMarketDayLow"),
+                "close": info.get("regularMarketPrice"),
+                "bid":  info.get("bid"),
+                "ask":  info.get("ask"),
+                "volume": info.get("regularMarketVolume"),
+                "openInterest": info.get("openInterest"),
+            }
+        except Exception:
+            # On any crumb/rate-limit/HTTP error, skip this symbol
+            return sym, None
+
+    info_map = {}
+    if len(all_syms) > 0:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(fetch_info, s): s for s in all_syms}
+            total = len(futures)
+            for i, fut in enumerate(as_completed(futures), 1):
+                sym, data = fut.result()
+                info_map[sym] = data
+                print_progress_bar(i, total, prefix="📊 OHLC Snapshots")
+
+    new_cols = [
+        "call_open", "call_high", "call_low", "call_close",
+        "call_bid_info", "call_ask_info",
+        "call_volume_info", "call_openInterest_info",
+        "put_open", "put_high", "put_low", "put_close",
+        "put_bid_info", "put_ask_info",
+        "put_volume_info", "put_openInterest_info",
+    ]
+    for c in new_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    if call_symbol_col in df.columns:
+        for idx, cs in df[call_symbol_col].dropna().items():
+            data = info_map.get(str(cs))
+            if not data:
+                continue
+            df.at[idx, "call_open"]              = data["open"]
+            df.at[idx, "call_high"]              = data["high"]
+            df.at[idx, "call_low"]               = data["low"]
+            df.at[idx, "call_close"]             = data["close"]
+            df.at[idx, "call_bid_info"]          = data["bid"]
+            df.at[idx, "call_ask_info"]          = data["ask"]
+            df.at[idx, "call_volume_info"]       = data["volume"]
+            df.at[idx, "call_openInterest_info"] = data["openInterest"]
+
+    if put_symbol_col in df.columns:
+        for idx, ps in df[put_symbol_col].dropna().items():
+            data = info_map.get(str(ps))
+            if not data:
+                continue
+            df.at[idx, "put_open"]               = data["open"]
+            df.at[idx, "put_high"]               = data["high"]
+            df.at[idx, "put_low"]                = data["low"]
+            df.at[idx, "put_close"]              = data["close"]
+            df.at[idx, "put_bid_info"]           = data["bid"]
+            df.at[idx, "put_ask_info"]           = data["ask"]
+            df.at[idx, "put_volume_info"]        = data["volume"]
+            df.at[idx, "put_openInterest_info"]  = data["openInterest"]
+
+    return df
 
 # ============= OPTIONS FETCH & MERGE =============
 
 def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
-    tk = yf.Ticker(ticker)
+    # curl_cffi session to reduce rate limits (same pattern as issue 2422)
+    session = curl_requests.Session(impersonate="chrome")
+    tk = yf.Ticker(ticker, session=session)
+
     results = []
     try:
         if hasattr(tk, 'options') and tk.options:
             for exp in tk.options:
                 oc = tk.option_chain(exp)
-                calls = oc.calls[['strike', 'openInterest', 'lastPrice', 'volume']].rename(columns={
-                    'openInterest': 'openInt_Call', 'lastPrice': 'lastPrice_Call', 'volume': 'vol_Call'})
-                puts = oc.puts[['strike', 'openInterest', 'lastPrice', 'volume']].rename(columns={
-                    'openInterest': 'openInt_Put', 'lastPrice': 'lastPrice_Put', 'volume': 'vol_Put'})
+
+                calls = oc.calls[['contractSymbol', 'strike', 'openInterest', 'lastPrice', 'volume']].rename(columns={
+                    'contractSymbol': 'contractSymbol_Call',
+                    'openInterest': 'openInt_Call',
+                    'lastPrice': 'lastPrice_Call',
+                    'volume': 'vol_Call'
+                })
+
+                puts = oc.puts[['contractSymbol', 'strike', 'openInterest', 'lastPrice', 'volume']].rename(columns={
+                    'contractSymbol': 'contractSymbol_Put',
+                    'openInterest': 'openInt_Put',
+                    'lastPrice': 'lastPrice_Put',
+                    'volume': 'vol_Put'
+                })
+
                 calls['expiry_date'] = exp
                 puts['expiry_date'] = exp
+
                 merged = pd.merge(calls, puts, on=['strike', 'expiry_date'], how='outer')
                 merged['ticker'] = ticker
                 merged['asset_type'] = asset_type
@@ -252,13 +374,28 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
         }))
     return results
 
-def merge_calls_puts_per_strike_parallel(trade_day, company_name_map):
+def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_tickers):
     print(f"🔄 Starting options chain collection with threading for {trade_day.strftime('%Y-%m-%d')}")
     trade_day_str = trade_day.strftime('%d%b%Y')
+
+    def infer_asset_type(ticker):
+        if ticker in [yf_ticker_fix(t) for t in INDEX_TICKERS]:
+            return "index"
+        if ticker in [yf_ticker_fix(t) for t in METALS_TICKERS]:
+            return "gold" if "G" in ticker else "silver"
+        if ticker in [yf_ticker_fix(t) for t in COMMODITY_TICKERS]:
+            return "crude" if ticker.endswith("USO") else "copper"
+        if ticker in [yf_ticker_fix(t) for t in BOND_TICKERS]:
+            return "bond"
+        if ticker in [yf_ticker_fix(t) for t in CRYPTO_TICKERS]:
+            return "crypto"
+        return "stock"
+
     args = [
-        (ticker, company_name_map.get(ticker, ticker), ASSET_TYPE_MAP.get(ticker, "other"), trade_day_str)
-        for ticker in ALL_TICKERS
+        (ticker, company_name_map.get(ticker, ticker), infer_asset_type(ticker), trade_day_str)
+        for ticker in all_tickers
     ]
+
     all_rows = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
         futures = [executor.submit(fetch_option_chain, *a) for a in args]
@@ -266,9 +403,27 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map):
         for i, f in enumerate(futures, 1):
             all_rows += f.result()
             print_progress_bar(i, total, prefix="📈 Options Data")
+
     print(f"\n📊 All tickers processed. Saving file ...")
     if all_rows:
         df_final = pd.concat(all_rows, ignore_index=True)
+
+        before = len(df_final)
+        df_final = df_final.drop_duplicates()
+        after = len(df_final)
+        print(f"🧹 Removed {before - after} exact duplicate rows")
+
+        print("📈 Enriching options data with per‑contract OHLC via yfinance.info ...")
+        df_final = enrich_with_option_ohlc_parallel(df_final)
+
+        # Reorder columns: ticker, asset_type, company_name first; contractSymbol_Call/Put last
+        cols = list(df_final.columns)
+        first_cols = [c for c in ["ticker", "asset_type", "company_name"] if c in cols]
+        last_cols = [c for c in ["contractSymbol_Call", "contractSymbol_Put"] if c in cols]
+        middle_cols = [c for c in cols if c not in first_cols + last_cols]
+        new_order = first_cols + middle_cols + last_cols
+        df_final = df_final[new_order]
+
         out_file = os.path.join(DATA_DIR, f"Options_Strike_CallPut_{trade_day_str}.csv")
         df_final.to_csv(out_file, index=False)
         print(f"✅ Output file saved: {out_file}")
@@ -277,6 +432,43 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map):
         return df_final, out_file
     print("❌ No call/put pairs to merge.")
     return None, None
+
+# ============= AUDIT BLANK / EMPTY ROWS =============
+
+def audit_empty_option_rows(df: pd.DataFrame, trade_day_str: str):
+    """
+    Audit rows where both call and put OI and volume are NaN or zero and
+    write them to a timestamped CSV log.
+    """
+    if df is None or df.empty:
+        print("🔍 Audit: DataFrame is empty, nothing to audit.")
+        return
+
+    oi_call = df.get("openInt_Call", pd.Series(index=df.index, data=np.nan)).fillna(0)
+    oi_put  = df.get("openInt_Put",  pd.Series(index=df.index, data=np.nan)).fillna(0)
+    vol_call = df.get("vol_Call",   pd.Series(index=df.index, data=np.nan)).fillna(0)
+    vol_put  = df.get("vol_Put",    pd.Series(index=df.index, data=np.nan)).fillna(0)
+
+    mask_empty = (oi_call == 0) & (oi_put == 0) & (vol_call == 0) & (vol_put == 0)
+    empty_rows = df[mask_empty].copy()
+
+    total_empty = len(empty_rows)
+    total_rows = len(df)
+    print(f"\n🔍 Audit: Found {total_empty} rows with no call/put OI and volume "
+          f"out of {total_rows} total rows.")
+
+    if total_empty == 0:
+        return
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    log_name = f"Options_Audit_EmptyRows_{trade_day_str}_{ts}.csv"
+    log_path = os.path.join(LOG_DIR, log_name)
+
+    if "company_name" in empty_rows.columns:
+        empty_rows["company_name"] = empty_rows["company_name"].astype(str).str.replace('"', "")
+
+    empty_rows.to_csv(log_path, index=False)
+    print(f"📝 Audit log saved: {log_path}")
 
 # ============= CHANGE CALCULATION =============
 
@@ -350,6 +542,9 @@ def compute_oi_vol_change(trade_day):
     ]
     merged = ensure_columns(merged, cols_out)
 
+    if "company_name_now" in merged.columns:
+        merged["company_name_now"] = merged["company_name_now"].astype(str).str.replace('"', "")
+
     out_file = os.path.join(DATA_DIR, f"Options_Strike_CallPut_Change_{trade_day_str}.csv")
     merged[cols_out].to_csv(out_file, index=False)
     print(f"✅ OI/Volume change file: {out_file}")
@@ -378,7 +573,7 @@ def cleanup_old_files(data_dir, days=90):
         print_progress_bar(i, len(files_to_delete), prefix="🗑️  Cleanup")
     print(f"\n✅ Cleanup completed: {len(files_to_delete)} files deleted.")
 
-# ============= MAIN =============
+# ============= MAIN (daily run) =============
 
 if __name__ == "__main__":
     print("🚀 Starting Options Chain Data Collection Script")
@@ -392,16 +587,21 @@ if __name__ == "__main__":
     print("\n🧹 Phase 1: Cleanup old files")
     cleanup_old_files(DATA_DIR, 90)
 
-    print("\n🏢 Phase 2: Building company name mapping (Yahoo → Wikipedia → ticker)")
-    company_name_map = build_company_name_map_all(ALL_TICKERS)
+    print("\n🏢 Phase 2: Universe & name map")
+    company_name_map, all_tickers = prepare_universe_and_name_map()
 
     print("\n📅 Phase 3: Determine trading day")
     eod_day = get_eod_trading_day()
 
     print("\n📈 Phase 4: Collect options data")
-    df, today_file = merge_calls_puts_per_strike_parallel(eod_day, company_name_map)
+    df, today_file = merge_calls_puts_per_strike_parallel(eod_day, company_name_map, all_tickers)
+
+    trade_day_str = eod_day.strftime('%d%b%Y')
 
     if df is not None:
+        print("\n📝 Phase 4b: Audit empty option rows")
+        audit_empty_option_rows(df, trade_day_str)
+
         print("\n📊 Phase 5: Compute changes")
         compute_oi_vol_change(eod_day)
         print("\n🎉 Script completed successfully!")
