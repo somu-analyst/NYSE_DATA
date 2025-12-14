@@ -3,25 +3,31 @@ import sys
 import time
 import json
 import requests
+import requests as py_requests  # for catching HTTPError in enrichment
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import yfinance as yf
 import pytz
-import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO  # for pd.read_html on HTML string
 import pandas_market_calendars as mcal  # NYSE calendar
 from curl_cffi import requests as curl_requests  # curl_cffi session
 
+
 # ============= RUNTIME START =============
 SCRIPT_START_TIME = time.time()
 
+
 # ================== CONFIG ==================
 
+
 DATA_DIR = r"C:\Users\srini\Options_chain_data"
-UNIVERSE_FILE = os.path.join(DATA_DIR, "ticker_universe.csv")
+UNIVERSE_FILE = os.path.join(DATA_DIR, "ticker_universe.xlsx")
+UNIVERSE_SHEET_ACTIVE = "ticker_universe"   # tickers to process
+UNIVERSE_SHEET_WHOLE  = "Whole_universe"   # full / history
 LOG_DIR = DATA_DIR
+
 
 CATEGORY_SP500     = "sp500"
 CATEGORY_NON_SP500 = "non_s&p"
@@ -32,9 +38,11 @@ CATEGORY_BOND      = "bond"
 CATEGORY_CRYPTO    = "crypto"
 CATEGORY_OTHER     = "other"
 
+
 INDEX_TICKERS = [
     "QQQ", "SPY", "IWM", "DIA", "IVV", "VOO", "SPLG", "SPYG", "SPYV", "IBIT"
 ]
+
 
 METALS_TICKERS = ["GLD", "IAU", "SGOL", "PHYS", "SLV", "SIVR", "PSLV", "SIL"]
 COMMODITY_TICKERS = ["USO", "CPER"]
@@ -42,12 +50,16 @@ BOND_TICKERS = ["AGG", "BND", "SCHZ", "FBND", "IUSB", "SPAB", "VTEB"]
 CRYPTO_TICKERS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
                   "XRP-USD", "ADA-USD", "DOGE-USD", "TRX-USD"]
 
+
 EXTRA_STOCKS = ["SOFI"]
+
 
 # ========= HELPER: ticker normalization & progress bar ==========
 
+
 def yf_ticker_fix(ticker):
     return ticker.replace('.', '-')
+
 
 def print_progress_bar(current, total, bar_length=50, prefix="Progress"):
     percent = (current / total) * 100 if total > 0 else 0
@@ -58,28 +70,63 @@ def print_progress_bar(current, total, bar_length=50, prefix="Progress"):
     if current == total:
         print()
 
-# ========== UNIVERSE CSV HELPERS ==========
 
-def load_universe(path):
+# ========== UNIVERSE EXCEL HELPERS ==========
+
+
+def _normalize_universe_df(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ticker", "name", "category"])
+    for col in ["ticker", "name", "category"]:
+        if col not in df.columns:
+            df[col] = ""
+    df["ticker"] = df["ticker"].astype(str)
+    df["name"] = df["name"].astype(str)
+    df["category"] = df["category"].astype(str)
+    return df[["ticker", "name", "category"]]
+
+
+def load_universe_sheets(path):
     if not os.path.exists(path):
-        return pd.DataFrame(columns=["ticker", "name", "category"])
-    try:
-        df = pd.read_csv(path, dtype=str)
-        for col in ["ticker", "name", "category"]:
-            if col not in df.columns:
-                df[col] = ""
-        df["ticker"] = df["ticker"].astype(str)
-        df["name"] = df["name"].astype(str)
-        df["category"] = df["category"].astype(str)
-        return df[["ticker", "name", "category"]]
-    except Exception:
-        return pd.DataFrame(columns=["ticker", "name", "category"])
+        active = pd.DataFrame(columns=["ticker", "name", "category"])
+        whole  = pd.DataFrame(columns=["ticker", "name", "category"])
+        return active, whole
 
-def save_universe(df, path):
-    if df.empty:
-        return
-    df = df.sort_values("ticker")
-    df.to_csv(path, index=False)
+    try:
+        all_sheets = pd.read_excel(path, sheet_name=None, dtype=str, engine="openpyxl")
+    except Exception:
+        active = pd.DataFrame(columns=["ticker", "name", "category"])
+        whole  = pd.DataFrame(columns=["ticker", "name", "category"])
+        return active, whole
+
+    active = _normalize_universe_df(all_sheets.get(UNIVERSE_SHEET_ACTIVE, None))
+    whole  = _normalize_universe_df(all_sheets.get(UNIVERSE_SHEET_WHOLE,  None))
+    return active, whole
+
+
+def save_universe_sheets(active_df, whole_df, path):
+    if not active_df.empty:
+        active_df = active_df.sort_values("ticker")
+    if not whole_df.empty:
+        whole_df = whole_df.sort_values("ticker")
+
+    existing_sheets = {}
+    if os.path.exists(path):
+        try:
+            existing = pd.read_excel(path, sheet_name=None, engine="openpyxl")
+            for k in list(existing.keys()):
+                if k in (UNIVERSE_SHEET_ACTIVE, UNIVERSE_SHEET_WHOLE):
+                    existing.pop(k, None)
+            existing_sheets = existing
+        except Exception:
+            existing_sheets = {}
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for name, sdf in existing_sheets.items():
+            sdf.to_excel(writer, sheet_name=name, index=False)
+        active_df.to_excel(writer, sheet_name=UNIVERSE_SHEET_ACTIVE, index=False)
+        whole_df.to_excel(writer,  sheet_name=UNIVERSE_SHEET_WHOLE,  index=False)
+
 
 def yahoo_name_from_ticker(symbol):
     url = "https://query2.finance.yahoo.com/v1/finance/search"
@@ -96,6 +143,7 @@ def yahoo_name_from_ticker(symbol):
         pass
     return None
 
+
 def get_sp500_name_map():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {
@@ -108,7 +156,6 @@ def get_sp500_name_map():
     resp = requests.get(url, headers=headers, timeout=10)
     resp.raise_for_status()
     tables = pd.read_html(StringIO(resp.text))
-
     target = None
     for t in tables:
         cols = {c.lower() for c in t.columns.astype(str)}
@@ -117,7 +164,6 @@ def get_sp500_name_map():
             break
     if target is None:
         raise RuntimeError("Could not find S&P 500 table with Symbol/Security columns")
-
     col_map = {}
     for c in target.columns:
         lc = str(c).lower()
@@ -128,6 +174,7 @@ def get_sp500_name_map():
     target = target.rename(columns=col_map)
     df = target[["ticker", "name"]]
     return dict(zip(df["ticker"], df["name"]))
+
 
 def classify_category(ticker, current_sp500_set):
     if ticker in [yf_ticker_fix(t) for t in INDEX_TICKERS]:
@@ -144,12 +191,12 @@ def classify_category(ticker, current_sp500_set):
         return CATEGORY_SP500
     return CATEGORY_NON_SP500
 
-def prepare_universe_and_name_map():
-    print("📁 Loading existing ticker universe ...")
-    universe_df = load_universe(UNIVERSE_FILE)
-    existing_tickers = set(universe_df["ticker"])
 
-    current_sp500_set = set(universe_df.loc[universe_df["category"] == CATEGORY_SP500, "ticker"])
+def prepare_universe_and_name_map():
+    print("📁 Loading existing universe sheets ...")
+    active_df, whole_df = load_universe_sheets(UNIVERSE_FILE)
+
+    whole_tickers  = set(whole_df["ticker"])
 
     base_tickers = (
         [yf_ticker_fix(t) for t in INDEX_TICKERS] +
@@ -159,45 +206,58 @@ def prepare_universe_and_name_map():
         [yf_ticker_fix(t) for t in CRYPTO_TICKERS] +
         [yf_ticker_fix(t) for t in EXTRA_STOCKS]
     )
-    target_set = set(base_tickers) | existing_tickers
 
-    new_tickers = sorted(target_set - existing_tickers)
-    if new_tickers:
-        print(f"🆕 Found {len(new_tickers)} new tickers to add to universe")
+    target_set_for_whole = set(base_tickers) | whole_tickers
+
+    current_sp500_set = set(
+        whole_df.loc[whole_df["category"] == CATEGORY_SP500, "ticker"]
+    )
+
+    new_tickers_for_whole = sorted(target_set_for_whole - whole_tickers)
+    if new_tickers_for_whole:
+        print(f"🆕 Found {len(new_tickers_for_whole)} new tickers to add to Whole_universe")
 
     sp500_wiki_map = {}
     try:
-        if new_tickers:
+        if new_tickers_for_whole:
             sp500_wiki_map = get_sp500_name_map()
     except Exception as e:
-        print("⚠️ Could not load S&P 500 Wikipedia table for universe enrichment:", e)
+        print("⚠️ Could not load S&P 500 Wikipedia table for enrichment:", e)
         sp500_wiki_map = {}
 
-    new_rows = []
-    total = len(new_tickers)
-    for i, t in enumerate(new_tickers, 1):
+    new_rows_whole = []
+    total = len(new_tickers_for_whole)
+    for i, t in enumerate(new_tickers_for_whole, 1):
         name = yahoo_name_from_ticker(t)
         if not name and sp500_wiki_map:
             base = t.replace('-', '.')
             name = sp500_wiki_map.get(base)
         if not name:
             name = t
-
         cat = classify_category(t, current_sp500_set)
-        new_rows.append({"ticker": t, "name": name, "category": cat})
-        print_progress_bar(i, total, prefix="🏢 Universe (new)")
+        new_rows_whole.append({"ticker": t, "name": name, "category": cat})
+        print_progress_bar(i, total, prefix="🌍 Whole_universe (new)")
 
-    if new_rows:
-        universe_df = pd.concat([universe_df, pd.DataFrame(new_rows)], ignore_index=True)
+    if new_rows_whole:
+        whole_df = pd.concat([whole_df, pd.DataFrame(new_rows_whole)], ignore_index=True)
 
-    save_universe(universe_df, UNIVERSE_FILE)
-    print(f"\n💾 Universe saved with {len(universe_df)} total tickers")
+    if not active_df.empty and not whole_df.empty:
+        whole_map = whole_df.set_index("ticker")[["name", "category"]]
+        active_df = active_df.set_index("ticker")
+        active_df["name"] = active_df.index.to_series().map(whole_map["name"]).fillna(active_df["name"])
+        active_df["category"] = active_df.index.to_series().map(whole_map["category"]).fillna(active_df["category"])
+        active_df = active_df.reset_index()
 
-    name_map = dict(zip(universe_df["ticker"], universe_df["name"]))
-    all_tickers = sorted(universe_df["ticker"])
+    save_universe_sheets(active_df, whole_df, UNIVERSE_FILE)
+    print(f"\n💾 Whole_universe tickers: {len(whole_df)}, active ticker_universe tickers: {len(active_df)}")
+
+    name_map = dict(zip(active_df["ticker"], active_df["name"]))
+    all_tickers = sorted(active_df["ticker"])
     return name_map, all_tickers
 
+
 # ============= TRADING DAY USING NYSE CALENDAR =============
+
 
 def get_eod_trading_day(max_back=10):
     print("📅 Determining end-of-day trading date using NYSE calendar ...")
@@ -234,47 +294,66 @@ def get_eod_trading_day(max_back=10):
     print(f"✅ Using NYSE trading day: {use_day.isoformat()}")
     return eastern.localize(datetime(use_day.year, use_day.month, use_day.day))
 
-# ============= ENRICHMENT WITH OHLC (PARALLEL, UNIQUE CONTRACTS) =============
+
+# ============= ENRICHMENT WITH OHLC (THROTTLED) =============
+
 
 def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
                                      call_symbol_col="contractSymbol_Call",
                                      put_symbol_col="contractSymbol_Put",
-                                     max_workers=32) -> pd.DataFrame:
+                                     max_workers=1,
+                                     max_retries=1) -> pd.DataFrame:
     call_syms = df[call_symbol_col].dropna().astype(str).unique() if call_symbol_col in df.columns else []
     put_syms  = df[put_symbol_col].dropna().astype(str).unique() if put_symbol_col in df.columns else []
     all_syms = np.unique(np.concatenate([call_syms, put_syms])) if len(call_syms) + len(put_syms) > 0 else []
     print(f"🔁 Enriching {len(all_syms)} unique option contracts with OHLC snapshot...")
 
-    # Use single curl_cffi session for all contract lookups (issue 2422 fix)
+    if len(all_syms) == 0:
+        return df
+
     session = curl_requests.Session(impersonate="chrome")
 
     def fetch_info(sym):
-        try:
-            tk = yf.Ticker(sym, session=session)
-            info = tk.info
-            return sym, {
-                "open": info.get("regularMarketOpen"),
-                "high": info.get("regularMarketDayHigh"),
-                "low":  info.get("regularMarketDayLow"),
-                "close": info.get("regularMarketPrice"),
-                "bid":  info.get("bid"),
-                "ask":  info.get("ask"),
-                "volume": info.get("regularMarketVolume"),
-                "openInterest": info.get("openInterest"),
-            }
-        except Exception:
-            # On any crumb/rate-limit/HTTP error, skip this symbol
-            return sym, None
+        for attempt in range(max_retries + 1):
+            try:
+                tk = yf.Ticker(sym, session=session)
+                info = tk.info
+                time.sleep(0.2)  # 200 ms pause per contract
+                return sym, {
+                    "open": info.get("regularMarketOpen"),
+                    "high": info.get("regularMarketDayHigh"),
+                    "low":  info.get("regularMarketDayLow"),
+                    "close": info.get("regularMarketPrice"),
+                    "bid":  info.get("bid"),
+                    "ask":  info.get("ask"),
+                    "volume": info.get("regularMarketVolume"),
+                    "openInterest": info.get("openInterest"),
+                }
+            except py_requests.exceptions.HTTPError as e:
+                msg = str(e)
+                if "Too Many Requests" in msg or "rate limit" in msg:
+                    print(f"\n⚠️ Rate limited on {sym}, skipping OHLC for this contract")
+                    return sym, None
+                if attempt >= max_retries:
+                    print(f"\n⚠️ HTTP error on {sym} after retries, skipping: {e}")
+                    return sym, None
+                continue
+            except Exception as e:
+                msg = str(e)
+                if "Too Many Requests" in msg or "rate limit" in msg:
+                    print(f"\n⚠️ Rate limited on {sym}, skipping OHLC")
+                else:
+                    print(f"\n⚠️ Error in OHLC for {sym}: {e}")
+                return sym, None
 
     info_map = {}
-    if len(all_syms) > 0:
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(fetch_info, s): s for s in all_syms}
-            total = len(futures)
-            for i, fut in enumerate(as_completed(futures), 1):
-                sym, data = fut.result()
-                info_map[sym] = data
-                print_progress_bar(i, total, prefix="📊 OHLC Snapshots")
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(fetch_info, s): s for s in all_syms}
+        total = len(futures)
+        for i, fut in enumerate(as_completed(futures), 1):
+            sym, data = fut.result()
+            info_map[sym] = data
+            print_progress_bar(i, total, prefix="📊 OHLC Snapshots")
 
     new_cols = [
         "call_open", "call_high", "call_low", "call_close",
@@ -318,17 +397,39 @@ def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
 
     return df
 
-# ============= OPTIONS FETCH & MERGE =============
+
+# ============= OPTIONS FETCH (YAHOO, ±10 STRIKES, NEXT 45 DAYS) =============
+
 
 def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
-    # curl_cffi session to reduce rate limits (same pattern as issue 2422)
     session = curl_requests.Session(impersonate="chrome")
     tk = yf.Ticker(ticker, session=session)
-
     results = []
     try:
+        # Get spot price
+        spot = None
+        try:
+            hist = tk.history(period="1d")
+            if not hist.empty and "Close" in hist.columns:
+                spot = hist["Close"].iloc[-1]
+        except Exception:
+            pass
+
+        # LIMIT: only expiries within next 45 days
+        max_horizon_days = 45
+
         if hasattr(tk, 'options') and tk.options:
             for exp in tk.options:
+                # Parse expiry and filter by horizon
+                try:
+                    exp_dt = datetime.strptime(exp, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                trade_dt = datetime.strptime(trade_day_str, "%d%b%Y").date()
+                if exp_dt > trade_dt + timedelta(days=max_horizon_days):
+                    continue
+
+                # Get option chain for this expiry
                 oc = tk.option_chain(exp)
 
                 calls = oc.calls[['contractSymbol', 'strike', 'openInterest', 'lastPrice', 'volume']].rename(columns={
@@ -345,6 +446,27 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
                     'volume': 'vol_Put'
                 })
 
+                # LIMIT: keep only ±10 strikes around spot
+                if spot is not None and (not calls.empty or not puts.empty):
+                    strikes_series = pd.concat([
+                        calls['strike'] if 'strike' in calls.columns else pd.Series([], dtype=float),
+                        puts['strike'] if 'strike' in puts.columns else pd.Series([], dtype=float)
+                    ])
+                    all_strikes = strikes_series.dropna().unique()
+                    all_strikes = np.sort(all_strikes)
+                    if len(all_strikes) > 0:
+                        nearest_idx = (np.abs(all_strikes - spot)).argmin()
+                        low_idx = max(nearest_idx - 10, 0)
+                        high_idx = min(nearest_idx + 10, len(all_strikes) - 1)
+                        keep_strikes = set(all_strikes[low_idx:high_idx + 1])
+                        if not calls.empty:
+                            calls = calls[calls['strike'].isin(keep_strikes)].copy()
+                        if not puts.empty:
+                            puts  = puts[puts['strike'].isin(keep_strikes)].copy()
+
+                if calls.empty and puts.empty:
+                    continue
+
                 calls['expiry_date'] = exp
                 puts['expiry_date'] = exp
 
@@ -354,28 +476,28 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
                 merged['company_name'] = company_name
                 merged['trade_date'] = trade_day_str
                 results.append(merged)
-        else:
-            results.append(pd.DataFrame({
-                'ticker': [ticker],
-                'company_name': [company_name],
-                'asset_type': [asset_type],
-                'vol_Call': [np.nan], 'lastPrice_Call': [np.nan], 'openInt_Call': [np.nan], 'strike': [np.nan],
-                'openInt_Put': [np.nan], 'lastPrice_Put': [np.nan], 'vol_Put': [np.nan],
-                'expiry_date': [np.nan], 'trade_date': [trade_day_str]
-            }))
-    except Exception:
-        results.append(pd.DataFrame({
-            'ticker': [ticker],
-            'company_name': [company_name],
-            'asset_type': [asset_type],
-            'vol_Call': [np.nan], 'lastPrice_Call': [np.nan], 'openInt_Call': [np.nan], 'strike': [np.nan],
-            'openInt_Put': [np.nan], 'lastPrice_Put': [np.nan], 'vol_Put': [np.nan],
-            'expiry_date': [np.nan], 'trade_date': [trade_day_str]
-        }))
+    except Exception as e:
+        msg = str(e)
+        if "Too Many Requests" in msg or "rate limit" in msg or "Too many requests" in msg:
+            print(f"⚠️ Rate limited while fetching options for {ticker}, skipping this ticker for now")
+            return []
+        print(f"⚠️ Error for {ticker}: {e}")
+        return []
+
+    if not results:
+        print(f"ℹ No options data returned for {ticker}")
+    else:
+        print(f"✅ Options fetched for {ticker}: {sum(len(r) for r in results)} rows")
     return results
 
+
+# ============= MERGE CALLS/PUTS: ONE TICKER AT A TIME =============
+
+
 def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_tickers):
-    print(f"🔄 Starting options chain collection with threading for {trade_day.strftime('%Y-%m-%d')}")
+    SECS_BETWEEN_TICKERS = 30  # adjust 20–60 as needed
+
+    print(f"🔄 Starting options chain collection (Yahoo, 1 ticker at a time) for {trade_day.strftime('%Y-%m-%d')}")
     trade_day_str = trade_day.strftime('%d%b%Y')
 
     def infer_asset_type(ticker):
@@ -391,55 +513,66 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
             return "crypto"
         return "stock"
 
-    args = [
-        (ticker, company_name_map.get(ticker, ticker), infer_asset_type(ticker), trade_day_str)
-        for ticker in all_tickers
-    ]
-
+    total = len(all_tickers)
     all_rows = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
-        futures = [executor.submit(fetch_option_chain, *a) for a in args]
-        total = len(futures)
-        for i, f in enumerate(futures, 1):
-            all_rows += f.result()
-            print_progress_bar(i, total, prefix="📈 Options Data")
+
+    for i, ticker in enumerate(all_tickers, 1):
+        company_name = company_name_map.get(ticker, ticker)
+        asset_type = infer_asset_type(ticker)
+
+        print(f"\n▶ [{i}/{total}] Fetching options for {ticker} ({company_name})")
+        try:
+            rows_list = fetch_option_chain(ticker, company_name, asset_type, trade_day_str)
+        except Exception as e:
+            print(f"⚠️ Error fetching {ticker}: {e}")
+            rows_list = []
+
+        if rows_list:
+            all_rows += rows_list
+            print(f"✅ {ticker}: added {sum(len(r) for r in rows_list)} rows")
+        else:
+            print(f"ℹ {ticker}: no data (no options or skipped)")
+
+        print_progress_bar(i, total, prefix="📈 Options Data (Yahoo)")
+
+        if i < total:
+            print(f"⏸ Waiting {SECS_BETWEEN_TICKERS} seconds before next ticker...")
+            time.sleep(SECS_BETWEEN_TICKERS)
 
     print(f"\n📊 All tickers processed. Saving file ...")
-    if all_rows:
-        df_final = pd.concat(all_rows, ignore_index=True)
+    if not all_rows:
+        print("❌ No call/put pairs to merge.")
+        return None, None
 
-        before = len(df_final)
-        df_final = df_final.drop_duplicates()
-        after = len(df_final)
-        print(f"🧹 Removed {before - after} exact duplicate rows")
+    df_final = pd.concat(all_rows, ignore_index=True)
 
-        print("📈 Enriching options data with per‑contract OHLC via yfinance.info ...")
-        df_final = enrich_with_option_ohlc_parallel(df_final)
+    before = len(df_final)
+    df_final = df_final.drop_duplicates()
+    after = len(df_final)
+    print(f"🧹 Removed {before - after} exact duplicate rows")
 
-        # Reorder columns: ticker, asset_type, company_name first; contractSymbol_Call/Put last
-        cols = list(df_final.columns)
-        first_cols = [c for c in ["ticker", "asset_type", "company_name"] if c in cols]
-        last_cols = [c for c in ["contractSymbol_Call", "contractSymbol_Put"] if c in cols]
-        middle_cols = [c for c in cols if c not in first_cols + last_cols]
-        new_order = first_cols + middle_cols + last_cols
-        df_final = df_final[new_order]
+    print("📈 Enriching options data with per‑contract OHLC via yfinance.info ...")
+    df_final = enrich_with_option_ohlc_parallel(df_final)
 
-        out_file = os.path.join(DATA_DIR, f"Options_Strike_CallPut_{trade_day_str}.csv")
-        df_final.to_csv(out_file, index=False)
-        print(f"✅ Output file saved: {out_file}")
-        print(f"📈 Total records: {len(df_final)}")
-        print("Sample record for today:\n", df_final.head(1).to_string(index=False))
-        return df_final, out_file
-    print("❌ No call/put pairs to merge.")
-    return None, None
+    cols = list(df_final.columns)
+    first_cols = [c for c in ["ticker", "asset_type", "company_name"] if c in cols]
+    last_cols = [c for c in ["contractSymbol_Call", "contractSymbol_Put"] if c in cols]
+    middle_cols = [c for c in cols if c not in first_cols + last_cols]
+    new_order = first_cols + middle_cols + last_cols
+    df_final = df_final[new_order]
+
+    out_file = os.path.join(DATA_DIR, f"Options_Strike_CallPut_{trade_day_str}.csv")
+    df_final.to_csv(out_file, index=False)
+    print(f"✅ Output file saved: {out_file}")
+    print(f"📈 Total records: {len(df_final)}")
+    print("Sample record for today:\n", df_final.head(1).to_string(index=False))
+    return df_final, out_file
+
 
 # ============= AUDIT BLANK / EMPTY ROWS =============
 
+
 def audit_empty_option_rows(df: pd.DataFrame, trade_day_str: str):
-    """
-    Audit rows where both call and put OI and volume are NaN or zero and
-    write them to a timestamped CSV log.
-    """
     if df is None or df.empty:
         print("🔍 Audit: DataFrame is empty, nothing to audit.")
         return
@@ -450,33 +583,34 @@ def audit_empty_option_rows(df: pd.DataFrame, trade_day_str: str):
     vol_put  = df.get("vol_Put",    pd.Series(index=df.index, data=np.nan)).fillna(0)
 
     mask_empty = (oi_call == 0) & (oi_put == 0) & (vol_call == 0) & (vol_put == 0)
-    empty_rows = df[mask_empty].copy()
+    empty_rows = df.loc[mask_empty, ["ticker", "asset_type", "company_name",
+                                     "strike", "expiry_date", "trade_date"]].copy()
 
     total_empty = len(empty_rows)
     total_rows = len(df)
     print(f"\n🔍 Audit: Found {total_empty} rows with no call/put OI and volume "
           f"out of {total_rows} total rows.")
 
-    if total_empty == 0:
+    if empty_rows.empty:
         return
 
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     log_name = f"Options_Audit_EmptyRows_{trade_day_str}_{ts}.csv"
     log_path = os.path.join(LOG_DIR, log_name)
 
-    if "company_name" in empty_rows.columns:
-        empty_rows["company_name"] = empty_rows["company_name"].astype(str).str.replace('"', "")
-
     empty_rows.to_csv(log_path, index=False)
-    print(f"📝 Audit log saved: {log_path}")
+    print(f"📝 Simple audit log saved: {log_path}")
+
 
 # ============= CHANGE CALCULATION =============
+
 
 def ensure_columns(df, required):
     for c in required:
         if c not in df.columns:
             df[c] = np.nan
     return df
+
 
 def compute_oi_vol_change(trade_day):
     print(f"🔍 Computing open interest and volume changes for {trade_day.strftime('%Y-%m-%d')}...")
@@ -552,7 +686,9 @@ def compute_oi_vol_change(trade_day):
     print("Sample percentage change record:\n", merged[cols_out].head(2).to_string(index=False))
     return out_file
 
+
 # ============= CLEANUP =============
+
 
 def cleanup_old_files(data_dir, days=90):
     print(f"🗑️  Cleaning up files older than {days} days...")
@@ -573,10 +709,12 @@ def cleanup_old_files(data_dir, days=90):
         print_progress_bar(i, len(files_to_delete), prefix="🗑️  Cleanup")
     print(f"\n✅ Cleanup completed: {len(files_to_delete)} files deleted.")
 
+
 # ============= MAIN (daily run) =============
 
+
 if __name__ == "__main__":
-    print("🚀 Starting Options Chain Data Collection Script")
+    print("🚀 Starting Options Chain Data Collection Script (Yahoo, single-ticker mode)")
     print(f"📁 Data directory: {DATA_DIR}")
     if not os.path.exists(DATA_DIR):
         print(f"📁 Creating data directory: {DATA_DIR}")
@@ -593,7 +731,7 @@ if __name__ == "__main__":
     print("\n📅 Phase 3: Determine trading day")
     eod_day = get_eod_trading_day()
 
-    print("\n📈 Phase 4: Collect options data")
+    print("\n📈 Phase 4: Collect options data (Yahoo)")
     df, today_file = merge_calls_puts_per_strike_parallel(eod_day, company_name_map, all_tickers)
 
     trade_day_str = eod_day.strftime('%d%b%Y')
@@ -607,3 +745,4 @@ if __name__ == "__main__":
         print("\n🎉 Script completed successfully!")
     else:
         print("\n❌ Script ended - no data to process")
+    
