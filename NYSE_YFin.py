@@ -13,21 +13,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO  # for pd.read_html on HTML string
 import pandas_market_calendars as mcal  # NYSE calendar
 from curl_cffi import requests as curl_requests  # curl_cffi session
-
+import sqlite3
 
 # ============= RUNTIME START =============
 SCRIPT_START_TIME = time.time()
 
-
 # ================== CONFIG ==================
-
 
 DATA_DIR = r"C:\Users\srini\Options_chain_data"
 UNIVERSE_FILE = os.path.join(DATA_DIR, "ticker_universe.xlsx")
 UNIVERSE_SHEET_ACTIVE = "ticker_universe"   # tickers to process
-UNIVERSE_SHEET_WHOLE  = "Whole_universe"   # full / history
+UNIVERSE_SHEET_WHOLE  = "Whole_universe"    # full / history
 LOG_DIR = DATA_DIR
 
+# SQLite DB and tables
+DB_PATH = os.path.join(DATA_DIR, "US_data.db")
+TABLE_OPTIONS_RAW = "options_raw"
+TABLE_OPTIONS = "options_daily"
+TABLE_OPTIONS_CHANGE = "options_change"
+TABLE_STOCK_DAILY = "stock_daily"
+WEEK_TABLES = ["week1_options", "week2_options", "week3_options", "week4_options", "week5_options"]
+MONTH_TABLES = ["month1_options", "month2_options"]
 
 CATEGORY_SP500     = "sp500"
 CATEGORY_NON_SP500 = "non_s&p"
@@ -38,11 +44,9 @@ CATEGORY_BOND      = "bond"
 CATEGORY_CRYPTO    = "crypto"
 CATEGORY_OTHER     = "other"
 
-
 INDEX_TICKERS = [
     "QQQ", "SPY", "IWM", "DIA", "IVV", "VOO", "SPLG", "SPYG", "SPYV", "IBIT"
 ]
-
 
 METALS_TICKERS = ["GLD", "IAU", "SGOL", "PHYS", "SLV", "SIVR", "PSLV", "SIL"]
 COMMODITY_TICKERS = ["USO", "CPER"]
@@ -50,16 +54,16 @@ BOND_TICKERS = ["AGG", "BND", "SCHZ", "FBND", "IUSB", "SPAB", "VTEB"]
 CRYPTO_TICKERS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
                   "XRP-USD", "ADA-USD", "DOGE-USD", "TRX-USD"]
 
-
 EXTRA_STOCKS = ["SOFI"]
 
-
-# ========= HELPER: ticker normalization & progress bar ==========
-
+# ========= HELPER: dates, ticker normalization, progress bar ==========
 
 def yf_ticker_fix(ticker):
     return ticker.replace('.', '-')
 
+def current_load_date():
+    # Global load timestamp for all tables, MM-DD-YYYY
+    return datetime.now().strftime("%m-%d-%Y")
 
 def print_progress_bar(current, total, bar_length=50, prefix="Progress"):
     percent = (current / total) * 100 if total > 0 else 0
@@ -70,9 +74,7 @@ def print_progress_bar(current, total, bar_length=50, prefix="Progress"):
     if current == total:
         print()
 
-
 # ========== UNIVERSE EXCEL HELPERS ==========
-
 
 def _normalize_universe_df(df):
     if df is None or df.empty:
@@ -84,7 +86,6 @@ def _normalize_universe_df(df):
     df["name"] = df["name"].astype(str)
     df["category"] = df["category"].astype(str)
     return df[["ticker", "name", "category"]]
-
 
 def load_universe_sheets(path):
     if not os.path.exists(path):
@@ -102,7 +103,6 @@ def load_universe_sheets(path):
     active = _normalize_universe_df(all_sheets.get(UNIVERSE_SHEET_ACTIVE, None))
     whole  = _normalize_universe_df(all_sheets.get(UNIVERSE_SHEET_WHOLE,  None))
     return active, whole
-
 
 def save_universe_sheets(active_df, whole_df, path):
     if not active_df.empty:
@@ -127,7 +127,6 @@ def save_universe_sheets(active_df, whole_df, path):
         active_df.to_excel(writer, sheet_name=UNIVERSE_SHEET_ACTIVE, index=False)
         whole_df.to_excel(writer,  sheet_name=UNIVERSE_SHEET_WHOLE,  index=False)
 
-
 def yahoo_name_from_ticker(symbol):
     url = "https://query2.finance.yahoo.com/v1/finance/search"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -142,7 +141,6 @@ def yahoo_name_from_ticker(symbol):
     except Exception:
         pass
     return None
-
 
 def get_sp500_name_map():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -175,7 +173,6 @@ def get_sp500_name_map():
     df = target[["ticker", "name"]]
     return dict(zip(df["ticker"], df["name"]))
 
-
 def classify_category(ticker, current_sp500_set):
     if ticker in [yf_ticker_fix(t) for t in INDEX_TICKERS]:
         return CATEGORY_INDEX
@@ -191,12 +188,11 @@ def classify_category(ticker, current_sp500_set):
         return CATEGORY_SP500
     return CATEGORY_NON_SP500
 
-
 def prepare_universe_and_name_map():
     print("📁 Loading existing universe sheets ...")
     active_df, whole_df = load_universe_sheets(UNIVERSE_FILE)
 
-    whole_tickers  = set(whole_df["ticker"])
+    whole_tickers = set(whole_df["ticker"])
 
     base_tickers = (
         [yf_ticker_fix(t) for t in INDEX_TICKERS] +
@@ -253,11 +249,10 @@ def prepare_universe_and_name_map():
 
     name_map = dict(zip(active_df["ticker"], active_df["name"]))
     all_tickers = sorted(active_df["ticker"])
+    print(f"🔎 Active tickers: {all_tickers}")
     return name_map, all_tickers
 
-
 # ============= TRADING DAY USING NYSE CALENDAR =============
-
 
 def get_eod_trading_day(max_back=10):
     print("📅 Determining end-of-day trading date using NYSE calendar ...")
@@ -294,9 +289,7 @@ def get_eod_trading_day(max_back=10):
     print(f"✅ Using NYSE trading day: {use_day.isoformat()}")
     return eastern.localize(datetime(use_day.year, use_day.month, use_day.day))
 
-
 # ============= ENRICHMENT WITH OHLC (THROTTLED) =============
-
 
 def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
                                      call_symbol_col="contractSymbol_Call",
@@ -397,16 +390,106 @@ def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
 
     return df
 
+# ============= DB HELPERS: WEEKLY & MONTHLY TABLES =============
+
+def refresh_weekly_tables(conn):
+    """
+    Build rolling week1_options .. week5_options from options_daily.
+    week1 = nearest future expiry, week2 = next, ... up to 5.
+    Each row stamped with load_date (MM-DD-YYYY).
+    """
+    print("🛠 Refreshing weekly tables from options_daily...")
+    q = """
+    SELECT DISTINCT expiry_date
+    FROM options_daily
+    ORDER BY expiry_date
+    """
+    expiries_df = pd.read_sql(q, conn)
+    expiries = expiries_df["expiry_date"].tolist()
+
+    if not expiries:
+        print("⚠️ No expiries in options_daily; weekly tables not updated.")
+        for tbl in WEEK_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+        conn.commit()
+        return
+
+    load_date = current_load_date()
+
+    for i, exp in enumerate(expiries[:len(WEEK_TABLES)]):
+        table_name = WEEK_TABLES[i]
+        print(f"📆 Refreshing {table_name} for expiry {exp}")
+        df_week = pd.read_sql(
+            "SELECT * FROM options_daily WHERE expiry_date = ?",
+            conn,
+            params=(exp,)
+        )
+        df_week["load_date"] = load_date
+        df_week.to_sql(table_name, conn, if_exists="replace", index=False)
+
+    for j in range(len(expiries), len(WEEK_TABLES)):
+        table_name = WEEK_TABLES[j]
+        print(f"🗑 Dropping stale weekly table {table_name} (no matching expiry)")
+        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+        conn.commit()
+
+def refresh_monthly_tables(conn):
+    """
+    Build rolling month1_options and month2_options from options_daily.
+    month1 = nearest future monthly expiry (per calendar month),
+    month2 = next month's expiry.
+    Each row stamped with load_date.
+    """
+    print("🛠 Refreshing monthly tables from options_daily...")
+    q = """
+    WITH monthly_min AS (
+        SELECT
+            strftime('%Y', expiry_date) AS y,
+            strftime('%m', expiry_date) AS m,
+            MIN(expiry_date) AS month_expiry
+        FROM options_daily
+        GROUP BY y, m
+    )
+    SELECT month_expiry
+    FROM monthly_min
+    ORDER BY month_expiry
+    """
+    expiries_df = pd.read_sql(q, conn)
+    expiries = expiries_df["month_expiry"].tolist()
+
+    if not expiries:
+        print("⚠️ No monthly expiries found; monthly tables not updated.")
+        for tbl in MONTH_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+        conn.commit()
+        return
+
+    load_date = current_load_date()
+
+    for i, exp in enumerate(expiries[:len(MONTH_TABLES)]):
+        table_name = MONTH_TABLES[i]
+        print(f"📆 Refreshing {table_name} for monthly expiry {exp}")
+        df_month = pd.read_sql(
+            "SELECT * FROM options_daily WHERE expiry_date = ?",
+            conn,
+            params=(exp,)
+        )
+        df_month["load_date"] = load_date
+        df_month.to_sql(table_name, conn, if_exists="replace", index=False)
+
+    for j in range(len(expiries), len(MONTH_TABLES)):
+        table_name = MONTH_TABLES[j]
+        print(f"🗑 Dropping stale monthly table {table_name} (no matching expiry)")
+        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+        conn.commit()
 
 # ============= OPTIONS FETCH (YAHOO, ±10 STRIKES, NEXT 45 DAYS) =============
-
 
 def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
     session = curl_requests.Session(impersonate="chrome")
     tk = yf.Ticker(ticker, session=session)
     results = []
     try:
-        # Get spot price
         spot = None
         try:
             hist = tk.history(period="1d")
@@ -415,12 +498,10 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
         except Exception:
             pass
 
-        # LIMIT: only expiries within next 45 days
         max_horizon_days = 45
 
         if hasattr(tk, 'options') and tk.options:
             for exp in tk.options:
-                # Parse expiry and filter by horizon
                 try:
                     exp_dt = datetime.strptime(exp, "%Y-%m-%d").date()
                 except Exception:
@@ -429,7 +510,6 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
                 if exp_dt > trade_dt + timedelta(days=max_horizon_days):
                     continue
 
-                # Get option chain for this expiry
                 oc = tk.option_chain(exp)
 
                 calls = oc.calls[['contractSymbol', 'strike', 'openInterest', 'lastPrice', 'volume']].rename(columns={
@@ -446,7 +526,6 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
                     'volume': 'vol_Put'
                 })
 
-                # LIMIT: keep only ±10 strikes around spot
                 if spot is not None and (not calls.empty or not puts.empty):
                     strikes_series = pd.concat([
                         calls['strike'] if 'strike' in calls.columns else pd.Series([], dtype=float),
@@ -490,9 +569,7 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
         print(f"✅ Options fetched for {ticker}: {sum(len(r) for r in results)} rows")
     return results
 
-
 # ============= MERGE CALLS/PUTS: ONE TICKER AT A TIME =============
-
 
 def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_tickers):
     SECS_BETWEEN_TICKERS = 30  # adjust 20–60 as needed
@@ -561,16 +638,52 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
     new_order = first_cols + middle_cols + last_cols
     df_final = df_final[new_order]
 
+    trade_day_str = trade_day.strftime('%d%b%Y')
     out_file = os.path.join(DATA_DIR, f"Options_Strike_CallPut_{trade_day_str}.csv")
     df_final.to_csv(out_file, index=False)
     print(f"✅ Output file saved: {out_file}")
     print(f"📈 Total records: {len(df_final)}")
+
+    # Write into SQLite with duplicate-safe logic
+    load_date = current_load_date()
+    df_raw = df_final.copy()
+    df_raw["load_date"] = load_date
+
+    df_daily = df_final.copy()
+    df_daily["load_date"] = load_date
+
+    conn = sqlite3.connect(DB_PATH)
+    print("🛢 Writing to DB:", DB_PATH)
+
+    # delete existing rows for this trade_date (safe rerun)
+    if not df_daily.empty and "trade_date" in df_daily.columns:
+        trade_date_db = df_daily["trade_date"].iloc[0]
+        try:
+            conn.execute(f"DELETE FROM {TABLE_OPTIONS_RAW} WHERE trade_date = ?", (trade_date_db,))
+        except Exception:
+            pass
+        try:
+            conn.execute(f"DELETE FROM {TABLE_OPTIONS} WHERE trade_date = ?", (trade_date_db,))
+        except Exception:
+            pass
+        conn.commit()
+
+    df_raw.to_sql(TABLE_OPTIONS_RAW, conn, if_exists="append", index=False)
+    print(f"✅ Appended {len(df_raw)} rows to {TABLE_OPTIONS_RAW}")
+    df_daily.to_sql(TABLE_OPTIONS, conn, if_exists="append", index=False)
+    print(f"✅ Appended {len(df_daily)} rows to {TABLE_OPTIONS}")
+
+    # Refresh weekly/monthly from options_daily
+    refresh_weekly_tables(conn)
+    refresh_monthly_tables(conn)
+
+    conn.close()
+    print(f"✅ DB write and weekly/monthly refresh completed for {trade_day_str}")
+
     print("Sample record for today:\n", df_final.head(1).to_string(index=False))
     return df_final, out_file
 
-
 # ============= AUDIT BLANK / EMPTY ROWS =============
-
 
 def audit_empty_option_rows(df: pd.DataFrame, trade_day_str: str):
     if df is None or df.empty:
@@ -601,9 +714,7 @@ def audit_empty_option_rows(df: pd.DataFrame, trade_day_str: str):
     empty_rows.to_csv(log_path, index=False)
     print(f"📝 Simple audit log saved: {log_path}")
 
-
-# ============= CHANGE CALCULATION =============
-
+# ============= CHANGE CALCULATION (UPDATED) =============
 
 def ensure_columns(df, required):
     for c in required:
@@ -611,10 +722,11 @@ def ensure_columns(df, required):
             df[c] = np.nan
     return df
 
-
 def compute_oi_vol_change(trade_day):
     print(f"🔍 Computing open interest and volume changes for {trade_day.strftime('%Y-%m-%d')}...")
     trade_day_str = trade_day.strftime('%d%b%Y')
+
+    # ---------- find previous trading day file ----------
     prev_day = trade_day - timedelta(days=1)
     prev_day_str = None
     for _ in range(7):
@@ -638,12 +750,22 @@ def compute_oi_vol_change(trade_day):
     df_now = pd.read_csv(today_file)
     df_prev = pd.read_csv(prev_file)
 
+    # ---------- ensure base columns ----------
     required_columns = [
         'ticker','company_name','asset_type','strike','expiry_date','trade_date',
-        'openInt_Call','openInt_Put','vol_Call','vol_Put','lastPrice_Call','lastPrice_Put'
+        'openInt_Call','openInt_Put','vol_Call','vol_Put',
+        'lastPrice_Call','lastPrice_Put'
     ]
     df_now = ensure_columns(df_now, required_columns)
     df_prev = ensure_columns(df_prev, required_columns)
+
+    # ---------- ensure OHLC ----------
+    ohlc_cols = [
+        "call_open","call_high","call_low","call_close",
+        "put_open","put_high","put_low","put_close"
+    ]
+    df_now = ensure_columns(df_now, ohlc_cols)
+    df_prev = ensure_columns(df_prev, ohlc_cols)
 
     df_now['expiry_date'] = df_now['expiry_date'].astype(str)
     df_prev['expiry_date'] = df_prev['expiry_date'].astype(str)
@@ -651,28 +773,68 @@ def compute_oi_vol_change(trade_day):
     df_prev['strike'] = df_prev['strike'].astype(float)
 
     key_cols = ['ticker', 'strike', 'expiry_date']
-    merged = pd.merge(df_now, df_prev, on=key_cols, suffixes=('_now', '_prev'), how='inner')
+    merged = pd.merge(
+        df_now,
+        df_prev,
+        on=key_cols,
+        suffixes=('_now', '_prev'),
+        how='inner'
+    )
 
-    merged['change_OI_Call'] = merged['openInt_Call_now'] - merged['openInt_Call_prev']
-    merged['change_OI_Put']  = merged['openInt_Put_now']  - merged['openInt_Put_prev']
-    merged['change_vol_Call'] = merged['vol_Call_now'] - merged['vol_Call_prev']
-    merged['change_vol_Put']  = merged['vol_Put_now']  - merged['vol_Put_prev']
+    # ---------- OI / volume changes ----------
+    for c in [
+        'openInt_Call_now','openInt_Call_prev',
+        'openInt_Put_now','openInt_Put_prev',
+        'vol_Call_now','vol_Call_prev',
+        'vol_Put_now','vol_Put_prev'
+    ]:
+        if c in merged.columns:
+            merged[c] = merged[c].fillna(0)
+
+    merged['change_OI_Call']  = merged['openInt_Call_now'] - merged['openInt_Call_prev']
+    merged['change_OI_Put']   = merged['openInt_Put_now']  - merged['openInt_Put_prev']
+    merged['change_vol_Call'] = merged['vol_Call_now']     - merged['vol_Call_prev']
+    merged['change_vol_Put']  = merged['vol_Put_now']      - merged['vol_Put_prev']
 
     def pct_change(now, prev):
         return np.where(prev == 0, np.nan, (now - prev) / prev * 100)
 
-    merged['pct_change_OI_Call'] = pct_change(merged['openInt_Call_now'], merged['openInt_Call_prev'])
-    merged['pct_change_OI_Put']  = pct_change(merged['openInt_Put_now'],  merged['openInt_Put_prev'])
-    merged['pct_change_vol_Call'] = pct_change(merged['vol_Call_now'], merged['vol_Call_prev'])
-    merged['pct_change_vol_Put']  = pct_change(merged['vol_Put_now'],  merged['vol_Put_prev'])
+    merged['pct_change_OI_Call']  = pct_change(merged['openInt_Call_now'], merged['openInt_Call_prev'])
+    merged['pct_change_OI_Put']   = pct_change(merged['openInt_Put_now'],  merged['openInt_Put_prev'])
+    merged['pct_change_vol_Call'] = pct_change(merged['vol_Call_now'],     merged['vol_Call_prev'])
+    merged['pct_change_vol_Put']  = pct_change(merged['vol_Put_now'],      merged['vol_Put_prev'])
 
+    # ---------- levels and today's OHLC ----------
+    merged["lastPrice_Call_now"] = merged["lastPrice_Call_now"].fillna(0)
+    merged["lastPrice_Put_now"]  = merged["lastPrice_Put_now"].fillna(0)
+
+    # if *_now highs missing, fall back to plain highs
+    merged["call_high_now"] = merged.get("call_high_now", merged.get("call_high")).fillna(0)
+    merged["put_high_now"]  = merged.get("put_high_now",  merged.get("put_high")).fillna(0)
+
+    merged["R1"]  = merged["strike"] + merged["lastPrice_Call_now"]
+    merged["S1"]  = merged["strike"] - merged["lastPrice_Put_now"]
+    merged["R12"] = merged["strike"] + merged["call_high_now"]
+    merged["S12"] = merged["strike"] - merged["put_high_now"]
+
+    merged["call_open_now"]  = merged.get("call_open_now",  merged.get("call_open"))
+    merged["call_low_now"]   = merged.get("call_low_now",   merged.get("call_low"))
+    merged["call_close_now"] = merged.get("call_close_now", merged.get("call_close"))
+    merged["put_open_now"]   = merged.get("put_open_now",   merged.get("put_open"))
+    merged["put_low_now"]    = merged.get("put_low_now",    merged.get("put_low"))
+    merged["put_close_now"]  = merged.get("put_close_now",  merged.get("put_close"))
+
+    # ---------- output columns ----------
     cols_out = [
         'ticker','company_name_now','asset_type_now','strike','expiry_date','trade_date_now',
         'openInt_Call_now','openInt_Call_prev','change_OI_Call','pct_change_OI_Call',
         'openInt_Put_now','openInt_Put_prev','change_OI_Put','pct_change_OI_Put',
         'vol_Call_now','vol_Call_prev','change_vol_Call','pct_change_vol_Call',
         'vol_Put_now','vol_Put_prev','change_vol_Put','pct_change_vol_Put',
-        'lastPrice_Call_now','lastPrice_Put_now'
+        'lastPrice_Call_now','lastPrice_Put_now',
+        'call_open_now','call_high_now','call_low_now','call_close_now',
+        'put_open_now','put_high_now','put_low_now','put_close_now',
+        'R1','S1','R12','S12'
     ]
     merged = ensure_columns(merged, cols_out)
 
@@ -680,15 +842,119 @@ def compute_oi_vol_change(trade_day):
         merged["company_name_now"] = merged["company_name_now"].astype(str).str.replace('"', "")
 
     out_file = os.path.join(DATA_DIR, f"Options_Strike_CallPut_Change_{trade_day_str}.csv")
-    merged[cols_out].to_csv(out_file, index=False)
+    load_date = current_load_date()
+    df_out = merged[cols_out].copy()
+    df_out["load_date"] = load_date
+
+    df_out.to_csv(out_file, index=False)
     print(f"✅ OI/Volume change file: {out_file}")
-    print(f"📊 Change records saved: {len(merged)}")
-    print("Sample percentage change record:\n", merged[cols_out].head(2).to_string(index=False))
+    print(f"📊 Change records saved: {len(df_out)}")
+
+    conn = sqlite3.connect(DB_PATH)
+
+    # delete existing change rows for this trade_date_now (safe rerun)
+    if not df_out.empty and "trade_date_now" in df_out.columns:
+        trade_date_now = df_out["trade_date_now"].iloc[0]
+        try:
+            conn.execute(f"DELETE FROM {TABLE_OPTIONS_CHANGE} WHERE trade_date_now = ?", (trade_date_now,))
+            conn.commit()
+        except Exception:
+            pass
+
+    df_out.to_sql(TABLE_OPTIONS_CHANGE, conn, if_exists="append", index=False)
+    conn.close()
+    print(f"✅ Appended {len(df_out)} change rows into {TABLE_OPTIONS_CHANGE}")
+
+    print("Sample percentage change record:\n", df_out.head(2).to_string(index=False))
     return out_file
 
+# ============= STOCK_DAILY (OHLC + PCR) =============
+
+def build_stock_daily(trade_day, all_tickers):
+    """
+    For each ticker and trade_date, store OHLC, volume from Yahoo,
+    and basic PCR (using options_daily), plus load_date stamp.
+    Dates stored as MM-DD-YYYY strings.
+    """
+    trade_day_str_db = trade_day.strftime("%m-%d-%Y")
+    print(f"📊 Building stock_daily for {trade_day_str_db}...")
+
+    session = curl_requests.Session(impersonate="chrome")
+    records = []
+
+    for ticker in all_tickers:
+        try:
+            trade_day_iso = trade_day.strftime("%Y-%m-%d")
+            tk = yf.Ticker(ticker, session=session)
+            hist = tk.history(start=trade_day_iso, end=trade_day_iso, interval="1d")
+            if hist.empty:
+                hist = tk.history(period="1d")
+            if hist.empty:
+                print(f"ℹ stock_daily: no price data for {ticker}")
+                continue
+
+            row = hist.iloc[-1]
+            o = float(row.get("Open", np.nan))
+            h = float(row.get("High", np.nan))
+            l = float(row.get("Low", np.nan))
+            c = float(row.get("Close", np.nan))
+            v = float(row.get("Volume", np.nan))
+
+            conn = sqlite3.connect(DB_PATH)
+            df_opt = pd.read_sql(
+                """
+                SELECT openInt_Call, openInt_Put
+                FROM options_daily
+                WHERE ticker = ? AND trade_date = ?
+                """,
+                conn,
+                params=(ticker, trade_day.strftime("%d%b%Y")),
+            )
+            conn.close()
+
+            total_call_oi = df_opt["openInt_Call"].fillna(0).sum() if not df_opt.empty else 0
+            total_put_oi  = df_opt["openInt_Put"].fillna(0).sum()  if not df_opt.empty else 0
+            pcr_oi = total_put_oi / total_call_oi if total_call_oi > 0 else np.nan
+
+            load_date_str = current_load_date()
+
+            records.append({
+                "ticker": ticker,
+                "trade_date": trade_day_str_db,
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+                "volume": v,
+                "pcr_oi": pcr_oi,
+                "load_date": load_date_str,
+            })
+        except Exception as e:
+            print(f"⚠️ stock_daily: error for {ticker}: {e}")
+            continue
+
+    if not records:
+        print("⚠️ stock_daily: no records created")
+        return None
+
+    df_stock = pd.DataFrame(records)
+
+    conn = sqlite3.connect(DB_PATH)
+
+    # delete existing rows for this trade_date (safe rerun)
+    try:
+        conn.execute(f"DELETE FROM {TABLE_STOCK_DAILY} WHERE trade_date = ?", (trade_day_str_db,))
+        conn.commit()
+    except Exception:
+        pass
+
+    df_stock.to_sql(TABLE_STOCK_DAILY, conn, if_exists="append", index=False)
+    conn.close()
+    print(f"✅ stock_daily: appended {len(df_stock)} rows into {TABLE_STOCK_DAILY}")
+
+    return df_stock
 
 # ============= CLEANUP =============
-
 
 def cleanup_old_files(data_dir, days=90):
     print(f"🗑️  Cleaning up files older than {days} days...")
@@ -709,9 +975,7 @@ def cleanup_old_files(data_dir, days=90):
         print_progress_bar(i, len(files_to_delete), prefix="🗑️  Cleanup")
     print(f"\n✅ Cleanup completed: {len(files_to_delete)} files deleted.")
 
-
 # ============= MAIN (daily run) =============
-
 
 if __name__ == "__main__":
     print("🚀 Starting Options Chain Data Collection Script (Yahoo, single-ticker mode)")
@@ -742,7 +1006,13 @@ if __name__ == "__main__":
 
         print("\n📊 Phase 5: Compute changes")
         compute_oi_vol_change(eod_day)
+
+        print("\n📊 Phase 6: Build stock_daily")
+        build_stock_daily(eod_day, all_tickers)
+
         print("\n🎉 Script completed successfully!")
     else:
         print("\n❌ Script ended - no data to process")
-    
+
+    elapsed = time.time() - SCRIPT_START_TIME
+    print(f"\n⏱ Total runtime: {elapsed:.1f} seconds")
