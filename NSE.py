@@ -11,6 +11,7 @@ import os
 import html
 import pandas as pd
 
+
 # =====================================================
 # CONFIG
 # =====================================================
@@ -100,7 +101,7 @@ def get_font(fontsize=17):
 # NEW: 5-DAY OPTION SLICE FOR /SR STOCK STRIKE CE DD-MM
 # =====================================================
 
-def get_5day_option_slice(symbol: str, strike: float, opt_type: str, ddmm: str | None):
+def get_5day_option_slice(symbol: str, strike: float, opt_type: str, anchor_date: str | None):
     sym = symbol.upper()
     opt_type = opt_type.upper()
 
@@ -167,21 +168,7 @@ def get_5day_option_slice(symbol: str, strike: float, opt_type: str, ddmm: str |
     cur = conn.cursor()
 
     # dates
-    if ddmm:
-        cur.execute(f"SELECT MAX({date_col}) FROM {table} WHERE {sym_col} = ?", (sym,))
-        latest = cur.fetchone()[0]
-        if not latest:
-            conn.close()
-            return "", f"No data found for {sym} in {table}."
-
-        year = int(str(latest).split("-")[0])
-        try:
-            d, m = map(int, ddmm.split("-"))
-            anchor = f"{year:04d}-{m:02d}-{d:02d}"
-        except Exception:
-            conn.close()
-            return "", "Invalid date format. Use DD-MM."
-
+    if anchor_date:
         cur.execute(
             f"""
             SELECT DISTINCT {date_col}
@@ -191,7 +178,7 @@ def get_5day_option_slice(symbol: str, strike: float, opt_type: str, ddmm: str |
             ORDER BY {date_col} DESC
             LIMIT 5
             """,
-            (sym, anchor)
+            (sym, anchor_date)
         )
     else:
         cur.execute(
@@ -1516,10 +1503,139 @@ def build_layer1_plotly_chart(rows):
     fig.write_image('chart.png', width=900, height=550)
     return 'chart.png'
 
+# =====================================================
+# /sr COMMAND (INCLUDES /sr count AND 5-DAY SLICE DATE LOGIC)
+# =====================================================
+
 async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id if user else "unknown"
     raw_command = update.message.text if update.message else ""
+
+    # 0) /sr count [DD-MM] -> COUNT + STO1 joined
+    if context.args and context.args[0].lower() == "count":
+        args = context.args[1:]
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+
+        if len(args) == 0:
+            cur.execute("""
+                SELECT DISTINCT Trade_Date
+                FROM count
+                ORDER BY Trade_Date DESC
+                LIMIT 4
+            """)
+        else:
+            ddmm = args[0]
+            cur.execute("SELECT MAX(Trade_Date) FROM count")
+            latest = cur.fetchone()[0]
+            if not latest:
+                await update.message.reply_text("No data in count table.")
+                conn.close()
+                return
+            year = int(latest[:4])
+            try:
+                d, m = map(int, ddmm.split("-"))
+                anchor = f"{year:04d}-{m:02d}-{d:02d}"
+            except Exception:
+                await update.message.reply_text("Invalid date. Use /sr count DD-MM")
+                conn.close()
+                return
+
+            cur.execute("""
+                SELECT DISTINCT Trade_Date
+                FROM count
+                WHERE Trade_Date <= ?
+                ORDER BY Trade_Date DESC
+                LIMIT 4
+            """, (anchor,))
+
+        date_rows = cur.fetchall()
+        if not date_rows:
+            await update.message.reply_text("No trade dates found in count table.")
+            conn.close()
+            return
+
+        dates = [r[0] for r in date_rows]
+        placeholders = ",".join("?" * len(dates))
+
+        sql = f"""
+            SELECT
+                c.Symbol,
+                c.Option_Type,
+                c.Trade_Date,
+                c.Count,
+                c.Highest_Strike,
+                c.Open_Price,
+                c.High_Price,
+                c.Low_Price,
+                c.Close_Price,
+                c.PrevClose_Price,
+                s.Open_Interest  AS OI,
+                s.Change_in_OI   AS COI
+            FROM count AS c
+            JOIN STO1 AS s
+              ON s.Symbol      = c.Symbol
+             AND s.Option_Type = c.Option_Type
+             AND s.Trade_Date  = c.Trade_Date
+             AND s.StrkPric    = c.Highest_Strike
+            WHERE c.Trade_Date IN ({placeholders})
+            ORDER BY c.Trade_Date DESC, c.Symbol, c.Option_Type
+        """
+        cur.execute(sql, dates)
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            await update.message.reply_text("No matching rows in count/STO1 for those dates.")
+            return
+
+        headers = [
+            "Symbol","Type","Date","Count","High_Strike",
+            "Open","High","Low","Close","PrevClose","OI","COI"
+        ]
+
+        table_rows = []
+        raw_dates = []
+        for r in rows:
+            sym, opt, dt, cnt, hst, op, hi, lo, cl, pc, oi, coi = r
+            short_dt = dt[8:10] + "-" + dt[5:7]
+            raw_dates.append(dt)
+            table_rows.append([
+                str(sym),
+                str(opt),
+                short_dt,
+                str(cnt),
+                str(int(round(hst))) if hst is not None else "NA",
+                f"{op:.1f}" if op is not None else "NA",
+                f"{hi:.1f}" if hi is not None else "NA",
+                f"{lo:.1f}" if lo is not None else "NA",
+                f"{cl:.1f}" if cl is not None else "NA",
+                f"{pc:.1f}" if pc is not None else "NA",
+                str(int(oi)) if oi is not None else "NA",
+                str(int(coi)) if coi is not None else "NA"
+            ])
+
+        col_widths = [
+            max(len(headers[i]), max(len(row[i]) for row in table_rows))
+            for i in range(len(headers))
+        ]
+
+        header_line = " | ".join(headers[i].ljust(col_widths[i]) for i in range(len(headers)))
+        lines = [header_line]
+
+        last_dt = None
+        for idx, row in enumerate(table_rows):
+            curr_dt = raw_dates[idx]
+            if last_dt is not None and curr_dt != last_dt:
+                lines.append("")
+            lines.append(" | ".join(row[i].ljust(col_widths[i]) for i in range(len(headers))))
+            last_dt = curr_dt
+
+        text = "\n".join(lines)
+        await send_in_blocks(text, update)
+        log_line(f"USER {user_id} CMD {raw_command} -> SR-COUNT mode args={args}")
+        return
 
     # 1) SR SCANNER SHORTCUTS: /sr S1, /sr ALLS, /sr R2 08-12
     if context.args:
@@ -1552,18 +1668,72 @@ async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             opt_type = context.args[2].upper()
             if opt_type in ("CE", "PE"):
-                ddmm = context.args[3] if len(context.args) >= 4 else None
-                text, debug = get_5day_option_slice(sym, strike_val, opt_type, ddmm)
+                ddmm_input = context.args[3] if len(context.args) >= 4 else None
+
+                anchor_trade_date = None
+                conn = sqlite3.connect(DB_PATH)
+                cur = conn.cursor()
+
+                if sym in ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"):
+                    index_map = {
+                        "NIFTY": "NIFTYFO",
+                        "BANKNIFTY": "BANKFO",
+                        "SENSEX": "SENSEXFO",
+                        "MIDCPNIFTY": "MIDFO",
+                    }
+                    tname = index_map[sym]
+                    date_col = "TradDt"
+                    sym_col = "TckrSymb"
+                else:
+                    tname = "STO1"
+                    date_col = "Trade_Date"
+                    sym_col = "Symbol"
+
+                cur.execute(
+                    f"SELECT MAX({date_col}) FROM {tname} WHERE {sym_col} = ?",
+                    (sym,)
+                )
+                latest_row = cur.fetchone()
+                latest_td = latest_row[0] if latest_row and latest_row[0] else None
+
+                if latest_td:
+                    if ddmm_input:
+                        try:
+                            year = int(latest_td[:4])
+                            d, m = map(int, ddmm_input.split("-"))
+                            anchor = f"{year:04d}-{m:02d}-{d:02d}"
+                            cur.execute(
+                                f"""
+                                SELECT MAX({date_col})
+                                FROM {tname}
+                                WHERE {sym_col} = ?
+                                  AND {date_col} <= ?
+                                """,
+                                (sym, anchor)
+                            )
+                            row2 = cur.fetchone()
+                            anchor_trade_date = row2[0] if row2 and row2[0] else None
+                        except Exception:
+                            anchor_trade_date = None
+                    else:
+                        anchor_trade_date = latest_td
+
+                conn.close()
+
+                text, debug = get_5day_option_slice(sym, strike_val, opt_type, anchor_trade_date)
+
                 if text:
                     heading = f"{sym} {int(strike_val)} {opt_type} 5-day slice"
-                    if ddmm:
-                        heading += f" up to {ddmm}"
+                    if anchor_trade_date:
+                        heading += f" up to {anchor_trade_date[8:10]}-{anchor_trade_date[5:7]}"
                     await send_in_blocks(heading + "\n\n" + text, update)
                 else:
                     await update.message.reply_text(f"No data: {debug}")
+
                 log_line(
                     f"USER {user_id} CMD {raw_command} -> 5DAY MODE "
-                    f"symbol={sym}, strike={strike_val}, type={opt_type}, ddmm={ddmm}"
+                    f"symbol={sym}, strike={strike_val}, type={opt_type}, "
+                    f"anchor={anchor_trade_date}"
                 )
                 return
 
@@ -1675,145 +1845,9 @@ async def sr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/sr S1 | /sr ALLS | /sr R2 08-12\n"
         "/sr <INDEX> <STRIKE>\n"
         "/sr <STOCK>\n"
-        "/sr <STOCK> <STRIKE> CE|PE [DD-MM]"
+        "/sr <STOCK> <STRIKE> CE|PE [DD-MM]\n"
+        "/sr count [DD-MM]"
     )
-
-# =====================================================
-# NEW: /count COMMAND (COUNT + STO1 JOIN)
-# =====================================================
-
-# =====================================================
-# NEW: /count COMMAND (COUNT + STO1 JOIN)
-# =====================================================
-
-async def count_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    # 1) determine 4 trade dates from count table
-    if len(args) == 0:
-        # /count -> last 4 dates
-        cur.execute("""
-            SELECT DISTINCT Trade_Date
-            FROM count
-            ORDER BY Trade_Date DESC
-            LIMIT 4
-        """)
-    else:
-        # /count DD-MM -> that date + previous 3 dates
-        ddmm = args[0]
-        cur.execute("SELECT MAX(Trade_Date) FROM count")
-        latest = cur.fetchone()[0]
-        if not latest:
-            await update.message.reply_text("No data in count table.")
-            conn.close()
-            return
-        year = int(latest[:4])
-        try:
-            d, m = map(int, ddmm.split("-"))
-            anchor = f"{year:04d}-{m:02d}-{d:02d}"
-        except Exception:
-            await update.message.reply_text("Invalid date. Use /count DD-MM")
-            conn.close()
-            return
-
-        cur.execute("""
-            SELECT DISTINCT Trade_Date
-            FROM count
-            WHERE Trade_Date <= ?
-            ORDER BY Trade_Date DESC
-            LIMIT 4
-        """, (anchor,))
-
-    date_rows = cur.fetchall()
-    if not date_rows:
-        await update.message.reply_text("No trade dates found in count table.")
-        conn.close()
-        return
-
-    dates = [r[0] for r in date_rows]
-    placeholders = ",".join("?" * len(dates))
-
-    # 2) join count + STO1
-    sql = f"""
-        SELECT
-            c.Symbol,
-            c.Option_Type,
-            c.Trade_Date,
-            c.Count,
-            c.Highest_Strike,
-            c.Open_Price,
-            c.High_Price,
-            c.Low_Price,
-            c.Close_Price,
-            c.PrevClose_Price,
-            s.Open_Interest  AS OI,
-            s.Change_in_OI   AS COI
-        FROM count AS c
-        JOIN STO1 AS s
-          ON s.Symbol      = c.Symbol
-         AND s.Option_Type = c.Option_Type
-         AND s.Trade_Date  = c.Trade_Date
-         AND s.StrkPric    = c.Highest_Strike
-        WHERE c.Trade_Date IN ({placeholders})
-        ORDER BY c.Trade_Date DESC, c.Symbol, c.Option_Type
-    """
-    cur.execute(sql, dates)
-    rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
-        await update.message.reply_text("No matching rows in count/STO1 for those dates.")
-        return
-
-    headers = [
-        "Symbol","Type","Date","Count","High_Strike",
-        "Open","High","Low","Close","PrevClose","OI","COI"
-    ]
-
-    # build rows as strings and keep raw date to insert blank lines between dates
-    table_rows = []
-    raw_dates = []
-    for r in rows:
-        sym, opt, dt, cnt, hst, op, hi, lo, cl, pc, oi, coi = r
-        short_dt = dt[8:10] + "-" + dt[5:7]
-        raw_dates.append(dt)
-        table_rows.append([
-            str(sym),
-            str(opt),
-            short_dt,
-            str(cnt),
-            str(int(round(hst))) if hst is not None else "NA",
-            f"{op:.1f}" if op is not None else "NA",
-            f"{hi:.1f}" if hi is not None else "NA",
-            f"{lo:.1f}" if lo is not None else "NA",
-            f"{cl:.1f}" if cl is not None else "NA",
-            f"{pc:.1f}" if pc is not None else "NA",
-            str(int(oi)) if oi is not None else "NA",
-            str(int(coi)) if coi is not None else "NA"
-        ])
-
-    # auto-fit column widths (like your other tables)
-    col_widths = [
-        max(len(headers[i]), max(len(row[i]) for row in table_rows))
-        for i in range(len(headers))
-    ]
-
-    header_line = " | ".join(headers[i].ljust(col_widths[i]) for i in range(len(headers)))
-    lines = [header_line]
-
-    # add a blank line when Trade_Date changes
-    last_dt = None
-    for idx, row in enumerate(table_rows):
-        curr_dt = raw_dates[idx]
-        if last_dt is not None and curr_dt != last_dt:
-            lines.append("")  # blank separator line between dates
-        lines.append(" | ".join(row[i].ljust(col_widths[i]) for i in range(len(headers))))
-        last_dt = curr_dt
-
-    text = "\n".join(lines)
-    await send_in_blocks(text, update)
 
 # =====================================================
 # BASIC COMMANDS & MAIN
@@ -1836,40 +1870,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "    /srsr ALLS\n"
         "    /srsr R2 08-12\n\n"
         "/sr S1 | /sr ALLS | /sr R2 08-12\n"
-        "  - Same SR scanner shortcuts on /sr.\n"
-        "  - Examples:\n"
-        "    /sr S1\n"
-        "    /sr ALLS\n"
-        "    /sr R2 08-12\n\n"
+        "  - Same SR scanner shortcuts on /sr.\n\n"
         "/sr <INDEX> <STRIKE>\n"
         "  - Index options view around a strike (single day).\n"
-        "  - INDEX must be NIFTY, BANKNIFTY, SENSEX or MIDCPNIFTY.\n"
-        "  - Examples:\n"
-        "    /sr NIFTY 26500\n"
-        "    /sr BANKNIFTY 48000\n\n"
+        "  - INDEX must be NIFTY, BANKNIFTY, SENSEX or MIDCPNIFTY.\n\n"
         "/sr <STOCK>\n"
-        "  - Multi-layer stock analytics (Layers 1–4) + chart.\n"
-        "  - Example:\n"
-        "    /sr INFY\n\n"
+        "  - Multi-layer stock analytics (Layers 1–4) + chart.\n\n"
         "/sr <SYMBOL> <STRIKE> CE|PE [DD-MM]\n"
         "  - 5 trading days slice for one symbol/strike and option type.\n"
         "  - If DD-MM is given: uses up to 5 trading days on/before that date (current year).\n"
-        "  - If DD-MM is omitted: uses last 5 trading days.\n"
-        "  - SYMBOL can be stock (from STO1) or index (NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY).\n"
-        "  - Examples:\n"
-        "    /sr INFY 1600 CE\n"
-        "    /sr INFY 1600 CE 14-12\n"
-        "    /sr NIFTY 26000 CE\n"
-        "    /sr BANKNIFTY 48000 PE 10-12\n\n"
-        "/count [DD-MM]\n"
+        "  - If DD-MM is omitted: uses last 5 trading days.\n\n"
+        "/sr count [DD-MM]\n"
         "  - Show last 4 trade dates from 'count' joined with STO1 (OI/COI).\n"
         "  - Without date: last 4 dates.\n"
         "  - With DD-MM: that date plus previous 3 trade dates.\n\n"
         "/niftyfo, /niftym, /sensexfo, /bankfo, /midfo\n"
         "  - Index OI/COI structure + unwind images for latest date.\n"
-        "  - Examples:\n"
-        "    /niftyfo\n"
-        "    /bankfo\n"
     )
     await update.message.reply_text(text)
 
@@ -1882,17 +1898,9 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-
-    # Old SR scanner
     app.add_handler(CommandHandler("srsr", srscan_command))
-
-    # Multi-layer / options analytics
     app.add_handler(CommandHandler("sr", sr_command))
 
-    # New /count command
-    app.add_handler(CommandHandler("count", count_command))
-
-    # Index image commands
     app.add_handler(CommandHandler("niftyfo", niftyfo))
     app.add_handler(CommandHandler("niftym", niftym))
     app.add_handler(CommandHandler("sensexfo", sensexfo))
