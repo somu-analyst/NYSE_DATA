@@ -572,7 +572,7 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
 # ============= MERGE CALLS/PUTS: ONE TICKER AT A TIME =============
 
 def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_tickers):
-    SECS_BETWEEN_TICKERS = 30  # adjust 20–60 as needed
+    SECS_BETWEEN_TICKERS = 1  # adjust 20–60 as needed
 
     print(f"🔄 Starting options chain collection (Yahoo, 1 ticker at a time) for {trade_day.strftime('%Y-%m-%d')}")
     trade_day_str = trade_day.strftime('%d%b%Y')
