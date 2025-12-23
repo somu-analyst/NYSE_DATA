@@ -6,6 +6,7 @@ import pandas as pd
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import yfinance as yf
 
 # =========================
 # CONFIG
@@ -20,6 +21,12 @@ TABLE_STOCK_DAILY    = "stock_daily"
 
 BASE_OUT_DIR = os.path.join(DATA_DIR, "NYSE_DATA", "US_CHARTS")
 os.makedirs(BASE_OUT_DIR, exist_ok=True)
+
+SUMMARY_EXCEL_PATH = os.path.join(DATA_DIR, "Daily_Spread_Summary.xlsx")
+
+# Filters for which trades to include in daily summary
+MIN_PREMIUM_COLLECTED = 0.0   # e.g. 10.0 to require >= $10 credit; 0.0 = no min
+MAX_MAX_LOSS = None           # e.g. 500.0 to cap risk per spread; None = no cap
 
 # =========================
 # DB helpers
@@ -37,6 +44,26 @@ def latest_trade_date_now():
     if df.empty or df["td"].iloc[0] is None:
         return None
     return df["td"].iloc[0]
+
+def previous_trade_date_now(curr_trade_date_now):
+    with get_conn() as conn:
+        df = pd.read_sql(
+            f"""
+            SELECT DISTINCT trade_date_now
+            FROM {TABLE_OPTIONS_CHANGE}
+            ORDER BY trade_date_now DESC
+            """,
+            conn
+        )
+    if df.empty:
+        return None
+    dates = df["trade_date_now"].tolist()
+    if curr_trade_date_now not in dates:
+        return dates[1] if len(dates) > 1 else None
+    idx = dates.index(curr_trade_date_now)
+    if idx + 1 < len(dates):
+        return dates[idx + 1]
+    return None
 
 def trade_date_now_to_mmddyyyy(td_now):
     dt = datetime.strptime(td_now, "%d%b%Y")
@@ -153,6 +180,8 @@ def get_options_slice(symbol, trade_date_now, expiry):
         "change_OI_Call", "change_OI_Put",
         "change_vol_Call", "change_vol_Put",
         "R1", "S1", "R12", "S12",
+        "call_close_now", "put_close_now",
+        "call_open_now", "put_open_now",
     ]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
@@ -163,10 +192,65 @@ def get_options_slice(symbol, trade_date_now, expiry):
     return df
 
 # =========================
-# FIGURE 1: OI chart (±5% band, OI bars + ΔOI lines, legend top-right)
+# Yahoo Finance helpers
 # =========================
 
-def make_oi_chart(symbol, trade_date_now):
+def get_yahoo_prices():
+    tickers = [
+        "IBIT", "GLD", "SLV", "SPY", "VOO", "QQQ",
+        "BTC-USD", "GC=F", "SI=F", "^GSPC", "^NDX"
+    ]
+    data = yf.download(
+        tickers=" ".join(tickers),
+        period="1d",
+        interval="1d",
+        progress=False
+    )
+    prices = {}
+    try:
+        close = data["Close"]
+        for t in tickers:
+            if t in close.columns:
+                val = close[t].iloc[-1]
+            else:
+                val = np.nan
+            prices[t] = float(val) if pd.notna(val) else np.nan
+    except Exception:
+        for t in tickers:
+            prices[t] = np.nan
+    return prices
+
+def mapping_ratio(ticker, prices):
+    t = str(ticker).upper()
+    def ratio(etf_sym, underlying_sym):
+        etf_p = prices.get(etf_sym, np.nan)
+        und_p = prices.get(underlying_sym, np.nan)
+        if np.isnan(etf_p) or np.isnan(und_p) or etf_p <= 0:
+            return 1.0
+        return und_p / etf_p
+    if t == "IBIT":
+        return ratio("IBIT", "BTC-USD")
+    if t == "GLD":
+        return ratio("GLD", "GC=F")
+    if t == "SLV":
+        return ratio("SLV", "SI=F")
+    if t in ("SPY", "VOO"):
+        return ratio(t, "^GSPC")
+    if t == "QQQ":
+        return ratio("QQQ", "^NDX")
+    return 1.0
+
+def map_spot_for_display(ticker, raw_spot, prices):
+    if raw_spot is None or np.isnan(raw_spot):
+        return raw_spot
+    r = mapping_ratio(ticker, prices)
+    return raw_spot * r
+
+# =========================
+# FIGURE 1: OI chart (all strikes)
+# =========================
+
+def make_oi_chart(symbol, trade_date_now, yahoo_prices):
     sym = symbol.upper()
     company_name = get_company_name(sym, trade_date_now)
     expiries = get_all_expiries(sym, trade_date_now)
@@ -179,6 +263,10 @@ def make_oi_chart(symbol, trade_date_now):
         print(f"[WARN] {sym}: no stock_daily for {trade_date_now}")
         return None, None, None
     spot = float(stock_df["close"].iloc[0])
+
+    ratio = mapping_ratio(sym, yahoo_prices)
+    spot_conv = spot * ratio
+    display_spot = spot_conv
 
     n = len(expiries)
     fig = make_subplots(
@@ -196,14 +284,10 @@ def make_oi_chart(symbol, trade_date_now):
             print(f"[WARN] {sym}: no data for expiry {expiry}")
             continue
 
-        # limit strikes to ±5% around spot
         df = df_slice.copy()
-        band_low = spot * 0.95
-        band_high = spot * 1.05
-        df = df[(df["strike"] >= band_low) & (df["strike"] <= band_high)].copy()
-        if df.empty:
-            continue
         df = df.sort_values("strike")
+
+        df["strike_conv"] = df["strike"] * ratio
 
         df["call_oi"] = df["openInt_Call"]
         df["put_oi"]  = df["openInt_Put"]
@@ -221,10 +305,9 @@ def make_oi_chart(symbol, trade_date_now):
 
         show_legend = (i == 1)
 
-        # OI bars
         fig.add_trace(
             go.Bar(
-                x=df["strike"],
+                x=df["strike_conv"],
                 y=df["call_oi"],
                 name="Call OI",
                 marker_color="royalblue",
@@ -235,7 +318,7 @@ def make_oi_chart(symbol, trade_date_now):
         )
         fig.add_trace(
             go.Bar(
-                x=df["strike"],
+                x=df["strike_conv"],
                 y=df["put_oi_plot"],
                 name="Put OI",
                 marker_color="firebrick",
@@ -244,11 +327,9 @@ def make_oi_chart(symbol, trade_date_now):
             ),
             row=i, col=1, secondary_y=False
         )
-
-        # ΔOI lines on secondary axis
         fig.add_trace(
             go.Scatter(
-                x=df["strike"],
+                x=df["strike_conv"],
                 y=df["call_coi"],
                 name="Call ΔOI",
                 mode="lines+markers",
@@ -260,7 +341,7 @@ def make_oi_chart(symbol, trade_date_now):
         )
         fig.add_trace(
             go.Scatter(
-                x=df["strike"],
+                x=df["strike_conv"],
                 y=df["put_coi"],
                 name="Put ΔOI",
                 mode="lines+markers",
@@ -271,8 +352,7 @@ def make_oi_chart(symbol, trade_date_now):
             row=i, col=1, secondary_y=True
         )
 
-        # x-axis ticks = all strikes, numeric axis
-        strike_vals = df["strike"].tolist()
+        strike_vals = df["strike_conv"].tolist()
         strike_text = [str(int(s)) for s in strike_vals]
 
         fig.update_xaxes(
@@ -301,7 +381,7 @@ def make_oi_chart(symbol, trade_date_now):
         )
 
         fig.add_vline(
-            x=spot,
+            x=spot_conv,
             line_dash="dash",
             line_color="black",
             row=i,
@@ -317,8 +397,8 @@ def make_oi_chart(symbol, trade_date_now):
 
     fig.update_layout(
         title=(
-            f"{company_name} ({sym}) – OI & ΔOI by Strike (±5% around spot)"
-            f"<br>trade_date_now {trade_date_now}, spot {spot:.2f}"
+            f"{company_name} ({sym}) – OI & ΔOI by Strike (all strikes)"
+            f"<br>trade_date_now {trade_date_now}, spot {display_spot:.2f}"
         ),
         height=280 * max(1, len(expiries)),
         width=1500,
@@ -330,7 +410,7 @@ def make_oi_chart(symbol, trade_date_now):
             yanchor="top",
             y=1.0,
             xanchor="right",
-            x=1.02,  # right top outside plot
+            x=1.02,
         ),
         margin=dict(l=60, r=160, t=80, b=40),
     )
@@ -341,8 +421,10 @@ def make_oi_chart(symbol, trade_date_now):
 # FIGURE 2: per‑stock numeric summary TABLE
 # =========================
 
-def make_summary_table(symbol, trade_date_now, company_name, spot):
+def make_summary_table(symbol, trade_date_now, company_name, spot, yahoo_prices):
     sym = symbol.upper()
+    ratio = mapping_ratio(sym, yahoo_prices)
+    display_spot = spot * ratio if spot is not None and not np.isnan(spot) else np.nan
     expiries = get_all_expiries(sym, trade_date_now)
     if not expiries:
         return None
@@ -389,17 +471,17 @@ def make_summary_table(symbol, trade_date_now, company_name, spot):
 
         rows.append({
             "Expiry": expiry,
-            "Key_Strike": f"{key_strike:.0f}" if not np.isnan(key_strike) else "",
+            "Key_Strike": f"{key_strike * ratio:.0f}" if not np.isnan(key_strike) else "",
             "ΔCall_OI": f"{dcall:+}",
             "ΔPut_OI": f"{dput:+}",
             "|ΔOI|": f"{abs_doi}",
             "Call_OI": f"{int(total_call_oi):,}",
             "Put_OI": f"{int(total_put_oi):,}",
             "PCR_OI": f"{pcr_oi:.2f}" if not np.isnan(pcr_oi) else "NA",
-            "S1": f"{s1:.0f}" if s1 is not None else "",
-            "R1": f"{r1:.0f}" if r1 is not None else "",
-            "S12": f"{s12:.0f}" if s12 is not None else "",
-            "R12": f"{r12:.0f}" if r12 is not None else "",
+            "S1": f"{s1*ratio:.0f}" if s1 is not None else "",
+            "R1": f"{r1*ratio:.0f}" if r1 is not None else "",
+            "S12": f"{s12*ratio:.0f}" if s12 is not None else "",
+            "R12": f"{r12*ratio:.0f}" if r12 is not None else "",
         })
 
     if not rows:
@@ -431,7 +513,7 @@ def make_summary_table(symbol, trade_date_now, company_name, spot):
     fig.update_layout(
         title=(
             f"{company_name} ({sym}) – Options Summary Table "
-            f"({trade_date_now}, spot {spot:.2f})"
+            f"({trade_date_now}, spot {display_spot:.2f})"
         ),
         width=1500,
         height=300 + 25 * len(df_tab),
@@ -441,30 +523,12 @@ def make_summary_table(symbol, trade_date_now, company_name, spot):
     return fig
 
 # =========================
-# OVERVIEW + per‑expiry S/R
+# Consolidated spread table (today's trades)
 # =========================
 
-def build_overview_df(trade_date_now):
+def build_consolidated_spread_table(trade_date_now):
     td_mmddyyyy = trade_date_now_to_mmddyyyy(trade_date_now)
-
     with get_conn() as conn:
-        df_opt = pd.read_sql(
-            f"""
-            SELECT
-                ticker,
-                company_name_now,
-                openInt_Call_now,
-                openInt_Put_now,
-                change_OI_Call,
-                change_OI_Put,
-                strike,
-                S1, R1, S12, R12
-            FROM {TABLE_OPTIONS_CHANGE}
-            WHERE trade_date_now = ?
-            """,
-            conn,
-            params=(trade_date_now,)
-        )
         df_stock = pd.read_sql(
             f"""
             SELECT ticker, trade_date, close
@@ -474,327 +538,328 @@ def build_overview_df(trade_date_now):
             conn,
             params=(td_mmddyyyy,)
         )
+    if df_stock.empty:
+        print("[WARN] No stock_daily data; cannot build consolidated spreads.")
+        return pd.DataFrame()
 
-    if df_opt.empty or df_stock.empty:
-        return None
-
-    df_stock = df_stock.rename(columns={"close": "spot"})
-    stock_map = df_stock.set_index("ticker")["spot"].to_dict()
-
-    records = []
-
-    for ticker, grp in df_opt.groupby("ticker"):
-        spot = stock_map.get(ticker, np.nan)
-        total_call_oi = grp["openInt_Call_now"].fillna(0).sum()
-        total_put_oi  = grp["openInt_Put_now"].fillna(0).sum()
-        pcr_oi = total_put_oi / total_call_oi if total_call_oi > 0 else np.nan
-
-        if not np.isnan(spot) and spot > 0:
-            band_low = spot * 0.95
-            band_high = spot * 1.05
-            near = grp[(grp["strike"] >= band_low) & (grp["strike"] <= band_high)]
-        else:
-            near = grp
-
-        dcall_near = near["change_OI_Call"].fillna(0).sum()
-        dput_near  = near["change_OI_Put"].fillna(0).sum()
-
-        sr = grp[["S1", "R1", "S12", "R12"]].dropna(how="all").copy()
-
-        def pick_closest(col, is_support=True):
-            if col not in sr.columns:
-                return None
-            series = sr[col].dropna()
-            if series.empty or np.isnan(spot):
-                return None
-            if is_support:
-                series = series[series <= spot]
-            else:
-                series = series[series >= spot]
-            if series.empty:
-                return None
-            return float(series.iloc[(series - spot).abs().argmin()])
-
-        s1 = pick_closest("S1", True)
-        r1 = pick_closest("R1", False)
-
-        if np.isnan(pcr_oi):
-            bias = "Neutral"
-        elif pcr_oi > 1.2 and dput_near > 0 and dcall_near <= 0:
-            bias = "Down"
-        elif pcr_oi < 0.8 and dcall_near > 0 and dput_near >= 0:
-            bias = "Up"
-        else:
-            bias = "Range"
-
-        if np.isnan(spot) or np.isnan(pcr_oi):
-            exp_move_pct = np.nan
-        else:
-            dev = abs(pcr_oi - 1.0)
-            base = 0.02 + min(dev, 0.5) * 0.04
-            exp_move_pct = base
-
-        if bias == "Down" and not np.isnan(exp_move_pct):
-            exp_down_pct = exp_move_pct
-            exp_up_pct = exp_move_pct / 2
-        elif bias == "Up" and not np.isnan(exp_move_pct):
-            exp_up_pct = exp_move_pct
-            exp_down_pct = exp_move_pct / 2
-        else:
-            exp_up_pct = exp_move_pct / 2 if not np.isnan(exp_move_pct) else np.nan
-            exp_down_pct = exp_move_pct / 2 if not np.isnan(exp_move_pct) else np.nan
-
-        exp_up_price = spot * (1 + exp_up_pct) if not np.isnan(spot) and not np.isnan(exp_up_pct) else np.nan
-        exp_down_price = spot * (1 - exp_down_pct) if not np.isnan(spot) and not np.isnan(exp_down_pct) else np.nan
-
-        name = str(grp["company_name_now"].iloc[0]) if "company_name_now" in grp.columns else ticker
-
-        records.append({
-            "Ticker": ticker,
-            "Name": name,
-            "Spot": round(spot, 2) if not np.isnan(spot) else np.nan,
-            "PCR_OI": round(pcr_oi, 2) if not np.isnan(pcr_oi) else np.nan,
-            "Bias": bias,
-            "Exp_Up_%": round(exp_up_pct * 100, 1) if not np.isnan(exp_up_pct) else np.nan,
-            "Exp_Down_%": round(exp_down_pct * 100, 1) if not np.isnan(exp_down_pct) else np.nan,
-            "Nearest_S1": round(s1, 2) if s1 is not None else np.nan,
-            "Nearest_R1": round(r1, 2) if r1 is not None else np.nan,
-        })
-
-    return pd.DataFrame(records).sort_values("Ticker")
-
-def build_expiry_sr_df(trade_date_now):
-    with get_conn() as conn:
-        df = pd.read_sql(
-            f"""
-            SELECT ticker, expiry_date, S1, R1, S12, R12
-            FROM {TABLE_OPTIONS_CHANGE}
-            WHERE trade_date_now = ?
-            """,
-            conn,
-            params=(trade_date_now,)
-        )
-    for c in ["S1","R1","S12","R12"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    g = df.groupby(["ticker","expiry_date"])
-    out_rows = []
-    for (t,e), grp in g:
-        def pick(series):
-            vc = series.dropna().value_counts()
-            return vc.index[0] if not vc.empty else np.nan
-        out_rows.append({
-            "Ticker": t,
-            "Expiry": e,
-            "S1":  pick(grp["S1"]),
-            "R1":  pick(grp["R1"]),
-            "S12": pick(grp["S12"]),
-            "R12": pick(grp["R12"]),
-        })
-    return pd.DataFrame(out_rows)
-
-# =========================
-# English summary per stock (with arrows and volume)
-# =========================
-
-def make_english_summary_for_stock(symbol, trade_date_now, company_name, spot):
-    sym = symbol.upper()
-    expiries = get_all_expiries(sym, trade_date_now)
-    if not expiries:
-        return None
-
-    rows = []
-    bull_count = bear_count = 0
-    up_moves = []
-    dn_moves = []
-
-    for expiry in expiries:
-        df_slice = get_options_slice(sym, trade_date_now, expiry)
-        if df_slice is None or df_slice.empty:
+    stock_map = df_stock.set_index("ticker")["close"].to_dict()
+    symbols = get_symbols_for_trade_date(trade_date_now)
+    all_rows = []
+    for sym in symbols:
+        spot = stock_map.get(sym, np.nan)
+        if np.isnan(spot):
             continue
+        expiries = get_all_expiries(sym, trade_date_now)
+        if not expiries:
+            continue
+        for expiry in expiries:
+            df_slice = get_options_slice(sym, trade_date_now, expiry)
+            if df_slice is None or df_slice.empty:
+                continue
+            if "call_close_now" not in df_slice.columns:
+                continue
+            df_calls = df_slice.copy()
+            df_calls = df_calls[df_calls["call_close_now"] >= 0.10]
+            df_calls = df_calls[df_calls["strike"] >= spot]
+            if df_calls.empty or len(df_calls) < 2:
+                continue
+            df_calls = df_calls.sort_values("call_close_now", ascending=False)
+            top2 = df_calls.head(2).reset_index(drop=True)
+            short_row = top2.iloc[0]
+            long_row  = top2.iloc[1]
+            short_strike = float(short_row["strike"])
+            long_strike  = float(long_row["strike"])
+            short_price  = float(short_row["call_close_now"])
+            long_price   = float(long_row["call_close_now"])
+            multiplier = 100.0
+            premium_collected = (short_price - long_price) * multiplier
+            max_profit = premium_collected
+            max_loss = (long_strike - short_strike) * multiplier - premium_collected
+            all_rows.append({
+                "Trade_Date_Now": trade_date_now,
+                "Ticker": sym,
+                "Expiry": expiry,
+                "Underlying_Close": spot,
+                "Short_Strike": short_strike,
+                "Short_Call_Close": short_price,
+                "Long_Strike": long_strike,
+                "Long_Call_Close": long_price,
+                "Premium_Collected": premium_collected,
+                "Max_Profit": max_profit,
+                "Max_Loss": max_loss,
+                "Premium_EOD": np.nan,
+                "PnL_EndOfDay": np.nan,
+            })
+    if not all_rows:
+        print("[WARN] No valid spreads built.")
+        return pd.DataFrame()
+    return pd.DataFrame(all_rows)
 
-        total_call_oi = df_slice["openInt_Call_now"].sum()
-        total_put_oi  = df_slice["openInt_Put_now"].sum()
-        pcr_oi = total_put_oi / total_call_oi if total_call_oi > 0 else np.nan
-
-        if not np.isnan(spot) and spot > 0:
-            band_low = spot * 0.95
-            band_high = spot * 1.05
-            near = df_slice[(df_slice["strike"] >= band_low) & (df_slice["strike"] <= band_high)]
-        else:
-            near = df_slice
-
-        dcall = near["change_OI_Call"].sum()
-        dput  = near["change_OI_Put"].sum()
-
-        # classify bias
-        if np.isnan(pcr_oi):
-            bias = "Neutral"
-        elif pcr_oi > 1.2 and dput > 0 and dcall <= 0:
-            bias = "Bearish"
-        elif pcr_oi < 0.8 and dcall > 0 and dput >= 0:
-            bias = "Bullish"
-        else:
-            bias = "Neutral"
-
-        if bias == "Bullish":
-            bull_count += 1
-        elif bias == "Bearish":
-            bear_count += 1
-
-        # arrow / circle symbol
-        if bias == "Bullish":
-            bias_mark = "<b><span style='color:green;font-size:14px'>↑↑</span></b>"
-        elif bias == "Bearish":
-            bias_mark = "<b><span style='color:red;font-size:14px'>↓↓</span></b>"
-        else:
-            bias_mark = "<b><span style='color:goldenrod;font-size:14px'>●</span></b>"
-
-        # expected move
-        if np.isnan(spot) or np.isnan(pcr_oi):
-            exp_move_pct = np.nan
-        else:
-            dev = abs(pcr_oi - 1.0)
-            base = 0.02 + min(dev, 0.5) * 0.04
-            exp_move_pct = base
-
-        if bias == "Bearish" and not np.isnan(exp_move_pct):
-            exp_down_pct = exp_move_pct
-            exp_up_pct = exp_move_pct / 2
-        elif bias == "Bullish" and not np.isnan(exp_move_pct):
-            exp_up_pct = exp_move_pct
-            exp_down_pct = exp_move_pct / 2
-        else:
-            exp_up_pct = exp_move_pct / 2 if not np.isnan(exp_move_pct) else np.nan
-            exp_down_pct = exp_move_pct / 2 if not np.isnan(exp_move_pct) else np.nan
-
-        if not np.isnan(exp_up_pct):
-            up_moves.append(exp_up_pct * 100)
-        if not np.isnan(exp_down_pct):
-            dn_moves.append(exp_down_pct * 100)
-
-        # nearest S1 / R1
-        sr = df_slice[["S1", "R1"]].dropna(how="all")
-
-        def pick_closest(series, is_support=True):
-            s = series.dropna()
-            if s.empty or np.isnan(spot):
-                return None
-            if is_support:
-                s = s[s <= spot]
-            else:
-                s = s[s >= spot]
-            if s.empty:
-                return None
-            return float(s.iloc[(s - spot).abs().argmin()])
-
-        s1 = pick_closest(sr["S1"], True) if "S1" in sr else None
-        r1 = pick_closest(sr["R1"], False) if "R1" in sr else None
-
-        # total option volume for this expiry
-        vol_call = df_slice["vol_Call_now"] if "vol_Call_now" in df_slice.columns else df_slice["vol_Call"]
-        vol_put  = df_slice["vol_Put_now"] if "vol_Put_now"  in df_slice.columns else df_slice["vol_Put"]
-        tot_vol  = vol_call.sum() + vol_put.sum()
-
-        parts = [bias_mark]
-        if not np.isnan(pcr_oi):
-            parts.append(f"PCR {pcr_oi:.2f}")
-        parts.append(f"Vol {int(tot_vol):,}")
-        if s1 is not None:
-            parts.append(f"S1 {s1:.0f}")
-        if r1 is not None:
-            parts.append(f"R1 {r1:.0f}")
-        if not np.isnan(exp_up_pct) and not np.isnan(exp_down_pct):
-            parts.append(f"Move ~ +{exp_up_pct*100:.1f}% / -{exp_down_pct*100:.1f}%")
-
-        rows.append({"Expiry": expiry, "Summary": " ; ".join(parts)})
-
-    if not rows:
-        return None
-
-    df_sum = pd.DataFrame(rows)
-
-    if up_moves and dn_moves:
-        avg_up = np.mean(up_moves)
-        avg_dn = np.mean(dn_moves)
-    else:
-        avg_up = avg_dn = np.nan
-
-    overall = f"{bull_count} Bullish expiries, {bear_count} Bearish."
-    if not np.isnan(avg_up) and not np.isnan(avg_dn):
-        overall += f" Typical move ~ +{avg_up:.1f}% / -{avg_dn:.1f}%."
-
-    header = ["Expiry", "Summary"]
-    cells = [df_sum["Expiry"].tolist(), df_sum["Summary"].tolist()]
-
+def save_consolidated_spreads_to_excel_and_png(df_spreads, out_dir_today, trade_date_now):
+    if df_spreads.empty:
+        return
+    excel_path = os.path.join(out_dir_today, f"{trade_date_now}_Consolidated_Spreads.xlsx")
+    df_spreads.to_excel(excel_path, index=False)
+    print(f"[OK] Saved consolidated spreads Excel: {excel_path}")
+    df_show = df_spreads.copy()
+    max_rows = 200
+    if len(df_show) > max_rows:
+        df_show = df_show.head(max_rows)
+    header = list(df_show.columns)
+    cells = [df_show[col].tolist() for col in header]
     fig = go.Figure(
         data=[
             go.Table(
                 header=dict(
                     values=header,
                     fill_color="lightgrey",
-                    align="left",
-                    font=dict(size=11, color="black"),
+                    align="center",
+                    font=dict(size=10, color="black"),
                 ),
                 cells=dict(
                     values=cells,
-                    align="left",
-                    font=dict(size=10),
+                    align="center",
+                    font=dict(size=9),
                 ),
             )
         ]
     )
-
     fig.update_layout(
-        title=f"{company_name} ({sym}) – English Summary Across Expiries ({trade_date_now}, spot {spot:.2f})",
-        margin=dict(l=40, r=40, t=90, b=40),
-        width=1500,
-        height=250 + 25 * len(df_sum),
+        title=f"Consolidated Call Spreads – {trade_date_now}",
+        width=1800,
+        height=400 + 20 * len(df_show),
+        margin=dict(l=40, r=40, t=60, b=40),
     )
-
-    fig.add_annotation(
-        x=0,
-        y=1.08,
-        xref="paper",
-        yref="paper",
-        text=overall,
-        showarrow=False,
-        align="left",
-        font=dict(size=11),
-    )
-
-    return fig
+    png_path = os.path.join(out_dir_today, f"{trade_date_now}_Consolidated_Spreads.png")
+    fig.write_image(png_path, scale=2)
+    print(f"[OK] Saved consolidated spreads PNG: {png_path}")
 
 # =========================
-# Sentiment grid helpers
+# Previous-day update: compare entry at close vs entry at next-day open
 # =========================
 
-def sentiment_score(bias_str):
-    if not isinstance(bias_str, str):
-        return 0.0
-    b = bias_str.lower()
-    if b == "up":
-        return 1.0
-    if b == "down":
-        return -1.0
-    return 0.0
+def update_previous_day_spreads_with_next_day_prices(prev_trade_date_now, curr_trade_date_now_mmddyyyy):
+    """
+    For trades created on prev_trade_date_now (entry at prev close),
+    load next trading day's OPEN and CLOSE and compute two PnLs:
+      - PnL_if_Entry_Close: entry at prev close, exit at next close
+      - PnL_if_Entry_Open:  entry at next open, exit at next close
+    curr_trade_date_now_mmddyyyy: next trading day's trade_date in MM-DD-YYYY format.
+    """
+    prev_dir = os.path.join(BASE_OUT_DIR, prev_trade_date_now)
+    prev_excel = os.path.join(prev_dir, f"{prev_trade_date_now}_Consolidated_Spreads.xlsx")
+    if not os.path.exists(prev_excel):
+        print(f"[WARN] Previous day spreads file not found: {prev_excel}")
+        return None
 
-def score_to_color(score):
-    s = max(-1.0, min(1.0, score))
-    if s > 0:
-        g = int(180 + 60 * s)
-        return f"rgb(0,{g},0)"
-    elif s < 0:
-        r = int(180 + 60 * (-s))
-        return f"rgb({r},0,0)"
+    df_prev = pd.read_excel(prev_excel)
+
+    with get_conn() as conn:
+        df_opt_next = pd.read_sql(
+            f"""
+            SELECT ticker, expiry_date, strike,
+                   call_open_now, call_close_now
+            FROM {TABLE_OPTIONS_DAILY}
+            WHERE trade_date = ?
+            """,
+            conn,
+            params=(curr_trade_date_now_mmddyyyy,)
+        )
+
+    if df_opt_next.empty:
+        print("[WARN] No options_daily for next day; cannot update comparison PnL.")
+        return None
+
+    if "call_open_now" not in df_opt_next.columns:
+        df_opt_next["call_open_now"] = df_opt_next.get("call_close_now", np.nan)
+
+    df_prev["Expiry_str"] = df_prev["Expiry"].astype(str)
+    df_opt_next["Expiry_str"] = df_opt_next["expiry_date"].astype(str)
+
+    # Merge for short leg
+    short_merge = df_prev.merge(
+        df_opt_next,
+        left_on=["Ticker", "Expiry_str", "Short_Strike"],
+        right_on=["ticker", "Expiry_str", "strike"],
+        how="left",
+        suffixes=("", "_short_next")
+    )
+    short_merge = short_merge.rename(columns={
+        "call_open_now": "Short_Call_Open_Next",
+        "call_close_now": "Short_Call_Close_Next"
+    })
+
+    # Merge for long leg
+    long_merge = short_merge.merge(
+        df_opt_next,
+        left_on=["Ticker", "Expiry_str", "Long_Strike"],
+        right_on=["ticker", "Expiry_str", "strike"],
+        how="left",
+        suffixes=("", "_long_next")
+    )
+    long_merge = long_merge.rename(columns={
+        "call_open_now": "Long_Call_Open_Next",
+        "call_close_now": "Long_Call_Close_Next"
+    })
+
+    multiplier = 100.0
+
+    # Scenario A: Entry at prev close, exit at next close
+    long_merge["Premium_Entry_Close"] = (long_merge["Short_Call_Close"] - long_merge["Long_Call_Close"]) * multiplier
+    long_merge["Premium_Exit_Close"] = (long_merge["Short_Call_Close_Next"] - long_merge["Long_Call_Close_Next"]) * multiplier
+    long_merge["PnL_if_Entry_Close"] = long_merge["Premium_Entry_Close"] - long_merge["Premium_Exit_Close"]
+
+    # Scenario B: Entry at next day open, exit at next close
+    long_merge["Premium_Entry_Open"] = (long_merge["Short_Call_Open_Next"] - long_merge["Long_Call_Open_Next"]) * multiplier
+    long_merge["Premium_Exit_Close_2"] = long_merge["Premium_Exit_Close"]
+    long_merge["PnL_if_Entry_Open"] = long_merge["Premium_Entry_Open"] - long_merge["Premium_Exit_Close_2"]
+
+    # For summary: treat PnL_EndOfDay as entry-at-close scenario
+    long_merge["Premium_EOD"] = long_merge["Premium_Exit_Close"]
+    long_merge["PnL_EndOfDay"] = long_merge["PnL_if_Entry_Close"]
+
+    out_cols = [
+        "Trade_Date_Now",
+        "Ticker",
+        "Expiry",
+        "Underlying_Close",
+        "Short_Strike",
+        "Short_Call_Close",
+        "Long_Strike",
+        "Long_Call_Close",
+        "Premium_Collected",
+        "Max_Profit",
+        "Max_Loss",
+        "Short_Call_Open_Next",
+        "Long_Call_Open_Next",
+        "Short_Call_Close_Next",
+        "Long_Call_Close_Next",
+        "Premium_Entry_Close",
+        "Premium_Entry_Open",
+        "Premium_Exit_Close",
+        "PnL_if_Entry_Close",
+        "PnL_if_Entry_Open",
+        "Premium_EOD",
+        "PnL_EndOfDay",
+    ]
+    df_out = long_merge[out_cols].copy()
+
+    out_excel = os.path.join(prev_dir, f"{prev_trade_date_now}_Consolidated_Spreads_EntryClose_vs_Open.xlsx")
+    df_out.to_excel(out_excel, index=False)
+    print(f"[OK] Saved comparison file (entry close vs entry open): {out_excel}")
+    return df_out
+
+# =========================
+# Daily summary workbook (one stacked sheet per day)
+# =========================
+
+def append_daily_summary_sheet(df_eod_spreads, trade_date_now):
+    if df_eod_spreads is None or df_eod_spreads.empty:
+        print("[INFO] No EOD spreads for summary.")
+        return
+
+    df = df_eod_spreads.copy()
+
+    # Apply filters
+    if MIN_PREMIUM_COLLECTED is not None and MIN_PREMIUM_COLLECTED > 0:
+        df = df[df["Premium_Collected"] >= MIN_PREMIUM_COLLECTED]
+    if MAX_MAX_LOSS is not None and MAX_MAX_LOSS > 0:
+        df = df[df["Max_Loss"] <= MAX_MAX_LOSS]
+
+    if df.empty:
+        print("[INFO] All trades filtered out by summary filters; nothing to summarize.")
+        return
+
+    # Headline totals
+    pos_pnl = df["PnL_EndOfDay"][df["PnL_EndOfDay"] > 0].sum()
+    neg_pnl = df["PnL_EndOfDay"][df["PnL_EndOfDay"] < 0].sum()
+
+    total_investment = df["Max_Loss"].clip(lower=0).sum()
+    total_loss = -neg_pnl
+
+    total_trades = len(df)
+    win_trades = (df["PnL_EndOfDay"] > 0).sum()
+    loss_trades = (df["PnL_EndOfDay"] < 0).sum()
+
+    if total_investment > 0:
+        total_return_pct = (pos_pnl + neg_pnl) / total_investment * 100.0
     else:
-        return "rgb(230,230,230)"
+        total_return_pct = np.nan
+
+    summary_rows = [
+        ["Metric", "Value"],
+        ["Trade_Date_Now", trade_date_now],
+        ["Total_Trades", total_trades],
+        ["Winning_Trades", win_trades],
+        ["Losing_Trades", loss_trades],
+        ["Total_PnL_Positive", float(pos_pnl)],
+        ["Total_PnL_Negative", float(neg_pnl)],
+        ["Total_Investment", float(total_investment)],
+        ["Total_Loss", float(total_loss)],
+        ["Net_PnL", float(pos_pnl + neg_pnl)],
+        ["Net_PnL_%_of_Investment", float(total_return_pct) if not np.isnan(total_return_pct) else ""],
+        ["Min_Premium_Filter", MIN_PREMIUM_COLLECTED if MIN_PREMIUM_COLLECTED is not None else ""],
+        ["Max_MaxLoss_Filter", MAX_MAX_LOSS if MAX_MAX_LOSS is not None else ""],
+    ]
+    df_summary = pd.DataFrame(summary_rows[1:], columns=summary_rows[0])
+
+    # Per-ticker summary
+    grp_ticker = df.groupby("Ticker").agg(
+        Trades=("Ticker", "count"),
+        Win_Trades=("PnL_EndOfDay", lambda x: (x > 0).sum()),
+        Loss_Trades=("PnL_EndOfDay", lambda x: (x < 0).sum()),
+        PnL_Total=("PnL_EndOfDay", "sum"),
+        Investment=("Max_Loss", lambda x: x.clip(lower=0).sum())
+    ).reset_index()
+    grp_ticker["PnL_%_of_Investment"] = np.where(
+        grp_ticker["Investment"] > 0,
+        grp_ticker["PnL_Total"] / grp_ticker["Investment"] * 100.0,
+        np.nan
+    )
+
+    # Per-expiry summary
+    grp_expiry = df.groupby("Expiry").agg(
+        Trades=("Expiry", "count"),
+        Win_Trades=("PnL_EndOfDay", lambda x: (x > 0).sum()),
+        Loss_Trades=("PnL_EndOfDay", lambda x: (x < 0).sum()),
+        PnL_Total=("PnL_EndOfDay", "sum"),
+        Investment=("Max_Loss", lambda x: x.clip(lower=0).sum())
+    ).reset_index()
+    grp_expiry["PnL_%_of_Investment"] = np.where(
+        grp_expiry["Investment"] > 0,
+        grp_expiry["PnL_Total"] / grp_expiry["Investment"] * 100.0,
+        np.nan
+    )
+
+    # Write stacked into one sheet per day
+    mode = "a" if os.path.exists(SUMMARY_EXCEL_PATH) else "w"
+    with pd.ExcelWriter(SUMMARY_EXCEL_PATH, engine="openpyxl",
+                        mode=mode, if_sheet_exists="replace") as writer:
+        start_row = 0
+        # 1) summary
+        df_summary.to_excel(writer, sheet_name=trade_date_now, index=False, startrow=start_row)
+        start_row += len(df_summary) + 2
+
+        # 2) by ticker
+        pd.DataFrame([["By Ticker", ""]], columns=df_summary.columns)\
+            .to_excel(writer, sheet_name=trade_date_now, index=False, header=False, startrow=start_row)
+        start_row += 1
+        grp_ticker.to_excel(writer, sheet_name=trade_date_now, index=False, startrow=start_row)
+        start_row += len(grp_ticker) + 2
+
+        # 3) by expiry
+        pd.DataFrame([["By Expiry", ""]], columns=df_summary.columns)\
+            .to_excel(writer, sheet_name=trade_date_now, index=False, header=False, startrow=start_row)
+        start_row += 1
+        grp_expiry.to_excel(writer, sheet_name=trade_date_now, index=False, startrow=start_row)
+
+    print(f"[OK] Appended stacked daily summary for {trade_date_now} -> {SUMMARY_EXCEL_PATH}")
 
 # =========================
 # MAIN
 # =========================
 
 if __name__ == "__main__":
-    # pip install -U "plotly[kaleido]"
     td_now = latest_trade_date_now()
     if not td_now:
         print("No trade_date_now found.")
@@ -808,14 +873,16 @@ if __name__ == "__main__":
         print(f"No symbols for {td_now}")
         raise SystemExit(1)
 
-    print(f"[INFO] Creating per‑stock charts and summaries for {td_now}")
+    yahoo_prices = get_yahoo_prices()
 
+    print(f"[INFO] Creating per‑stock charts and summaries for {td_now}")
     for sym in symbols:
         try:
+            sym_upper = sym.upper()
             print(f"[INFO] {sym}: OI chart...")
-            oi_fig, full_name, spot = make_oi_chart(sym, td_now)
-            if oi_fig is not None:
-                oi_name = f"{full_name}_OI_CHART.png"
+            oi_fig, full_name, spot = make_oi_chart(sym, td_now, yahoo_prices)
+            if oi_fig is not None and full_name is not None:
+                oi_name = f"{full_name}_{sym_upper}_OI_CHART.png"
                 oi_path = os.path.join(out_dir_today, oi_name)
                 oi_fig.write_image(oi_path)
                 print(f"   [OK] {oi_path}")
@@ -824,148 +891,28 @@ if __name__ == "__main__":
                 continue
 
             print(f"[INFO] {sym}: Summary table...")
-            sum_fig = make_summary_table(sym, td_now, full_name, spot)
+            sum_fig = make_summary_table(sym, td_now, full_name, spot, yahoo_prices)
             if sum_fig is not None:
-                sum_name = f"{full_name}_Summary_analysis.png"
+                sum_name = f"{full_name}_{sym_upper}_Summary_analysis.png"
                 sum_path = os.path.join(out_dir_today, sum_name)
                 sum_fig.write_image(sum_path)
                 print(f"   [OK] {sum_path}")
 
-            print(f"[INFO] {sym}: English expiry summary...")
-            eng_fig = make_english_summary_for_stock(sym, td_now, full_name, spot)
-            if eng_fig is not None:
-                eng_name = f"{full_name}_Expiries_English_Summary.png"
-                eng_path = os.path.join(out_dir_today, eng_name)
-                eng_fig.write_image(eng_path)
-                print(f"   [OK] {eng_path}")
-
         except Exception as e:
             print(f"[WARN] Failed for {sym}: {e}")
 
-    # ---- Big all‑stocks sentiment table ----
-    print(f"[INFO] Building all‑stocks sentiment table for {td_now}")
-    df_over = build_overview_df(td_now)
-    if df_over is None or df_over.empty:
-        print("[WARN] Overview empty; skipping sentiment table.")
-        raise SystemExit(0)
+    # build today's consolidated spreads
+    print(f"[INFO] Building consolidated call spread table for {td_now}")
+    df_spreads_today = build_consolidated_spread_table(td_now)
+    save_consolidated_spreads_to_excel_and_png(df_spreads_today, out_dir_today, td_now)
 
-    df_sr = build_expiry_sr_df(td_now)
-    expiries = get_expiries_for_td(td_now)
-    if not expiries:
-        print("[WARN] No expiries; skipping sentiment table.")
-        raise SystemExit(0)
-
-    tickers = df_over["Ticker"].astype(str).tolist()
-
-    header_labels = ["Ticker<br>(Spot)"] + expiries
-
-    table_rows = []
-    color_rows = []
-
-    for _, r in df_over.iterrows():
-        t = str(r["Ticker"])
-        spot = r.get("Spot", np.nan)
-
-        row_vals = []
-        row_colors = []
-
-        if not np.isnan(spot):
-            row_vals.append(f"{t}<br>({spot:.2f})")
-        else:
-            row_vals.append(t)
-        row_colors.append("white")
-
-        for expiry in expiries:
-            sr_row = df_sr[(df_sr["Ticker"] == t) & (df_sr["Expiry"] == expiry)]
-            if sr_row.empty:
-                s1 = r1 = s12 = r12 = np.nan
-            else:
-                sr_row = sr_row.iloc[0]
-                s1  = sr_row.get("S1", np.nan)
-                r1  = sr_row.get("R1", np.nan)
-                s12 = sr_row.get("S12", np.nan)
-                r12 = sr_row.get("R12", np.nan)
-
-            bias = str(r.get("Bias", ""))  # Up / Down / Range / Neutral
-            pcr  = r.get("PCR_OI", np.nan)
-
-            # compact PCR + S/R formatting, no arrows
-            line1_parts = []
-            if not np.isnan(pcr):
-                line1_parts.append(f"PCR {pcr:.2f}")
-            line1 = " | ".join(line1_parts) if line1_parts else ""
-
-            s1_txt  = f"S1 {s1:.2f}"   if not np.isnan(s1)  else "S1 -"
-            r1_txt  = f"R1 {r1:.2f}"   if not np.isnan(r1)  else "R1 -"
-            line2 = f"{s1_txt}  |  {r1_txt}"
-
-            s12_txt = f"S12 {s12:.2f}" if not np.isnan(s12) else "S12 -"
-            r12_txt = f"R12 {r12:.2f}" if not np.isnan(r12) else "R12 -"
-            line3 = f"{s12_txt}  |  {r12_txt}"
-
-            cell_lines = [line for line in [line1, line2, line3] if line]
-            cell_text = "<br>".join(cell_lines)
-
-            row_vals.append(cell_text)
-
-            score = sentiment_score(bias)
-            row_colors.append(score_to_color(score))
-
-        table_rows.append(row_vals)
-        color_rows.append(row_colors)
-
-    values = [list(col) for col in zip(*table_rows)]
-    fill_colors = [list(col) for col in zip(*color_rows)]
-
-    fig_big = go.Figure(
-        data=[
-            go.Table(
-                header=dict(
-                    values=header_labels,
-                    fill_color="lightgrey",
-                    align="center",
-                    font=dict(size=11, color="black"),
-                ),
-                cells=dict(
-                    values=values,
-                    align="left",
-                    font=dict(size=9, color="black"),
-                    fill_color=fill_colors,
-                    height=26,  # slightly shorter rows
-                ),
-            )
-        ]
-    )
-
-    all_bias = df_over["Bias"].astype(str).tolist()
-    up_count   = sum(b == "Up"   for b in all_bias)
-    down_count = sum(b == "Down" for b in all_bias)
-
-    summary_line = f"Across all stocks: {up_count} Up bias, {down_count} Down bias."
-
-    fig_big.update_layout(
-        title=f"All Stocks Options Sentiment – {td_now}",
-        margin=dict(l=20, r=20, t=90, b=20),
-        width=min(1900, 220 + 140 * len(expiries)),
-        height=220 + 28 * len(tickers),   # smaller per-row height to fit more stocks
-    )
-
-    fig_big.add_annotation(
-        x=0,
-        y=1.05,
-        xref="paper",
-        yref="paper",
-        text=summary_line,
-        showarrow=False,
-        align="left",
-        font=dict(size=11),
-    )
-
-    out_png_big = os.path.join(out_dir_today, f"{td_now}_All_Stocks_Sentiment_Table.png")
-    fig_big.write_image(
-        out_png_big,
-        width=fig_big.layout.width,
-        height=fig_big.layout.height,
-        scale=2,  # higher DPI
-    )
-    print(f"[OK] Saved sentiment table: {out_png_big}")
+    # update previous trading day with next-day prices for comparison and summary
+    prev_td = previous_trade_date_now(td_now)
+    if prev_td:
+        print(f"[INFO] Updating previous trading day's spreads ({prev_td}) with next-day prices ({td_now})")
+        curr_trade_date_for_options_daily = trade_date_now_to_mmddyyyy(td_now)
+        df_comp_prev = update_previous_day_spreads_with_next_day_prices(prev_td, curr_trade_date_for_options_daily)
+        if df_comp_prev is not None:
+            append_daily_summary_sheet(df_comp_prev, prev_td)
+    else:
+        print("[INFO] No previous trading day found; skipping comparison and summary.")
