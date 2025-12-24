@@ -15,16 +15,29 @@ import pandas_market_calendars as mcal  # NYSE calendar
 from curl_cffi import requests as curl_requests  # curl_cffi session
 import sqlite3
 
+
 # ============= RUNTIME START =============
 SCRIPT_START_TIME = time.time()
+
 
 # ================== CONFIG ==================
 
 DATA_DIR = r"C:\Users\srini\Options_chain_data"
-UNIVERSE_FILE = os.path.join(DATA_DIR, "ticker_universe.xlsx")
+
+# New charts and archive folders
+US_CHARTS_DIR = os.path.join(DATA_DIR, "US_CHARTS")
+ARCHIVE_DIR = os.path.join(US_CHARTS_DIR, "archive")
+
+# Ensure these directories exist
+os.makedirs(US_CHARTS_DIR, exist_ok=True)
+os.makedirs(ARCHIVE_DIR, exist_ok=True)
+
+# Universe Excel now under US_CHARTS
+UNIVERSE_FILE = os.path.join(US_CHARTS_DIR, "ticker_universe.xlsx")
 UNIVERSE_SHEET_ACTIVE = "ticker_universe"   # tickers to process
 UNIVERSE_SHEET_WHOLE  = "Whole_universe"    # full / history
-LOG_DIR = DATA_DIR
+LOG_DIR = DATA_DIR   # keep logs under main DATA_DIR (unchanged)
+
 
 # SQLite DB and tables
 DB_PATH = os.path.join(DATA_DIR, "US_data.db")
@@ -35,6 +48,7 @@ TABLE_STOCK_DAILY = "stock_daily"
 WEEK_TABLES = ["week1_options", "week2_options", "week3_options", "week4_options", "week5_options"]
 MONTH_TABLES = ["month1_options", "month2_options"]
 
+
 CATEGORY_SP500     = "sp500"
 CATEGORY_NON_SP500 = "non_s&p"
 CATEGORY_INDEX     = "index"
@@ -44,9 +58,11 @@ CATEGORY_BOND      = "bond"
 CATEGORY_CRYPTO    = "crypto"
 CATEGORY_OTHER     = "other"
 
+
 INDEX_TICKERS = [
     "QQQ", "SPY", "IWM", "DIA", "IVV", "VOO", "SPLG", "SPYG", "SPYV", "IBIT"
 ]
+
 
 METALS_TICKERS = ["GLD", "IAU", "SGOL", "PHYS", "SLV", "SIVR", "PSLV", "SIL"]
 COMMODITY_TICKERS = ["USO", "CPER"]
@@ -54,16 +70,21 @@ BOND_TICKERS = ["AGG", "BND", "SCHZ", "FBND", "IUSB", "SPAB", "VTEB"]
 CRYPTO_TICKERS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
                   "XRP-USD", "ADA-USD", "DOGE-USD", "TRX-USD"]
 
+
 EXTRA_STOCKS = ["SOFI"]
 
+
 # ========= HELPER: dates, ticker normalization, progress bar ==========
+
 
 def yf_ticker_fix(ticker):
     return ticker.replace('.', '-')
 
+
 def current_load_date():
     # Global load timestamp for all tables, MM-DD-YYYY
     return datetime.now().strftime("%m-%d-%Y")
+
 
 def print_progress_bar(current, total, bar_length=50, prefix="Progress"):
     percent = (current / total) * 100 if total > 0 else 0
@@ -74,7 +95,9 @@ def print_progress_bar(current, total, bar_length=50, prefix="Progress"):
     if current == total:
         print()
 
+
 # ========== UNIVERSE EXCEL HELPERS ==========
+
 
 def _normalize_universe_df(df):
     if df is None or df.empty:
@@ -86,6 +109,7 @@ def _normalize_universe_df(df):
     df["name"] = df["name"].astype(str)
     df["category"] = df["category"].astype(str)
     return df[["ticker", "name", "category"]]
+
 
 def load_universe_sheets(path):
     if not os.path.exists(path):
@@ -103,6 +127,7 @@ def load_universe_sheets(path):
     active = _normalize_universe_df(all_sheets.get(UNIVERSE_SHEET_ACTIVE, None))
     whole  = _normalize_universe_df(all_sheets.get(UNIVERSE_SHEET_WHOLE,  None))
     return active, whole
+
 
 def save_universe_sheets(active_df, whole_df, path):
     if not active_df.empty:
@@ -127,6 +152,7 @@ def save_universe_sheets(active_df, whole_df, path):
         active_df.to_excel(writer, sheet_name=UNIVERSE_SHEET_ACTIVE, index=False)
         whole_df.to_excel(writer,  sheet_name=UNIVERSE_SHEET_WHOLE,  index=False)
 
+
 def yahoo_name_from_ticker(symbol):
     url = "https://query2.finance.yahoo.com/v1/finance/search"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -141,6 +167,7 @@ def yahoo_name_from_ticker(symbol):
     except Exception:
         pass
     return None
+
 
 def get_sp500_name_map():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -173,6 +200,7 @@ def get_sp500_name_map():
     df = target[["ticker", "name"]]
     return dict(zip(df["ticker"], df["name"]))
 
+
 def classify_category(ticker, current_sp500_set):
     if ticker in [yf_ticker_fix(t) for t in INDEX_TICKERS]:
         return CATEGORY_INDEX
@@ -187,6 +215,7 @@ def classify_category(ticker, current_sp500_set):
     if ticker in current_sp500_set:
         return CATEGORY_SP500
     return CATEGORY_NON_SP500
+
 
 def prepare_universe_and_name_map():
     print("📁 Loading existing universe sheets ...")
@@ -252,7 +281,9 @@ def prepare_universe_and_name_map():
     print(f"🔎 Active tickers: {all_tickers}")
     return name_map, all_tickers
 
+
 # ============= TRADING DAY USING NYSE CALENDAR =============
+
 
 def get_eod_trading_day(max_back=10):
     print("📅 Determining end-of-day trading date using NYSE calendar ...")
@@ -289,7 +320,9 @@ def get_eod_trading_day(max_back=10):
     print(f"✅ Using NYSE trading day: {use_day.isoformat()}")
     return eastern.localize(datetime(use_day.year, use_day.month, use_day.day))
 
+
 # ============= ENRICHMENT WITH OHLC (THROTTLED) =============
+
 
 def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
                                      call_symbol_col="contractSymbol_Call",
@@ -390,7 +423,9 @@ def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
 
     return df
 
+
 # ============= DB HELPERS: WEEKLY & MONTHLY TABLES =============
+
 
 def refresh_weekly_tables(conn):
     """
@@ -432,6 +467,7 @@ def refresh_weekly_tables(conn):
         print(f"🗑 Dropping stale weekly table {table_name} (no matching expiry)")
         conn.execute(f"DROP TABLE IF EXISTS {table_name}")
         conn.commit()
+
 
 def refresh_monthly_tables(conn):
     """
@@ -483,7 +519,9 @@ def refresh_monthly_tables(conn):
         conn.execute(f"DROP TABLE IF EXISTS {table_name}")
         conn.commit()
 
+
 # ============= OPTIONS FETCH (YAHOO, ±10 STRIKES, NEXT 45 DAYS) =============
+
 
 def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
     session = curl_requests.Session(impersonate="chrome")
@@ -569,7 +607,9 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str):
         print(f"✅ Options fetched for {ticker}: {sum(len(r) for r in results)} rows")
     return results
 
+
 # ============= MERGE CALLS/PUTS: ONE TICKER AT A TIME =============
+
 
 def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_tickers):
     SECS_BETWEEN_TICKERS = 1  # adjust 20–60 as needed
@@ -639,7 +679,8 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
     df_final = df_final[new_order]
 
     trade_day_str = trade_day.strftime('%d%b%Y')
-    out_file = os.path.join(DATA_DIR, f"Options_Strike_CallPut_{trade_day_str}.csv")
+    # write options CSV into US_CHARTS_DIR
+    out_file = os.path.join(US_CHARTS_DIR, f"Options_Strike_CallPut_{trade_day_str}.csv")
     df_final.to_csv(out_file, index=False)
     print(f"✅ Output file saved: {out_file}")
     print(f"📈 Total records: {len(df_final)}")
@@ -683,7 +724,9 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
     print("Sample record for today:\n", df_final.head(1).to_string(index=False))
     return df_final, out_file
 
+
 # ============= AUDIT BLANK / EMPTY ROWS =============
+
 
 def audit_empty_option_rows(df: pd.DataFrame, trade_day_str: str):
     if df is None or df.empty:
@@ -714,13 +757,16 @@ def audit_empty_option_rows(df: pd.DataFrame, trade_day_str: str):
     empty_rows.to_csv(log_path, index=False)
     print(f"📝 Simple audit log saved: {log_path}")
 
+
 # ============= CHANGE CALCULATION (UPDATED) =============
+
 
 def ensure_columns(df, required):
     for c in required:
         if c not in df.columns:
             df[c] = np.nan
     return df
+
 
 def compute_oi_vol_change(trade_day):
     print(f"🔍 Computing open interest and volume changes for {trade_day.strftime('%Y-%m-%d')}...")
@@ -729,10 +775,11 @@ def compute_oi_vol_change(trade_day):
     # ---------- find previous trading day file ----------
     prev_day = trade_day - timedelta(days=1)
     prev_day_str = None
+    prev_file = None
     for _ in range(7):
         if prev_day.weekday() < 5:
             prev_day_str = prev_day.strftime('%d%b%Y')
-            prev_file = os.path.join(DATA_DIR, f"Options_Strike_CallPut_{prev_day_str}.csv")
+            prev_file = os.path.join(US_CHARTS_DIR, f"Options_Strike_CallPut_{prev_day_str}.csv")
             if os.path.exists(prev_file):
                 print(f"✅ Found previous day file: {prev_day_str}")
                 break
@@ -741,7 +788,7 @@ def compute_oi_vol_change(trade_day):
         print("❌ No previous trading file found for OI/volume change.")
         return None
 
-    today_file = os.path.join(DATA_DIR, f"Options_Strike_CallPut_{trade_day_str}.csv")
+    today_file = os.path.join(US_CHARTS_DIR, f"Options_Strike_CallPut_{trade_day_str}.csv")
     if not os.path.exists(today_file):
         print("❌ Cannot compute OI/volume change; today's file missing.")
         return None
@@ -841,7 +888,8 @@ def compute_oi_vol_change(trade_day):
     if "company_name_now" in merged.columns:
         merged["company_name_now"] = merged["company_name_now"].astype(str).str.replace('"', "")
 
-    out_file = os.path.join(DATA_DIR, f"Options_Strike_CallPut_Change_{trade_day_str}.csv")
+    # change CSV into US_CHARTS_DIR
+    out_file = os.path.join(US_CHARTS_DIR, f"Options_Strike_CallPut_Change_{trade_day_str}.csv")
     load_date = current_load_date()
     df_out = merged[cols_out].copy()
     df_out["load_date"] = load_date
@@ -868,7 +916,9 @@ def compute_oi_vol_change(trade_day):
     print("Sample percentage change record:\n", df_out.head(2).to_string(index=False))
     return out_file
 
+
 # ============= STOCK_DAILY (OHLC + PCR) =============
+
 
 def build_stock_daily(trade_day, all_tickers):
     """
@@ -954,7 +1004,9 @@ def build_stock_daily(trade_day, all_tickers):
 
     return df_stock
 
+
 # ============= CLEANUP =============
+
 
 def cleanup_old_files(data_dir, days=90):
     print(f"🗑️  Cleaning up files older than {days} days...")
@@ -975,7 +1027,39 @@ def cleanup_old_files(data_dir, days=90):
         print_progress_bar(i, len(files_to_delete), prefix="🗑️  Cleanup")
     print(f"\n✅ Cleanup completed: {len(files_to_delete)} files deleted.")
 
+
+def archive_old_excels(us_charts_dir, archive_dir, keep_days=1):
+    """
+    Move options-related Excel/CSV files older than 'keep_days' days
+    from US_CHARTS_DIR to ARCHIVE_DIR.
+    """
+    print(f"📦 Archiving US_CHARTS files older than {keep_days} days...")
+    now = time.time()
+    cutoff = now - keep_days * 86400
+
+    for fname in os.listdir(us_charts_dir):
+        fpath = os.path.join(us_charts_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+
+        # Only archive options-related CSV/XLSX files
+        if not (
+            (fname.startswith("Options_Strike_CallPut_") and (fname.endswith(".csv") or fname.endswith(".xlsx"))) or
+            (fname.startswith("Options_Strike_CallPut_Change_") and fname.endswith(".csv"))
+        ):
+            continue
+
+        if os.path.getmtime(fpath) < cutoff:
+            target = os.path.join(archive_dir, fname)
+            try:
+                os.replace(fpath, target)
+                print(f"📦 Archived {fname} -> {target}")
+            except Exception as e:
+                print(f"⚠️ Could not archive {fname}: {e}")
+
+
 # ============= MAIN (daily run) =============
+
 
 if __name__ == "__main__":
     print("🚀 Starting Options Chain Data Collection Script (Yahoo, single-ticker mode)")
@@ -986,8 +1070,15 @@ if __name__ == "__main__":
     else:
         print("📁 Data directory exists")
 
-    print("\n🧹 Phase 1: Cleanup old files")
+    # Ensure charts + archive dirs exist
+    os.makedirs(US_CHARTS_DIR, exist_ok=True)
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+
+    print("\n🧹 Phase 1: Cleanup old files under DATA_DIR")
     cleanup_old_files(DATA_DIR, 90)
+
+    print("\n📦 Phase 1b: Archive old US_CHARTS Excel/CSV")
+    archive_old_excels(US_CHARTS_DIR, ARCHIVE_DIR, keep_days=1)
 
     print("\n🏢 Phase 2: Universe & name map")
     company_name_map, all_tickers = prepare_universe_and_name_map()
