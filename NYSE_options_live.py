@@ -10,7 +10,7 @@ import sqlite3
 # =========================
 
 DATA_DIR = r"C:\Users\srini\Options_chain_data"
-BASE_OUT_DIR = os.path.join(DATA_DIR, "NYSE_DATA", "US_CHARTS")
+BASE_OUT_DIR = os.path.join(DATA_DIR, "US_CHARTS")
 DB_PATH = os.path.join(DATA_DIR, "US_data.db")  # your options DB
 
 def fmt_dmy(dt):

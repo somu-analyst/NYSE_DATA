@@ -8,57 +8,42 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import yfinance as yf
 
-
 # ========================= 
 # CONFIG
 # =========================
 
-
 DATA_DIR = r"C:\Users\srini\Options_chain_data"
 DB_PATH = os.path.join(DATA_DIR, "US_data.db")
-
 
 TABLE_OPTIONS_DAILY  = "options_daily"
 TABLE_OPTIONS_CHANGE = "options_change"
 TABLE_STOCK_DAILY    = "stock_daily"
 
-
-BASE_OUT_DIR = os.path.join(DATA_DIR, "NYSE_DATA", "US_CHARTS")
+BASE_OUT_DIR = os.path.join(DATA_DIR, "US_CHARTS")
 os.makedirs(BASE_OUT_DIR, exist_ok=True)
 
-
 SUMMARY_EXCEL_PATH = os.path.join(DATA_DIR, "Daily_Spread_Summary.xlsx")
-
 
 MIN_PREMIUM_COLLECTED = 0.0
 MAX_MAX_LOSS = None
 
-
-# previous bar width factor (inner bar)
+# width for inner OI bars
 PREV_BAR_WIDTH = 0.45
 
-
 # colors
-CALL_CURR_COLOR = "royalblue"   # current
-PUT_CURR_COLOR  = "firebrick"   # current
+CALL_CURR_COLOR = "royalblue"
+PUT_CURR_COLOR  = "firebrick"
 
-
-CALL_PREV_FILL  = "#cfe5ff"     # kept but not used for price
-CALL_PREV_LINE  = "#1f4e9d"     # previous main color
-
-
-PUT_PREV_FILL   = "#ffd1d1"
-PUT_PREV_LINE   = "#9b1c1c"     # previous main color
+CALL_PREV_LINE  = "#1f4e9d"     # dark blue for outer
+PUT_PREV_LINE   = "#9b1c1c"     # dark red for outer
 
 
 # =========================
 # DB helpers
 # =========================
 
-
 def get_conn():
     return sqlite3.connect(DB_PATH)
-
 
 def latest_trade_date_now():
     with get_conn() as conn:
@@ -70,34 +55,27 @@ def latest_trade_date_now():
         return None
     return df["td"].iloc[0]
 
-
 def parse_ddmmmyyyy(d):
     return datetime.strptime(d, "%d%b%Y")
 
-
 def format_ddmmmyyyy(dt):
     return dt.strftime("%d%b%Y")
-
 
 def get_prev_trade_date(trade_date_now):
     dt_now = parse_ddmmmyyyy(trade_date_now)
     dt_prev = dt_now - timedelta(days=1)
     return format_ddmmmyyyy(dt_prev)
 
-
 def previous_trade_date_now(curr_trade_date_now):
     return get_prev_trade_date(curr_trade_date_now)
-
 
 def is_today(td_now):
     dt = datetime.strptime(td_now, "%d%b%Y").date()
     return dt == datetime.today().date()
 
-
 def trade_date_now_to_mmddyyyy(td_now):
     dt = datetime.strptime(td_now, "%d%b%Y")
     return dt.strftime("%m-%d-%Y")
-
 
 def get_symbols_for_trade_date(td_now):
     with get_conn() as conn:
@@ -111,7 +89,6 @@ def get_symbols_for_trade_date(td_now):
             params=(td_now,)
         )
     return sorted(df["ticker"].tolist())
-
 
 def get_stock_close(symbol, trade_date_now):
     dt = parse_ddmmmyyyy(trade_date_now)
@@ -131,7 +108,6 @@ def get_stock_close(symbol, trade_date_now):
         return None
     return float(df["close"].iloc[0])
 
-
 def get_daily_stock(symbol, trade_date_now):
     td_mmddyyyy = trade_date_now_to_mmddyyyy(trade_date_now)
     with get_conn() as conn:
@@ -145,7 +121,6 @@ def get_daily_stock(symbol, trade_date_now):
             params=(symbol, td_mmddyyyy)
         )
     return df
-
 
 def get_company_name(symbol, trade_date_now):
     with get_conn() as conn:
@@ -164,7 +139,6 @@ def get_company_name(symbol, trade_date_now):
         return symbol.upper()
     return str(df["company_name_now"].iloc[0])
 
-
 def get_all_expiries(symbol, trade_date_now):
     with get_conn() as conn:
         df = pd.read_sql(
@@ -179,7 +153,6 @@ def get_all_expiries(symbol, trade_date_now):
             params=(symbol, trade_date_now),
         )
     return df["expiry_date"].tolist()
-
 
 def get_expiries_for_td(td_now):
     with get_conn() as conn:
@@ -199,7 +172,6 @@ def get_expiries_for_td(td_now):
 # =========================
 # Yahoo helpers
 # =========================
-
 
 def get_yahoo_prices():
     tickers = [
@@ -226,10 +198,8 @@ def get_yahoo_prices():
             prices[t] = np.nan
     return prices
 
-
 def mapping_ratio(ticker, prices=None):
     return 1.0
-
 
 def map_spot_for_display(ticker, raw_spot, prices):
     if raw_spot is None or np.isnan(raw_spot):
@@ -241,7 +211,6 @@ def map_spot_for_display(ticker, raw_spot, prices):
 # =========================
 # One-expiry slice with prev values
 # =========================
-
 
 def get_options_with_prev_values(symbol, trade_date_now, expiry):
     trade_date_prev = get_prev_trade_date(trade_date_now)
@@ -340,10 +309,13 @@ def get_options_with_prev_values(symbol, trade_date_now, expiry):
     for col in [
         "openInt_Call", "openInt_Put",
         "openInt_Call_prev", "openInt_Put_prev",
-        "change_OI_Call", "change_OI_Put",
     ]:
         if col in df.columns:
             df[col] = df[col].fillna(0.0)
+
+    # RECOMPUTE ΔOI = current − previous for both Call and Put
+    df["change_OI_Call"] = (df["openInt_Call"] - df["openInt_Call_prev"]).fillna(0.0)
+    df["change_OI_Put"]  = (df["openInt_Put"]  - df["openInt_Put_prev"]).fillna(0.0)
 
     df = df.dropna(subset=["strike"])
     df = df.sort_values("strike").reset_index(drop=True)
@@ -353,7 +325,6 @@ def get_options_with_prev_values(symbol, trade_date_now, expiry):
 # =========================
 # OI + Price mirrored chart
 # =========================
-
 
 def make_oi_chart(symbol, trade_date_now, yahoo_prices):
     sym = symbol.upper()
@@ -381,9 +352,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         df = df.copy()
         df["strike_conv"] = df["strike"] * ratio
 
-        # =========================
-        # OI: main = PREVIOUS, inner white = CURRENT
-        # =========================
+        # OI
         df["call_oi_prev"] = df["openInt_Call_prev"]
         df["put_oi_prev"]  = df["openInt_Put_prev"]
 
@@ -399,17 +368,16 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         df["call_coi"] = df["change_OI_Call"]
         df["put_coi"]  = -df["change_OI_Put"]
 
-        # =========================
-        # Price:
-        #   - main bar = previous CLOSE
-        #   - inner bars = previous O/H/L/C (dark colors)
-        #   - white inner bar = current close
-        # =========================
+        # Price
         df["call_price_prev_close"] = df["call_close_prev"]
         df["put_price_prev_close"]  = -df["put_close_prev"]
 
-        df["call_price_now_close"]  = df["call_close_now"]
-        df["put_price_now_close"]   = -df["put_close_now"]
+        df["call_open_now_val"]  = df["call_open_now"]
+        df["call_high_now_val"]  = df["call_high_now"]
+        df["call_low_now_val"]   = df["call_low_now"]
+        df["call_close_now_val"] = df["call_close_now"]
+
+        df["put_close_now_val"]  = -df["put_close_now"]
 
         df["call_price_change_raw"] = df["call_close_now"] - df["call_close_prev"]
         df["put_price_change_raw"]  = df["put_close_now"] - df["put_close_prev"]
@@ -423,11 +391,12 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
     fig = make_subplots(
         rows=n,
         cols=2,
-        shared_xaxes=False,   # each expiry its own x-axis
+        shared_xaxes=False,
         vertical_spacing=0.06,
         horizontal_spacing=0.06,
         subplot_titles=[
-            f"{e} – OI (prev vs now) / ΔOI" if j == 0 else f"{e} – Price (prev close + OHLC + now) / ΔPrice"
+            f"{e} – OI (prev vs now) / ΔOI" if j == 0
+            else f"{e} – Price (prev close + current OHLC) / ΔPrice"
             for e in expiries for j in range(2)
         ],
         specs=[
@@ -437,8 +406,8 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
     )
 
     fig.update_yaxes(showticklabels=True, title_font=dict(size=11))
+    fig.update_layout(barmode="overlay")
 
-    # colors for OHLC inner bars
     COLOR_OPEN  = "#003f5c"
     COLOR_HIGH  = "#58508d"
     COLOR_LOW   = "#bc5090"
@@ -449,18 +418,15 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             continue
 
         show_legend = (i == 1)
-        inner_width = PREV_BAR_WIDTH
 
         # ----- LEFT: OI -----
-
-        # main OI = previous
         fig.add_trace(
             go.Bar(
                 x=df["strike_conv"],
                 y=df["call_oi"],
                 name="Call OI prev",
                 marker_color=CALL_PREV_LINE,
-                opacity=0.8,
+                opacity=0.9,
                 showlegend=show_legend,
             ),
             row=i, col=1, secondary_y=False
@@ -471,13 +437,12 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
                 y=df["put_oi_plot"],
                 name="Put OI prev",
                 marker_color=PUT_PREV_LINE,
-                opacity=0.8,
+                opacity=0.9,
                 showlegend=show_legend,
             ),
             row=i, col=1, secondary_y=False
         )
 
-        # inner white = current OI
         fig.add_trace(
             go.Bar(
                 x=df["strike_conv"],
@@ -487,7 +452,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
                 marker_line_color=CALL_CURR_COLOR,
                 marker_line_width=1,
                 opacity=1.0,
-                width=inner_width,
+                width=PREV_BAR_WIDTH,
                 showlegend=show_legend,
             ),
             row=i, col=1, secondary_y=False
@@ -501,13 +466,12 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
                 marker_line_color=PUT_CURR_COLOR,
                 marker_line_width=1,
                 opacity=1.0,
-                width=inner_width,
+                width=PREV_BAR_WIDTH,
                 showlegend=show_legend,
             ),
             row=i, col=1, secondary_y=False
         )
 
-        # ΔOI lines
         fig.add_trace(
             go.Scatter(
                 x=df["strike_conv"],
@@ -515,7 +479,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
                 name="Call ΔOI",
                 mode="lines+markers",
                 line=dict(color="lightskyblue", width=2),
-                marker=dict(size=5),
+                marker=dict(size=6),
                 showlegend=show_legend,
             ),
             row=i, col=1, secondary_y=True
@@ -527,22 +491,25 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
                 name="Put ΔOI",
                 mode="lines+markers",
                 line=dict(color="lightcoral", width=2),
-                marker=dict(size=5),
+                marker=dict(size=6),
                 showlegend=show_legend,
             ),
             row=i, col=1, secondary_y=True
         )
 
         # ----- RIGHT: Price -----
+        outer_width = 0.8
+        inner_width = outer_width / 6.0
 
-        # main bar = previous close
+        # wide outer previous close bars
         fig.add_trace(
             go.Bar(
                 x=df["strike_conv"],
                 y=df["call_price_prev_close"],
                 name="Call Prev Close (main)",
                 marker_color=CALL_PREV_LINE,
-                opacity=0.7,
+                opacity=0.8,
+                width=outer_width,
                 showlegend=show_legend,
             ),
             row=i, col=2, secondary_y=False
@@ -553,20 +520,20 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
                 y=df["put_price_prev_close"],
                 name="Put Prev Close (main)",
                 marker_color=PUT_PREV_LINE,
-                opacity=0.7,
+                opacity=0.8,
+                width=outer_width,
                 showlegend=show_legend,
             ),
             row=i, col=2, secondary_y=False
         )
 
-        # inner OHLC bars = previous O/H/L/C
+        # 4 narrow OHLC bars overlaid on same x
         fig.add_trace(
             go.Bar(
                 x=df["strike_conv"],
-                y=df["call_open_prev"],
-                name="Call Prev Open",
+                y=df["call_open_now_val"],
+                name="Call Now Open",
                 marker_color=COLOR_OPEN,
-                opacity=1.0,
                 width=inner_width,
                 showlegend=show_legend,
             ),
@@ -575,10 +542,9 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         fig.add_trace(
             go.Bar(
                 x=df["strike_conv"],
-                y=df["call_high_prev"],
-                name="Call Prev High",
+                y=df["call_high_now_val"],
+                name="Call Now High",
                 marker_color=COLOR_HIGH,
-                opacity=1.0,
                 width=inner_width,
                 showlegend=show_legend,
             ),
@@ -587,10 +553,9 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         fig.add_trace(
             go.Bar(
                 x=df["strike_conv"],
-                y=df["call_low_prev"],
-                name="Call Prev Low",
+                y=df["call_low_now_val"],
+                name="Call Now Low",
                 marker_color=COLOR_LOW,
-                opacity=1.0,
                 width=inner_width,
                 showlegend=show_legend,
             ),
@@ -599,47 +564,32 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         fig.add_trace(
             go.Bar(
                 x=df["strike_conv"],
-                y=df["call_close_prev"],
-                name="Call Prev Close (inner)",
-                marker_color=COLOR_CLOSE,
-                opacity=1.0,
-                width=inner_width,
-                showlegend=show_legend,
-            ),
-            row=i, col=2, secondary_y=False
-        )
-
-        # white inner bar = current close
-        fig.add_trace(
-            go.Bar(
-                x=df["strike_conv"],
-                y=df["call_price_now_close"],
+                y=df["call_close_now_val"],
                 name="Call Now Close",
                 marker_color="white",
-                marker_line_color=CALL_CURR_COLOR,
+                marker_line_color=COLOR_CLOSE,
                 marker_line_width=1,
-                opacity=1.0,
-                width=inner_width * 0.8,
+                width=inner_width,
                 showlegend=show_legend,
             ),
             row=i, col=2, secondary_y=False
         )
+
+        # narrow put close mirrored
         fig.add_trace(
             go.Bar(
                 x=df["strike_conv"],
-                y=df["put_price_now_close"],
+                y=df["put_close_now_val"],
                 name="Put Now Close",
                 marker_color="white",
                 marker_line_color=PUT_CURR_COLOR,
                 marker_line_width=1,
-                opacity=1.0,
-                width=inner_width * 0.8,
+                width=inner_width,
                 showlegend=show_legend,
             ),
             row=i, col=2, secondary_y=False
         )
 
-        # ΔPrice lines
         fig.add_trace(
             go.Scatter(
                 x=df["strike_conv"],
@@ -665,8 +615,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             row=i, col=2, secondary_y=True
         )
 
-        # ----- per-expiry y ranges -----
-
+        # ranges
         max_oi_here = max(
             abs(df["call_oi"]).max(),
             abs(df["put_oi_plot"]).max(),
@@ -686,8 +635,8 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         max_price_here = max(
             abs(df["call_price_prev_close"]).max(),
             abs(df["put_price_prev_close"]).max(),
-            abs(df["call_price_now_close"]).max(),
-            abs(df["put_price_now_close"]).max(),
+            abs(df["call_close_now_val"]).max(),
+            abs(df["put_close_now_val"]).max(),
         )
         if not np.isfinite(max_price_here) or max_price_here <= 0:
             max_price_here = 1.0
@@ -702,32 +651,27 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         fig.update_yaxes(
             range=[-max_oi_here * 1.2, max_oi_here * 1.2],
             title_text="OI",
-            showticklabels=True,
             row=i, col=1, secondary_y=False,
         )
         fig.update_yaxes(
             range=[-max_coi_here * 1.2, max_coi_here * 1.2],
             title_text="ΔOI",
             showgrid=False,
-            showticklabels=True,
             row=i, col=1, secondary_y=True,
         )
 
         fig.update_yaxes(
             range=[-max_price_here * 1.2, max_price_here * 1.2],
             title_text="Price",
-            showticklabels=True,
             row=i, col=2, secondary_y=False,
         )
         fig.update_yaxes(
             range=[-max_dprice_here * 1.2, max_dprice_here * 1.2],
             title_text="ΔPrice",
             showgrid=False,
-            showticklabels=True,
             row=i, col=2, secondary_y=True,
         )
 
-        # per-expiry x-axis
         strikes_this_expiry = sorted(df["strike_conv"].unique().tolist())
         ticktext_this = [f"{v:.1f}" for v in strikes_this_expiry]
 
@@ -748,7 +692,6 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             col=2,
         )
 
-        # vertical spot lines
         fig.add_vline(
             x=spot_conv,
             line_dash="dash",
@@ -773,7 +716,6 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         ),
         height=260 * max(1, len(expiries)),
         width=1800,
-        barmode="overlay",
         bargap=0.02,
         bargroupgap=0.05,
         legend=dict(
@@ -791,9 +733,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
 
 # =========================
 # Combined numeric + English summary
-# (unchanged from your previous frozen version)
 # =========================
-
 
 def make_combined_tables(symbol, trade_date_now, company_name, spot, yahoo_prices):
     sym = symbol.upper()
@@ -1029,11 +969,8 @@ def make_combined_tables(symbol, trade_date_now, company_name, spot, yahoo_price
 
 
 # =========================
-# Consolidated spreads, update, summary (unchanged)
+# MAIN
 # =========================
-# (Your build_consolidated_spread_table, save_consolidated_spreads_to_excel_and_png,
-#  update_previous_day_spreads_with_next_day_prices, append_daily_summary_sheet,
-#  and MAIN block remain exactly as in your original code.)
 
 if __name__ == "__main__":
     print("=== NYSE_Telegram starting ===")
@@ -1104,20 +1041,5 @@ if __name__ == "__main__":
 
         except Exception as e:
             print(f"[WARN] Failed for {sym}: {e}")
-
-    print(f"[INFO] Building consolidated call spread table for {td_now}")
-    # If you have these functions defined below, keep them; otherwise comment this block.
-    # df_spreads_today = build_consolidated_spread_table(td_now)
-    # save_consolidated_spreads_to_excel_and_png(df_spreads_today, out_dir_today, td_now)
-
-    # prev_td = previous_trade_date_now(td_now)
-    # if prev_td:
-    #     print(f"[INFO] Updating previous trading day's spreads ({prev_td}) with next-day prices ({td_now})")
-    #     curr_trade_date_for_options_daily = trade_date_now_to_mmddyyyy(td_now)
-    #     df_comp_prev = update_previous_day_spreads_with_next_day_prices(prev_td, curr_trade_date_for_options_daily)
-    #     if df_comp_prev is not None:
-    #         append_daily_summary_sheet(df_comp_prev, prev_td)
-    # else:
-    #     print("[INFO] No previous trading day found; skipping comparison and summary.")
 
     print("=== NYSE_Telegram finished ===")
