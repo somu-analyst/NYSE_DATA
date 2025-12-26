@@ -18,7 +18,7 @@ OPTIONS_TABLE = "options_daily"
 CHANGE_TABLE  = "options_change"
 STOCK_TABLE   = "stock_daily"
 
-TELEGRAM_TOKEN = "YOUR_US_BOT_TOKEN_HERE"
+TELEGRAM_TOKEN = "8018716820:AAEMAtRy6D0B0xt7SJgJB-bj7VF07ld4aVA"
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 
@@ -406,8 +406,8 @@ def print_layer1_tcs_style(ticker: str, trade_date_db: str) -> str:
             "S2":  row["S2_all"],  "S22":  row["S22_all"],
             "S3":  row["S3_all"],  "S32":  row["S32_all"],
             "R1":  row["R1_all"],  "R12":  row["R12_all"],
-            "R2":  row["R2_all"],  "R22":  row["R22_all"],
-            "R3":  row["R3_all"],  "R32":  row["R32_all"],
+            "R2":  row["R2_all"],  "R22":  row["R2_all"],
+            "R3":  row["R3_all"],  "R32":  row["R3_all"],
             "Opn": row["OpnPric"], "High": row["HghPric"],
             "Low": row["LwPric"],  "Close": row["ClsPric"],
         }
@@ -417,7 +417,7 @@ def print_layer1_tcs_style(ticker: str, trade_date_db: str) -> str:
             "S3":  row["S3_filt"],  "S32":  row["S32_filt"],
             "R1":  row["R1_filt"],  "R12":  row["R12_filt"],
             "R2":  row["R2_filt"],  "R22":  row["R2_filt"],
-            "R3":  row["R3_filt"],  "R32":  row["R32_filt"],
+            "R3":  row["R3_filt"],  "R32":  row["R3_filt"],
             "Opn": row["OpnPric"],  "High": row["HghPric"],
             "Low": row["LwPric"],   "Close": row["ClsPric"],
         }
@@ -665,20 +665,8 @@ def format_layer4_snapshot(calls: pd.DataFrame, puts: pd.DataFrame, expiry: str)
 
 # ================== SIMPLE OHLC CHART (IMAGE) ==================
 def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
-    """
-    Plot last 30 days close with horizontal SR levels from SUMMARY_TABLE
-    (S1,S12,S2,S22,S3,S32,R1,R12,R2,R22,R3,R32).
-
-    For each SR level (sorted by price):
-      - Draw a horizontal dashed line.
-      - Bottom-most line: LEFT label only, below the line, with 2-unit gap.
-      - Next line: RIGHT label only, below the line, with 2-unit gap.
-      - Then alternate left/right up the stack.
-    """
-
     conn = sqlite3.connect(US_DB_PATH)
 
-    # 1) price series (30 days)
     df = pd.read_sql(
         f"""
         SELECT trade_date, close
@@ -699,7 +687,6 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
         conn.close()
         return ""
 
-    # 2) SR levels for that date
     df_sr = pd.read_sql(
         f"""
         SELECT S1_all, S12_all, S2_all, S22_all, S3_all, S32_all,
@@ -729,11 +716,9 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
             "R32": row["R32_all"],
         }
 
-    # 3) build plot
     plt.figure(figsize=(9, 5))
     ax = plt.gca()
 
-    # price line
     ax.plot(df["Date"], df["close"], marker="o", color="black", label="Close (last 30d)")
 
     level_colors = {
@@ -1046,7 +1031,7 @@ def scan_us_sr_levels(level: str, date_ddmm: str | None) -> str:
 
 
 
-# ================== OPTION 5-DAY SLICE ==================
+# ================== OPTION 5-DAY SLICE (SR-style) ==================
 def build_us_option_slice_text(
     ticker: str,
     strike: float,
@@ -1246,15 +1231,6 @@ def get_uscount_dates(ddmm: str | None) -> list[str]:
 
 
 def build_uscount_table(ddmm: str | None) -> str:
-    """
-    US /uscount in India-style /COUNT format:
-
-    Symbol | Type | Date | Count | High_Strike | Open | High | Low | Close | PrevClose | OI | COI
-
-    NOTE: Column names inside CHANGE_TABLE such as openPrice_Call, highPrice_Call, etc.
-    must match your DB. Adjust them if needed.
-    """
-
     dates = get_uscount_dates(ddmm)
     if not dates:
         if ddmm:
@@ -1262,10 +1238,8 @@ def build_uscount_table(ddmm: str | None) -> str:
         return "No US trade dates found for /uscount."
 
     conn = sqlite3.connect(US_DB_PATH)
-
     placeholders = ",".join("?" * len(dates))
 
-    # 1) aggregate at symbol+date level (all expiries)
     sql_agg = f"""
         SELECT
             ticker,
@@ -1283,7 +1257,6 @@ def build_uscount_table(ddmm: str | None) -> str:
         conn.close()
         return "No aggregated OI/COI rows for /uscount on those dates."
 
-    # 2) Count + dominant side
     df_agg["Count"] = df_agg["sum_coi_call"].abs().fillna(0) + df_agg["sum_coi_put"].abs().fillna(0)
     df_agg["side"] = np.where(
         df_agg["sum_coi_call"].abs() >= df_agg["sum_coi_put"].abs(),
@@ -1297,7 +1270,6 @@ def build_uscount_table(ddmm: str | None) -> str:
         conn.close()
         return "No symbols with non-zero Count for /uscount on those dates."
 
-    # 3) For each ticker+date, find strike with max |COI_side| and OHLC etc.
     records = []
     for _, row in df_agg.iterrows():
         ticker = row["ticker"]
@@ -1305,16 +1277,19 @@ def build_uscount_table(ddmm: str | None) -> str:
         side = row["side"]
         count_val = float(row["Count"])
 
-        # IMPORTANT: Adjust column names here if they differ in your US CHANGE_TABLE
         df_ch = pd.read_sql(
             f"""
             SELECT
                 strike,
                 expiry_date,
-                openPrice_Call, highPrice_Call, lowPrice_Call, closePrice_Call, prevClose_Call,
-                openInt_Call_now, change_OI_Call,
-                openPrice_Put,  highPrice_Put,  lowPrice_Put,  closePrice_Put,  prevClose_Put,
-                openInt_Put_now,  change_OI_Put
+                call_close_now,
+                call_high_now,
+                openInt_Call_now,
+                change_OI_Call,
+                put_close_now,
+                put_high_now,
+                openInt_Put_now,
+                change_OI_Put
             FROM {CHANGE_TABLE}
             WHERE ticker = ? AND trade_date_now = ?
             """,
@@ -1333,11 +1308,11 @@ def build_uscount_table(ddmm: str | None) -> str:
             best = df_side.sort_values("abs_coi", ascending=False).iloc[0]
             high_strike = float(best["strike"])
 
-            o   = float(best["openPrice_Call"] or 0)
-            h   = float(best["highPrice_Call"] or 0)
-            l   = float(best["lowPrice_Call"]  or 0)
-            c   = float(best["closePrice_Call"] or 0)
-            pc  = float(best["prevClose_Call"] or 0)
+            c   = float(best["call_close_now"] or 0)
+            h   = float(best["call_high_now"]  or c)
+            o   = c
+            l   = c
+            pc  = c
             oi  = int(best["openInt_Call_now"] or 0)
             coi = int(best["change_OI_Call"] or 0)
         else:
@@ -1349,11 +1324,11 @@ def build_uscount_table(ddmm: str | None) -> str:
             best = df_side.sort_values("abs_coi", ascending=False).iloc[0]
             high_strike = float(best["strike"])
 
-            o   = float(best["openPrice_Put"] or 0)
-            h   = float(best["highPrice_Put"] or 0)
-            l   = float(best["lowPrice_Put"]  or 0)
-            c   = float(best["closePrice_Put"] or 0)
-            pc  = float(best["prevClose_Put"] or 0)
+            c   = float(best["put_close_now"] or 0)
+            h   = float(best["put_high_now"]  or c)
+            o   = c
+            l   = c
+            pc  = c
             oi  = int(best["openInt_Put_now"] or 0)
             coi = int(best["change_OI_Put"] or 0)
 
@@ -1385,7 +1360,6 @@ def build_uscount_table(ddmm: str | None) -> str:
         return "No symbols with qualifying strikes for /uscount on those dates."
 
     df_out = pd.DataFrame(records)
-
     df_out = df_out.sort_values(["raw_date", "Count"], ascending=[False, False])
 
     headers = [
@@ -1436,7 +1410,7 @@ HELP_TEXT = (
     "    Example: /ussr S1\n"
     "    Example: /ussr ALLR 24-12\n\n"
     "/usopt TICKER STRIKE TYPE [DAYS] [MM-DD]\n"
-    "  - NSE-style multi-day option slice on US data.\n"
+    "  - SR-style multi-day option slice on US data (chart + table).\n"
     "    TYPE: C (Call) or P (Put).\n"
     "    DAYS: last N distinct trade days (default 5).\n"
     "    MM-DD (optional): US-style anchor date to cap the slice.\n"
@@ -1488,14 +1462,36 @@ def handle_us_command(message):
 
         ticker = parts[1].upper()
 
-        if len(parts) >= 3:
-            dt_str = parts[2]
-        else:
+        if len(parts) == 2:
             latest = get_latest_us_trade_date()
             if latest is None:
                 bot.reply_to(message, "No US trade dates in DB.")
                 return
             dt_str = latest
+        elif len(parts) == 3:
+            dt_str = parts[2]
+            try:
+                pd.to_datetime(dt_str, format="%m-%d-%Y")
+            except Exception:
+                bot.reply_to(
+                    message,
+                    "Invalid date.\n"
+                    "Use MM-DD-YYYY.\n"
+                    "Examples:\n"
+                    "  /us AVGO\n"
+                    "  /us AVGO 12-24-2025"
+                )
+                return
+        else:
+            bot.reply_to(
+                message,
+                "Too many arguments for /us.\n"
+                "Use:\n"
+                "  /us TICKER\n"
+                "  /us TICKER MM-DD-YYYY\n"
+                "For options slice, use /usopt TICKER STRIKE TYPE [DAYS] [MM-DD]."
+            )
+            return
 
         temp_dir = tempfile.gettempdir()
         chart_path = os.path.join(temp_dir, f"us_{ticker}_{dt_str}.png")
@@ -1593,6 +1589,17 @@ def handle_usopt_command(message):
             bot.reply_to(message, "TYPE must be C or P.")
             return
 
+        # 1) send SR-style chart (like /SR in India)
+        latest = get_latest_us_trade_date()
+        if latest:
+            temp_dir = tempfile.gettempdir()
+            chart_path = os.path.join(temp_dir, f"usopt_{ticker}_{int(strike)}_{opt_type}.png")
+            png = draw_us_ohlc_chart(ticker, latest, chart_path)
+            if png and os.path.exists(png):
+                with open(png, "rb") as f:
+                    bot.send_photo(message.chat.id, f)
+
+        # 2) send multi-day option slice table
         text = build_us_option_slice_text(ticker, strike, opt_type, days, mmdd_anchor)
         html = "<pre>" + text + "</pre>"
         if len(html) <= 4096:
