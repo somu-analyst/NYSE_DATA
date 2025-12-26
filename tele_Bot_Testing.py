@@ -8,6 +8,7 @@ import telebot
 import matplotlib
 matplotlib.use("Agg")  # non-GUI backend
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import tempfile
 
 
@@ -18,9 +19,8 @@ OPTIONS_TABLE = "options_daily"
 CHANGE_TABLE  = "options_change"
 STOCK_TABLE   = "stock_daily"
 
-TELEGRAM_TOKEN = "YOUR_US_BOT_TOKEN_HERE"
+TELEGRAM_TOKEN = "8018716820:AAEMAtRy6D0B0xt7SJgJB-bj7VF07ld4aVA"
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
 
 
 # ================== TABLE SETUP ==================
@@ -33,7 +33,7 @@ def recreate_us_analytics_table():
     cur.execute(f"DROP TABLE IF EXISTS {SUMMARY_TABLE}")
     cur.execute(f"""
         CREATE TABLE {SUMMARY_TABLE} (
-            trade_date   TEXT NOT NULL,  -- MM-DD-YYYY
+            trade_date   TEXT NOT NULL,  -- MM-DD-YYYY (anchor date, usually expiry)
             ticker       TEXT NOT NULL,
             expiry_date  TEXT NOT NULL,
             SUMCE        REAL,
@@ -66,7 +66,7 @@ def recreate_us_analytics_table():
             R2_filt      REAL, R22_filt   REAL,
             R3_filt      REAL, R32_filt   REAL,
 
-            -- Spot OHLC + PCR from stock_daily
+            -- Spot OHLC + PCR from stock_daily (last available <= anchor)
             OpnPric      REAL,
             HghPric      REAL,
             LwPric       REAL,
@@ -79,7 +79,6 @@ def recreate_us_analytics_table():
     conn.commit()
     conn.close()
     print(f"Recreated {SUMMARY_TABLE}")
-
 
 
 # ================== OPTIONS MONEY COLUMNS ==================
@@ -108,7 +107,6 @@ def ensure_options_money_columns():
     conn.close()
 
 
-
 def update_options_money_fields_and_ranks():
     conn = sqlite3.connect(US_DB_PATH)
     df = pd.read_sql(f"SELECT * FROM {OPTIONS_TABLE}", conn)
@@ -125,9 +123,8 @@ def update_options_money_fields_and_ranks():
         df["lastPrice_Call"] = df["lastPrice_Call"].fillna(0)
         df["vol_Call"] = df["vol_Call"].fillna(0)
 
-        df["chg_oi_call"] = df.groupby(
-            ["ticker", "expiry_date", "strike"]
-        )["openInt_Call"].diff().fillna(0)
+        # ChgOI will come from options_change; keep zeros here
+        df["chg_oi_call"] = 0.0
         df["money_coi_call"] = df["lastPrice_Call"] * df["chg_oi_call"]
         df["money_oi_call"]  = df["lastPrice_Call"] * df["openInt_Call"]
 
@@ -146,9 +143,8 @@ def update_options_money_fields_and_ranks():
         df["lastPrice_Put"] = df["lastPrice_Put"].fillna(0)
         df["vol_Put"] = df["vol_Put"].fillna(0)
 
-        df["chg_oi_put"] = df.groupby(
-            ["ticker", "expiry_date", "strike"]
-        )["openInt_Put"].diff().fillna(0)
+        # ChgOI will come from options_change; keep zeros here
+        df["chg_oi_put"] = 0.0
         df["money_coi_put"] = df["lastPrice_Put"] * df["chg_oi_put"]
         df["money_oi_put"]  = df["lastPrice_Put"] * df["openInt_Put"]
 
@@ -167,7 +163,6 @@ def update_options_money_fields_and_ranks():
 
     df.to_sql(OPTIONS_TABLE, conn, if_exists="replace", index=False)
     conn.close()
-
 
 
 # ================== NEAREST STRIKE HELPER ==================
@@ -213,25 +208,201 @@ def get_nearest_strike_for_us(
     return float(arr[idx])
 
 
+# ================== EXPIRY + STOCK DATE HELPERS (US) ==================
+def get_nearest_expiry_for_us(ticker: str) -> str | None:
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"""
+        SELECT DISTINCT expiry_date
+        FROM {OPTIONS_TABLE}
+        WHERE ticker = ?
+          AND expiry_date IS NOT NULL
+        """,
+        conn,
+        params=(ticker,)
+    )
+    conn.close()
+    if df.empty:
+        return None
 
-# ================== PER-TICKER ANALYTICS BUILDER ==================
-def build_us_analytics_for_day(trade_date_opt: str, ticker: str):
+    df["expiry_date"] = df["expiry_date"].astype(str)
+    df["expiry_dt"] = pd.to_datetime(df["expiry_date"], errors="coerce")
+    df = df.dropna(subset=["expiry_dt"])
+    if df.empty:
+        return None
+
+    today = pd.to_datetime(dt.datetime.now().date())
+    df_future = df[df["expiry_dt"] >= today]
+    if df_future.empty:
+        row = df.loc[df["expiry_dt"].idxmin()]
+    else:
+        row = df_future.loc[df_future["expiry_dt"].idxmin()]
+
+    return str(row["expiry_date"])
+
+
+def get_latest_trade_for_expiry_us(ticker: str, expiry_date: str) -> str | None:
+    conn = sqlite3.connect(US_DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT MAX(trade_date)
+        FROM {OPTIONS_TABLE}
+        WHERE ticker = ?
+          AND expiry_date = ?
+        """,
+        (ticker, expiry_date)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def get_nearest_expiry_on_or_after(ticker: str, anchor_date_db: str | None) -> str | None:
+    """
+    Find nearest expiry_date >= anchor_date_db (MM-DD-YYYY) for this ticker.
+    If anchor_date_db is None, use 'today' as anchor.
+    If nothing >= anchor, fall back to min(expiry_date).
+    """
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"""
+        SELECT DISTINCT expiry_date
+        FROM {OPTIONS_TABLE}
+        WHERE ticker = ?
+          AND expiry_date IS NOT NULL
+        """,
+        conn,
+        params=(ticker,)
+    )
+    conn.close()
+    if df.empty:
+        return None
+
+    df["expiry_date"] = df["expiry_date"].astype(str)
+    df["expiry_dt"] = pd.to_datetime(df["expiry_date"], errors="coerce")
+    df = df.dropna(subset=["expiry_dt"])
+    if df.empty:
+        return None
+
+    if anchor_date_db:
+        anchor_dt = pd.to_datetime(anchor_date_db, format="%m-%d-%Y", errors="coerce")
+        if pd.isna(anchor_dt):
+            anchor_dt = pd.to_datetime(dt.datetime.now().date())
+    else:
+        anchor_dt = pd.to_datetime(dt.datetime.now().date())
+
+    df_future = df[df["expiry_dt"] >= anchor_dt]
+    if df_future.empty:
+        row = df.loc[df["expiry_dt"].idxmin()]
+    else:
+        row = df_future.loc[df_future["expiry_dt"].idxmin()]
+
+    return str(row["expiry_date"])
+
+
+def get_nearest_stock_date_on_or_before(anchor_date_db: str) -> str | None:
+    """
+    Given MM-DD-YYYY, return nearest trade_date in STOCK_TABLE that is <= anchor_date_db.
+    If none <=, return earliest date; if no rows, None.
+    """
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"SELECT DISTINCT trade_date FROM {STOCK_TABLE}",
+        conn
+    )
+    conn.close()
+    if df.empty:
+        return None
+
+    df["trade_date_dt"] = pd.to_datetime(df["trade_date"], format="%m-%d-%Y", errors="coerce")
+    anchor_dt = pd.to_datetime(anchor_date_db, format="%m-%d-%Y", errors="coerce")
+    if pd.isna(anchor_dt):
+        return None
+
+    df = df.dropna(subset=["trade_date_dt"])
+    df_le = df[df["trade_date_dt"] <= anchor_dt]
+    if df_le.empty:
+        row = df.loc[df["trade_date_dt"].idxmin()]
+    else:
+        row = df_le.loc[df_le["trade_date_dt"].idxmax()]
+
+    return row["trade_date"]
+
+
+# latest options trade_date <= anchor (Option-B)
+def get_options_trade_on_or_before_anchor(ticker: str, expiry: str, anchor_date_db: str) -> str | None:
+    """
+    Latest options trade_date <= anchor_date_db (MM-DD-YYYY) for this expiry.
+    """
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"SELECT DISTINCT trade_date FROM {OPTIONS_TABLE} WHERE ticker=? AND expiry_date=?",
+        conn, params=(ticker, expiry)
+    )
+    conn.close()
+    if df.empty:
+        return None
+    df["trade_date_dt"] = pd.to_datetime(df["trade_date"], format="%d%b%Y", errors="coerce")
+    df = df.dropna(subset=["trade_date_dt"])
+    if df.empty:
+        return None
+    anchor_dt = pd.to_datetime(anchor_date_db, format="%m-%d-%Y", errors="coerce")
+    if pd.isna(anchor_dt):
+        return None
+    df_le = df[df["trade_date_dt"] <= anchor_dt]
+    if df_le.empty:
+        row = df.loc[df["trade_date_dt"].idxmin()]
+    else:
+        row = df_le.loc[df_le["trade_date_dt"].idxmax()]
+    return row["trade_date"]
+
+
+# ================== PER-TICKER ANALYTICS BUILDER (EXPIRY-DRIVEN, Option-B) ==================
+def build_us_analytics_for_day(trade_date_opt: str, ticker: str, expiry_hint: str | None = None):
+    """
+    trade_date_opt: %d%b%Y – used for CHANGE_TABLE join.
+
+    Option-B:
+      - anchor date (MM-DD-YYYY) = converted from trade_date_opt (expiry-based anchor)
+      - expiry: expiry_hint or nearest from today
+      - options snapshot: latest options trade_date <= anchor for that expiry
+      - trade_date in SUMMARY_TABLE = anchor date
+    """
     if not os.path.exists(US_DB_PATH):
         return
 
+    anchor_db = pd.to_datetime(trade_date_opt, format="%d%b%Y").strftime("%m-%d-%Y")
+
     conn = sqlite3.connect(US_DB_PATH)
-    df_opt = pd.read_sql(
-        f"SELECT * FROM {OPTIONS_TABLE} WHERE ticker=? AND trade_date=?",
-        conn, params=(ticker, trade_date_opt)
-    )
-    if df_opt.empty:
+
+    if expiry_hint:
+        expiry = expiry_hint
+    else:
+        expiry = get_nearest_expiry_for_us(ticker)
+    if not expiry:
         conn.close()
         return
 
-    df_opt["expiry_date"] = df_opt["expiry_date"].astype(str)
-    expiries = sorted(df_opt["expiry_date"].unique())
-    expiry = expiries[0]
-    df_e = df_opt[df_opt["expiry_date"] == expiry].copy()
+    opt_trade = get_options_trade_on_or_before_anchor(ticker, expiry, anchor_db)
+    if not opt_trade:
+        conn.close()
+        return
+
+    df_e = pd.read_sql(
+        f"""
+        SELECT *
+        FROM {OPTIONS_TABLE}
+        WHERE ticker=? AND trade_date=? AND expiry_date=?
+        """,
+        conn,
+        params=(ticker, opt_trade, expiry)
+    )
+    if df_e.empty:
+        conn.close()
+        return
+
+    df_e["expiry_date"] = df_e["expiry_date"].astype(str)
 
     df_e["openInt_Call"] = df_e["openInt_Call"].fillna(0)
     df_e["openInt_Put"]  = df_e["openInt_Put"].fillna(0)
@@ -268,9 +439,8 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str):
     top_ce_filt = top_ce_filt.sort_values("openInt_Call", ascending=False).head(3)
     top_pe_filt = top_pe_filt.sort_values("openInt_Put",  ascending=False).head(3)
 
-    trade_date_db = pd.to_datetime(trade_date_opt, format="%d%b%Y").strftime("%m-%d-%Y")
     data = {
-        "trade_date":  trade_date_db,
+        "trade_date":  anchor_db,
         "ticker":      ticker,
         "expiry_date": expiry,
         "SUMCE": round(SUMCE, 2),
@@ -354,12 +524,17 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str):
                  round(R1,2) if R1 is not None else None,
                  round(R12,2) if R12 is not None else None)
 
-    # spot
-    df_spot = pd.read_sql(
-        f"SELECT open, high, low, close, pcr_oi FROM {STOCK_TABLE} "
-        f"WHERE ticker=? AND trade_date=?",
-        conn, params=(ticker, trade_date_db)
-    )
+    # spot: last available OHLC on or before anchor_db
+    nearest_spot_date = get_nearest_stock_date_on_or_before(anchor_db)
+    if nearest_spot_date:
+        df_spot = pd.read_sql(
+            f"SELECT open, high, low, close, pcr_oi FROM {STOCK_TABLE} "
+            f"WHERE ticker=? AND trade_date=?",
+            conn, params=(ticker, nearest_spot_date)
+        )
+    else:
+        df_spot = pd.DataFrame()
+
     if not df_spot.empty:
         sr = df_spot.iloc[0]
         data["OpnPric"]     = round(float(sr["open"]), 2)
@@ -385,7 +560,6 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str):
     )
     conn.commit()
     conn.close()
-
 
 
 # ================== LAYER HELPERS (1–3) ==================
@@ -416,8 +590,8 @@ def print_layer1_tcs_style(ticker: str, trade_date_db: str) -> str:
             "S2":  row["S2_filt"],  "S22":  row["S22_filt"],
             "S3":  row["S3_filt"],  "S32":  row["S32_filt"],
             "R1":  row["R1_filt"],  "R12":  row["R12_filt"],
-            "R2":  row["R2_filt"],  "R22":  row["R2_filt"],
-            "R3":  row["R3_filt"],  "R32":  row["R32_filt"],
+            "R2":  row["R2_filt"],  "R22":  row["R2_filt"],  # no separate R22_filt col
+            "R3":  row["R3_filt"],  "R32":  row["R3_filt"],  # no separate R32_filt col
             "Opn": row["OpnPric"],  "High": row["HghPric"],
             "Low": row["LwPric"],   "Close": row["ClsPric"],
         }
@@ -426,7 +600,6 @@ def print_layer1_tcs_style(ticker: str, trade_date_db: str) -> str:
         df_out[num_cols] = df_out[num_cols].round(2)
         buf.write(df_out.to_string() + "\n")
     return buf.getvalue()
-
 
 
 def get_layer2(ticker: str, trade_date_db: str, lookback_days: int = 5) -> pd.DataFrame:
@@ -504,7 +677,6 @@ def get_layer2(ticker: str, trade_date_db: str, lookback_days: int = 5) -> pd.Da
     return df_out
 
 
-
 def get_layer3_pivot_cpr(ticker: str, trade_date_db: str) -> pd.DataFrame:
     conn = sqlite3.connect(US_DB_PATH)
     df = pd.read_sql(
@@ -538,33 +710,64 @@ def get_layer3_pivot_cpr(ticker: str, trade_date_db: str) -> pd.DataFrame:
     return df_out
 
 
+# ================== Layer-4 snapshot (COI from options_change) ==================
+def get_layer4_options_snapshot(ticker: str, trade_date_opt: str, top_n: int = 3, expiry_hint: str | None = None):
+    if expiry_hint:
+        expiry = expiry_hint
+    else:
+        expiry = get_nearest_expiry_for_us(ticker)
+    if not expiry:
+        return pd.DataFrame(), pd.DataFrame(), None
 
-# ================== Layer-4 snapshot ==================
-def get_layer4_options_snapshot(ticker: str, trade_date_opt: str, top_n: int = 3):
+    latest_trade_for_exp = get_latest_trade_for_expiry_us(ticker, expiry)
+    if not latest_trade_for_exp:
+        return pd.DataFrame(), pd.DataFrame(), None
+
     conn = sqlite3.connect(US_DB_PATH)
     df = pd.read_sql(
         f"""
         SELECT ticker, strike, expiry_date, trade_date,
                lastPrice_Call, openInt_Call, vol_Call,
                lastPrice_Put,  openInt_Put,  vol_Put,
-               money_coi_call, money_oi_call,
+               money_oi_call, money_oi_put,
                vol_rank_call,  vol_rank_all_call,
-               money_coi_put,  money_oi_put,
-               vol_rank_put,   vol_rank_all_put,
-               chg_oi_call,    chg_oi_put
+               vol_rank_put,   vol_rank_all_put
         FROM {OPTIONS_TABLE}
-        WHERE ticker=? AND trade_date=?
+        WHERE ticker=? AND trade_date=? AND expiry_date=?
+        """,
+        conn, params=(ticker, latest_trade_for_exp, expiry)
+    )
+    if df.empty:
+        conn.close()
+        return pd.DataFrame(), pd.DataFrame(), None
+
+    df["expiry_date"] = df["expiry_date"].astype(str)
+    df["strike"] = df["strike"].astype(float)
+
+    df_chg = pd.read_sql(
+        f"""
+        SELECT strike, expiry_date, change_OI_Call, change_OI_Put
+        FROM {CHANGE_TABLE}
+        WHERE ticker=? AND trade_date_now=?
         """,
         conn, params=(ticker, trade_date_opt)
     )
     conn.close()
-    if df.empty:
-        return pd.DataFrame(), pd.DataFrame(), None
 
-    df["expiry_date"] = df["expiry_date"].astype(str)
-    expiries = sorted(df["expiry_date"].unique())
-    expiry = expiries[0]
-    df_e = df[df["expiry_date"] == expiry].copy()
+    if not df_chg.empty:
+        df_chg["expiry_date"] = df_chg["expiry_date"].astype(str)
+        df_chg["strike"]      = df_chg["strike"].astype(float)
+        df = df.merge(df_chg, on=["strike","expiry_date"], how="left")
+    else:
+        df["change_OI_Call"] = np.nan
+        df["change_OI_Put"]  = np.nan
+
+    df["chg_oi_call"] = df["change_OI_Call"].fillna(0)
+    df["chg_oi_put"]  = df["change_OI_Put"].fillna(0)
+    df["money_coi_call"] = df["lastPrice_Call"].fillna(0) * df["chg_oi_call"]
+    df["money_coi_put"]  = df["lastPrice_Put"].fillna(0)  * df["chg_oi_put"]
+
+    df_e = df.copy()
 
     calls = df_e[df_e["openInt_Call"].notna() & (df_e["openInt_Call"] > 0)].copy()
     calls = calls.sort_values(["openInt_Call", "vol_Call"], ascending=[False, False]).head(top_n)
@@ -600,7 +803,6 @@ def get_layer4_options_snapshot(ticker: str, trade_date_opt: str, top_n: int = 3
             df_x[num_cols] = df_x[num_cols].round(2)
 
     return calls_out.reset_index(drop=True), puts_out.reset_index(drop=True), expiry
-
 
 
 def format_layer4_snapshot(calls: pd.DataFrame, puts: pd.DataFrame, expiry: str) -> str:
@@ -662,23 +864,10 @@ def format_layer4_snapshot(calls: pd.DataFrame, puts: pd.DataFrame, expiry: str)
     return buf.getvalue()
 
 
-
 # ================== SIMPLE OHLC CHART (IMAGE) ==================
 def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
-    """
-    Plot last 30 days close with horizontal SR levels from SUMMARY_TABLE
-    (S1,S12,S2,S22,S3,S32,R1,R12,R2,R22,R3,R32).
-
-    For each SR level (sorted by price):
-      - Draw a horizontal dashed line.
-      - Bottom-most line: LEFT label only, below the line, with 2-unit gap.
-      - Next line: RIGHT label only, below the line, with 2-unit gap.
-      - Then alternate left/right up the stack.
-    """
-
     conn = sqlite3.connect(US_DB_PATH)
 
-    # 1) price series (30 days)
     df = pd.read_sql(
         f"""
         SELECT trade_date, close
@@ -699,7 +888,6 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
         conn.close()
         return ""
 
-    # 2) SR levels for that date
     df_sr = pd.read_sql(
         f"""
         SELECT S1_all, S12_all, S2_all, S22_all, S3_all, S32_all,
@@ -729,11 +917,9 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
             "R32": row["R32_all"],
         }
 
-    # 3) build plot
     plt.figure(figsize=(9, 5))
     ax = plt.gca()
 
-    # price line
     ax.plot(df["Date"], df["close"], marker="o", color="black", label="Close (last 30d)")
 
     level_colors = {
@@ -818,6 +1004,9 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
     ax.set_ylabel("Price")
     ax.grid(True, alpha=0.3)
 
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+    plt.xticks(rotation=45)
+
     ax.set_xlim(
         df["Date"].min() - pd.Timedelta(days=1),
         df["Date"].max() + pd.Timedelta(days=1),
@@ -829,12 +1018,11 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
     return out_path
 
 
-
 # ================== FULL 4-LAYER TEXT ==================
-def build_us_layers_text(ticker: str, trade_date_db: str) -> str:
+def build_us_layers_text(ticker: str, trade_date_db: str, expiry_hint: str | None = None) -> str:
     buf = io.StringIO()
     trade_date_opt = pd.to_datetime(trade_date_db, format="%m-%d-%Y").strftime("%d%b%Y")
-    build_us_analytics_for_day(trade_date_opt, ticker)
+    build_us_analytics_for_day(trade_date_opt, ticker, expiry_hint=expiry_hint)
 
     buf.write("——————— LAYER-1 ———————\n")
     buf.write(print_layer1_tcs_style(ticker, trade_date_db))
@@ -853,11 +1041,12 @@ def build_us_layers_text(ticker: str, trade_date_db: str) -> str:
     else:
         buf.write(df_l3.to_string(index=False) + "\n")
 
-    calls, puts, expiry = get_layer4_options_snapshot(ticker, trade_date_opt, top_n=3)
+    calls, puts, expiry = get_layer4_options_snapshot(
+        ticker, trade_date_opt, top_n=3, expiry_hint=expiry_hint
+    )
     buf.write("\n")
     buf.write(format_layer4_snapshot(calls, puts, expiry))
     return buf.getvalue()
-
 
 
 # ================== DATE HELPERS ==================
@@ -871,7 +1060,6 @@ def get_latest_us_trade_date() -> str | None:
     if df.empty:
         return None
     return df["trade_date"].iloc[-1]
-
 
 
 def get_prev_us_trade_date(trade_date_db: str) -> str | None:
@@ -890,7 +1078,6 @@ def get_prev_us_trade_date(trade_date_db: str) -> str | None:
     if idx == 0:
         return None
     return dates[idx - 1]
-
 
 
 # ================== SR SCANNER ==================
@@ -1045,8 +1232,7 @@ def scan_us_sr_levels(level: str, date_ddmm: str | None) -> str:
     return "Unknown level. Use S1/S2/S3/R1/R2/R3/ALLS/ALLR."
 
 
-
-# ================== OPTION 5-DAY SLICE ==================
+# ================== OPTION 5-DAY SLICE (SR-style) ==================
 def build_us_option_slice_text(
     ticker: str,
     strike: float,
@@ -1197,7 +1383,6 @@ def build_us_option_slice_text(
     return buf.getvalue()
 
 
-
 # ================== /uscount HELPERS ==================
 def get_uscount_dates(ddmm: str | None) -> list[str]:
     conn = sqlite3.connect(US_DB_PATH)
@@ -1244,17 +1429,7 @@ def get_uscount_dates(ddmm: str | None) -> list[str]:
     return [r[0] for r in rows if r[0]]
 
 
-
 def build_uscount_table(ddmm: str | None) -> str:
-    """
-    US /uscount in India-style /COUNT format:
-
-    Symbol | Type | Date | Count | High_Strike | Open | High | Low | Close | PrevClose | OI | COI
-
-    NOTE: Column names inside CHANGE_TABLE such as openPrice_Call, highPrice_Call, etc.
-    must match your DB. Adjust them if needed.
-    """
-
     dates = get_uscount_dates(ddmm)
     if not dates:
         if ddmm:
@@ -1262,10 +1437,8 @@ def build_uscount_table(ddmm: str | None) -> str:
         return "No US trade dates found for /uscount."
 
     conn = sqlite3.connect(US_DB_PATH)
-
     placeholders = ",".join("?" * len(dates))
 
-    # 1) aggregate at symbol+date level (all expiries)
     sql_agg = f"""
         SELECT
             ticker,
@@ -1283,7 +1456,6 @@ def build_uscount_table(ddmm: str | None) -> str:
         conn.close()
         return "No aggregated OI/COI rows for /uscount on those dates."
 
-    # 2) Count + dominant side
     df_agg["Count"] = df_agg["sum_coi_call"].abs().fillna(0) + df_agg["sum_coi_put"].abs().fillna(0)
     df_agg["side"] = np.where(
         df_agg["sum_coi_call"].abs() >= df_agg["sum_coi_put"].abs(),
@@ -1297,7 +1469,6 @@ def build_uscount_table(ddmm: str | None) -> str:
         conn.close()
         return "No symbols with non-zero Count for /uscount on those dates."
 
-    # 3) For each ticker+date, find strike with max |COI_side| and OHLC etc.
     records = []
     for _, row in df_agg.iterrows():
         ticker = row["ticker"]
@@ -1305,16 +1476,19 @@ def build_uscount_table(ddmm: str | None) -> str:
         side = row["side"]
         count_val = float(row["Count"])
 
-        # IMPORTANT: Adjust column names here if they differ in your US CHANGE_TABLE
         df_ch = pd.read_sql(
             f"""
             SELECT
                 strike,
                 expiry_date,
-                openPrice_Call, highPrice_Call, lowPrice_Call, closePrice_Call, prevClose_Call,
-                openInt_Call_now, change_OI_Call,
-                openPrice_Put,  highPrice_Put,  lowPrice_Put,  closePrice_Put,  prevClose_Put,
-                openInt_Put_now,  change_OI_Put
+                call_close_now,
+                call_high_now,
+                openInt_Call_now,
+                change_OI_Call,
+                put_close_now,
+                put_high_now,
+                openInt_Put_now,
+                change_OI_Put
             FROM {CHANGE_TABLE}
             WHERE ticker = ? AND trade_date_now = ?
             """,
@@ -1333,11 +1507,11 @@ def build_uscount_table(ddmm: str | None) -> str:
             best = df_side.sort_values("abs_coi", ascending=False).iloc[0]
             high_strike = float(best["strike"])
 
-            o   = float(best["openPrice_Call"] or 0)
-            h   = float(best["highPrice_Call"] or 0)
-            l   = float(best["lowPrice_Call"]  or 0)
-            c   = float(best["closePrice_Call"] or 0)
-            pc  = float(best["prevClose_Call"] or 0)
+            c   = float(best["call_close_now"] or 0)
+            h   = float(best["call_high_now"]  or c)
+            o   = c
+            l   = c
+            pc  = c
             oi  = int(best["openInt_Call_now"] or 0)
             coi = int(best["change_OI_Call"] or 0)
         else:
@@ -1349,11 +1523,11 @@ def build_uscount_table(ddmm: str | None) -> str:
             best = df_side.sort_values("abs_coi", ascending=False).iloc[0]
             high_strike = float(best["strike"])
 
-            o   = float(best["openPrice_Put"] or 0)
-            h   = float(best["highPrice_Put"] or 0)
-            l   = float(best["lowPrice_Put"]  or 0)
-            c   = float(best["closePrice_Put"] or 0)
-            pc  = float(best["prevClose_Put"] or 0)
+            c   = float(best["put_close_now"] or 0)
+            h   = float(best["put_high_now"]  or c)
+            o   = c
+            l   = c
+            pc  = c
             oi  = int(best["openInt_Put_now"] or 0)
             coi = int(best["change_OI_Put"] or 0)
 
@@ -1385,7 +1559,6 @@ def build_uscount_table(ddmm: str | None) -> str:
         return "No symbols with qualifying strikes for /uscount on those dates."
 
     df_out = pd.DataFrame(records)
-
     df_out = df_out.sort_values(["raw_date", "Count"], ascending=[False, False])
 
     headers = [
@@ -1420,43 +1593,25 @@ def build_uscount_table(ddmm: str | None) -> str:
     return "\n".join(lines)
 
 
-
 # ================== HELP ==================
 HELP_TEXT = (
     "US Market Bot\n\n"
     "Commands:\n"
     "/us TICKER [MM-DD-YYYY]\n"
-    "  - Full 4 layers (options S/R, OHLC+PCR+FOI/FCOI, CPR, options snapshot) for one US ticker.\n"
-    "    Sends chart image + text layers.\n"
-    "    Example: /us SPY\n"
-    "    Example: /us AVGO 12-24-2025\n\n"
+    "  - Full 4 layers (options S/R, OHLC+PCR+FOI/FCOI, CPR, options snapshot).\n"
+    "    /us TICKER uses nearest expiry from today and uses that expiry as anchor date.\n"
+    "    /us TICKER MM-DD-YYYY uses nearest expiry on/after that date as anchor.\n"
+    "    Example: /us GLD\n"
+    "    Example: /us GLD 12-26-2025\n\n"
     "/ussr LEVEL [DD-MM]\n"
     "  - SR touch scan across all US tickers (S1/S2/S3/R1/R2/R3/ALLS/ALLR).\n"
-    "    DD-MM is India-style date; defaults to latest US date if omitted.\n"
-    "    Example: /ussr S1\n"
-    "    Example: /ussr ALLR 24-12\n\n"
+    "    DD-MM is India-style date; defaults to latest US date if omitted.\n\n"
     "/usopt TICKER STRIKE TYPE [DAYS] [MM-DD]\n"
-    "  - NSE-style multi-day option slice on US data.\n"
-    "    TYPE: C (Call) or P (Put).\n"
-    "    DAYS: last N distinct trade days (default 5).\n"
-    "    MM-DD (optional): US-style anchor date to cap the slice.\n"
-    "    Strike is auto-adjusted to nearest available strike.\n"
-    "    Examples:\n"
-    "      /usopt AVGO 350 C\n"
-    "      /usopt AVGO 350 C 7\n"
-    "      /usopt AVGO 350 C 5 12-24\n\n"
+    "  - SR-style multi-day option slice on US data (chart + table).\n"
+    "    TYPE: C (Call) or P (Put).\n\n"
     "/uscount [DD-MM]\n"
     "  - India-style COUNT scan on US options.\n"
-    "    For each of the latest 4 trade dates, aggregates COI across all expiries per symbol,\n"
-    "    picks the dominant side (CE/PE), then shows the strike with highest |COI| on that side,\n"
-    "    along with Open/High/Low/Close/PrevClose/OI/COI.\n"
-    "    Format:\n"
-    "      Symbol | Type | Date | Count | High_Strike | Open | High | Low | Close | PrevClose | OI | COI\n"
-    "    Examples:\n"
-    "      /uscount\n"
-    "      /uscount 24-12\n"
 )
-
 
 
 # ================== TELEGRAM HANDLERS ==================
@@ -1465,11 +1620,9 @@ def handle_start(message):
     bot.reply_to(message, "US bot online.\nUse /help for commands.")
 
 
-
 @bot.message_handler(commands=['help'])
 def handle_help(message):
     bot.reply_to(message, HELP_TEXT)
-
 
 
 @bot.message_handler(commands=['us', 'US'])
@@ -1482,20 +1635,60 @@ def handle_us_command(message):
                 "Format:\n"
                 "/us TICKER\n"
                 "/us TICKER MM-DD-YYYY\n"
-                "Example: /us AVGO 12-24-2025"
+                "Example: /us GLD\n"
+                "         /us GLD 12-26-2025"
             )
             return
 
         ticker = parts[1].upper()
 
-        if len(parts) >= 3:
-            dt_str = parts[2]
-        else:
-            latest = get_latest_us_trade_date()
-            if latest is None:
-                bot.reply_to(message, "No US trade dates in DB.")
+        if len(parts) == 2:
+            # /us TICKER: anchor = nearest expiry from today
+            expiry_hint = get_nearest_expiry_on_or_after(ticker, None)
+            if not expiry_hint:
+                bot.reply_to(message, "No expiries found for this ticker.")
                 return
-            dt_str = latest
+            expiry_dt = pd.to_datetime(str(expiry_hint), errors="coerce")
+            if pd.isna(expiry_dt):
+                bot.reply_to(message, f"Bad expiry format in DB: {expiry_hint}")
+                return
+            dt_str = expiry_dt.strftime("%m-%d-%Y")  # anchor = expiry date
+        elif len(parts) == 3:
+            # /us TICKER MM-DD-YYYY: anchor = nearest expiry on/after user date
+            user_date = parts[2]
+            try:
+                pd.to_datetime(user_date, format="%m-%d-%Y")
+            except Exception:
+                bot.reply_to(
+                    message,
+                    "Invalid date.\n"
+                    "Use MM-DD-YYYY.\n"
+                    "Examples:\n"
+                    "  /us GLD\n"
+                    "  /us GLD 12-26-2025"
+                )
+                return
+
+            expiry_hint = get_nearest_expiry_on_or_after(ticker, user_date)
+            if not expiry_hint:
+                bot.reply_to(message, "No expiries found for this ticker near that date.")
+                return
+
+            expiry_dt = pd.to_datetime(str(expiry_hint), errors="coerce")
+            if pd.isna(expiry_dt):
+                bot.reply_to(message, f"Bad expiry format in DB: {expiry_hint}")
+                return
+            dt_str = expiry_dt.strftime("%m-%d-%Y")  # anchor = expiry date
+        else:
+            bot.reply_to(
+                message,
+                "Too many arguments for /us.\n"
+                "Use:\n"
+                "  /us TICKER\n"
+                "  /us TICKER MM-DD-YYYY\n"
+                "For options slice, use /usopt TICKER STRIKE TYPE [DAYS] [MM-DD]."
+            )
+            return
 
         temp_dir = tempfile.gettempdir()
         chart_path = os.path.join(temp_dir, f"us_{ticker}_{dt_str}.png")
@@ -1504,7 +1697,7 @@ def handle_us_command(message):
             with open(png, "rb") as f:
                 bot.send_photo(message.chat.id, f)
 
-        layers = build_us_layers_text(ticker, dt_str)
+        layers = build_us_layers_text(ticker, dt_str, expiry_hint=expiry_hint)
         raw_text = layers
 
         html = f"<b>US Analytics: {ticker} {dt_str}</b>\n<pre>{raw_text}</pre>"
@@ -1524,7 +1717,6 @@ def handle_us_command(message):
         bot.reply_to(message, f"Error: {e}")
 
 
-
 @bot.message_handler(commands=['ussr', 'USSR'])
 def handle_ussr_command(message):
     try:
@@ -1536,7 +1728,6 @@ def handle_ussr_command(message):
                 "/ussr LEVEL\n"
                 "/ussr LEVEL DD-MM\n"
                 "LEVEL: S1,S2,S3,R1,R2,R3,ALLS,ALLR\n"
-                "Example: /ussr S1 24-12"
             )
             return
 
@@ -1556,7 +1747,6 @@ def handle_ussr_command(message):
         bot.reply_to(message, f"Error: {e}")
 
 
-
 @bot.message_handler(commands=['usopt', 'USOPT'])
 def handle_usopt_command(message):
     try:
@@ -1567,10 +1757,6 @@ def handle_usopt_command(message):
                 "Format:\n"
                 "/usopt TICKER STRIKE TYPE [DAYS] [MM-DD]\n"
                 "TYPE: C or P\n"
-                "Examples:\n"
-                "  /usopt AVGO 350 C\n"
-                "  /usopt AVGO 350 C 7\n"
-                "  /usopt AVGO 350 C 5 12-24"
             )
             return
 
@@ -1593,6 +1779,15 @@ def handle_usopt_command(message):
             bot.reply_to(message, "TYPE must be C or P.")
             return
 
+        latest = get_latest_us_trade_date()
+        if latest:
+            temp_dir = tempfile.gettempdir()
+            chart_path = os.path.join(temp_dir, f"usopt_{ticker}_{int(strike)}_{opt_type}.png")
+            png = draw_us_ohlc_chart(ticker, latest, chart_path)
+            if png and os.path.exists(png):
+                with open(png, "rb") as f:
+                    bot.send_photo(message.chat.id, f)
+
         text = build_us_option_slice_text(ticker, strike, opt_type, days, mmdd_anchor)
         html = "<pre>" + text + "</pre>"
         if len(html) <= 4096:
@@ -1606,7 +1801,6 @@ def handle_usopt_command(message):
         bot.reply_to(message, f"Error: {e}")
 
 
-
 @bot.message_handler(commands=['uscount', 'USCOUNT'])
 def handle_uscount_command(message):
     try:
@@ -1617,8 +1811,6 @@ def handle_uscount_command(message):
                 "Format:\n"
                 "/uscount\n"
                 "/uscount DD-MM\n"
-                "Example: /uscount\n"
-                "         /uscount 24-12"
             )
             return
 
@@ -1634,7 +1826,6 @@ def handle_uscount_command(message):
                 bot.send_message(message.chat.id, part, parse_mode="HTML")
     except Exception as e:
         bot.reply_to(message, f"Error: {e}")
-
 
 
 # ================== MAIN ==================
