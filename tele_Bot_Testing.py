@@ -1,0 +1,1566 @@
+import os
+import io
+import sqlite3
+import datetime as dt
+import pandas as pd
+import numpy as np
+import telebot
+import matplotlib
+matplotlib.use("Agg")  # non-GUI backend for file-only plots
+import matplotlib.pyplot as plt
+import tempfile
+
+# ================== CONFIG ==================
+US_DB_PATH    = r"C:\Users\srini\Options_chain_data\US_data.db"
+SUMMARY_TABLE = "us_analytics_daily"
+OPTIONS_TABLE = "options_daily"
+CHANGE_TABLE  = "options_change"
+STOCK_TABLE   = "stock_daily"
+
+TELEGRAM_TOKEN = "8018716820:AAEMAtRy6D0B0xt7SJgJB-bj7VF07ld4aVA"
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+
+# ================== TABLE SETUP ==================
+def recreate_us_analytics_table():
+    if not os.path.exists(US_DB_PATH):
+        print("DB not found:", US_DB_PATH)
+        return
+    conn = sqlite3.connect(US_DB_PATH)
+    cur = conn.cursor()
+    cur.execute(f"DROP TABLE IF EXISTS {SUMMARY_TABLE}")
+    cur.execute(f"""
+        CREATE TABLE {SUMMARY_TABLE} (
+            trade_date   TEXT NOT NULL,  -- MM-DD-YYYY
+            ticker       TEXT NOT NULL,
+            expiry_date  TEXT NOT NULL,
+            SUMCE        REAL,
+            SUMPE        REAL,
+            PCR          REAL,
+
+            -- top CE strikes
+            SCE1         REAL, OICE1      REAL, SCE1_VOL      REAL,
+            SCE2         REAL, OICE2      REAL, SCE2_VOL      REAL,
+            SCE3         REAL, OICE3      REAL, SCE3_VOL      REAL,
+
+            -- top PE strikes
+            SPE1         REAL, OIPE1      REAL, SPE1_VOL      REAL,
+            SPE2         REAL, OIPE2      REAL, SPE2_VOL      REAL,
+            SPE3         REAL, OIPE3      REAL, SPE3_VOL      REAL,
+
+            -- Layer-1 (ALL options) S/R
+            S1_all       REAL, S12_all    REAL,
+            S2_all       REAL, S22_all    REAL,
+            S3_all       REAL, S32_all    REAL,
+            R1_all       REAL, R12_all    REAL,
+            R2_all       REAL, R22_all    REAL,
+            R3_all       REAL, R32_all    REAL,
+
+            -- Layer-1 (FILTERED options) S/R
+            S1_filt      REAL, S12_filt   REAL,
+            S2_filt      REAL, S22_filt   REAL,
+            S3_filt      REAL, S32_filt   REAL,
+            R1_filt      REAL, R12_filt   REAL,
+            R2_filt      REAL, R22_filt   REAL,
+            R3_filt      REAL, R32_filt   REAL,
+
+            -- Spot OHLC + PCR from stock_daily
+            OpnPric      REAL,
+            HghPric      REAL,
+            LwPric       REAL,
+            ClsPric      REAL,
+            spot_pcr_oi  REAL,
+
+            PRIMARY KEY (trade_date, ticker, expiry_date)
+        )
+    """)
+    conn.commit()
+    conn.close()
+    print(f"Recreated {SUMMARY_TABLE}")
+
+
+# ================== OPTIONS MONEY COLUMNS ==================
+def ensure_options_money_columns():
+    conn = sqlite3.connect(US_DB_PATH)
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({OPTIONS_TABLE})")
+    cols = {row[1] for row in cur.fetchall()}
+
+    new_cols = [
+        ("money_coi_call", "REAL"),
+        ("money_oi_call",  "REAL"),
+        ("vol_rank_call",  "REAL"),
+        ("money_coi_put",  "REAL"),
+        ("money_oi_put",   "REAL"),
+        ("vol_rank_put",   "REAL"),
+        ("vol_rank_all_call", "REAL"),
+        ("vol_rank_all_put",  "REAL"),
+        ("chg_oi_call", "REAL"),
+        ("chg_oi_put",  "REAL"),
+    ]
+    for name, coltype in new_cols:
+        if name not in cols:
+            cur.execute(f"ALTER TABLE {OPTIONS_TABLE} ADD COLUMN {name} {coltype}")
+    conn.commit()
+    conn.close()
+
+
+def update_options_money_fields_and_ranks():
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(f"SELECT * FROM {OPTIONS_TABLE}", conn)
+    if df.empty:
+        conn.close()
+        return
+
+    df["expiry_date"] = df["expiry_date"].astype(str)
+    df = df.sort_values(["ticker", "expiry_date", "trade_date", "strike"])
+
+    # CALL
+    if {"lastPrice_Call", "openInt_Call", "vol_Call"}.issubset(df.columns):
+        df["openInt_Call"] = df["openInt_Call"].fillna(0)
+        df["lastPrice_Call"] = df["lastPrice_Call"].fillna(0)
+        df["vol_Call"] = df["vol_Call"].fillna(0)
+
+        df["chg_oi_call"] = df.groupby(
+            ["ticker", "expiry_date", "strike"]
+        )["openInt_Call"].diff().fillna(0)
+        df["money_coi_call"] = df["lastPrice_Call"] * df["chg_oi_call"]
+        df["money_oi_call"]  = df["lastPrice_Call"] * df["openInt_Call"]
+
+        df["vol_rank_call"] = df.groupby(
+            ["ticker", "trade_date", "expiry_date"]
+        )["vol_Call"].rank(method="min", pct=True) * 100
+    else:
+        df["chg_oi_call"]    = 0
+        df["money_coi_call"] = np.nan
+        df["money_oi_call"]  = np.nan
+        df["vol_rank_call"]  = np.nan
+
+    # PUT
+    if {"lastPrice_Put", "openInt_Put", "vol_Put"}.issubset(df.columns):
+        df["openInt_Put"] = df["openInt_Put"].fillna(0)
+        df["lastPrice_Put"] = df["lastPrice_Put"].fillna(0)
+        df["vol_Put"] = df["vol_Put"].fillna(0)
+
+        df["chg_oi_put"] = df.groupby(
+            ["ticker", "expiry_date", "strike"]
+        )["openInt_Put"].diff().fillna(0)
+        df["money_coi_put"] = df["lastPrice_Put"] * df["chg_oi_put"]
+        df["money_oi_put"]  = df["lastPrice_Put"] * df["openInt_Put"]
+
+        df["vol_rank_put"] = df.groupby(
+            ["ticker", "trade_date", "expiry_date"]
+        )["vol_Put"].rank(method="min", pct=True) * 100
+    else:
+        df["chg_oi_put"]    = 0
+        df["money_coi_put"] = np.nan
+        df["money_oi_put"]  = np.nan
+        df["vol_rank_put"]  = np.nan
+
+    # Global ranks
+    df["vol_rank_all_call"] = df.groupby("trade_date")["vol_Call"].rank(method="min", pct=True) * 100
+    df["vol_rank_all_put"]  = df.groupby("trade_date")["vol_Put"].rank(method="min", pct=True) * 100
+
+    df.to_sql(OPTIONS_TABLE, conn, if_exists="replace", index=False)
+    conn.close()
+
+
+# ================== NEAREST STRIKE HELPER ==================
+def get_nearest_strike_for_us(
+    ticker: str,
+    requested_strike: float,
+    max_back_days: int = 60
+) -> float | None:
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"""
+        SELECT DISTINCT strike, trade_date
+        FROM {OPTIONS_TABLE}
+        WHERE ticker = ?
+        """,
+        conn,
+        params=(ticker,)
+    )
+    conn.close()
+    if df.empty:
+        return None
+
+    try:
+        df["trade_date_dt"] = pd.to_datetime(df["trade_date"], format="%d%b%Y")
+    except Exception:
+        df["trade_date_dt"] = pd.to_datetime(df["trade_date"], errors="coerce")
+
+    latest_dt = df["trade_date_dt"].max()
+    if pd.isna(latest_dt):
+        return None
+
+    cutoff = latest_dt - pd.Timedelta(days=max_back_days)
+    df = df[df["trade_date_dt"] >= cutoff].copy()
+    if df.empty:
+        return None
+
+    strikes = df["strike"].dropna().astype(float).unique()
+    if strikes.size == 0:
+        return None
+
+    arr = np.array(strikes, dtype=float)
+    idx = np.abs(arr - float(requested_strike)).argmin()
+    return float(arr[idx])
+
+
+# ================== PER-TICKER ANALYTICS BUILDER ==================
+def build_us_analytics_for_day(trade_date_opt: str, ticker: str):
+    if not os.path.exists(US_DB_PATH):
+        return
+
+    conn = sqlite3.connect(US_DB_PATH)
+    df_opt = pd.read_sql(
+        f"SELECT * FROM {OPTIONS_TABLE} WHERE ticker=? AND trade_date=?",
+        conn, params=(ticker, trade_date_opt)
+    )
+    if df_opt.empty:
+        conn.close()
+        return
+
+    df_opt["expiry_date"] = df_opt["expiry_date"].astype(str)
+    expiries = sorted(df_opt["expiry_date"].unique())
+    expiry = expiries[0]
+    df_e = df_opt[df_opt["expiry_date"] == expiry].copy()
+
+    df_e["openInt_Call"] = df_e["openInt_Call"].fillna(0)
+    df_e["openInt_Put"]  = df_e["openInt_Put"].fillna(0)
+    SUMCE = float(df_e["openInt_Call"].sum())
+    SUMPE = float(df_e["openInt_Put"].sum())
+    PCR   = float(SUMPE / SUMCE) if SUMCE > 0 else np.nan
+
+    top_ce_all = df_e.sort_values("openInt_Call", ascending=False).head(3)
+    top_pe_all = df_e.sort_values("openInt_Put",  ascending=False).head(3)
+
+    df_ch = pd.read_sql(
+        f"""
+        SELECT strike, expiry_date,
+               call_close_now, put_close_now,
+               call_high_now,  put_high_now
+        FROM {CHANGE_TABLE}
+        WHERE ticker = ? AND trade_date_now = ?
+        """,
+        conn, params=(ticker, trade_date_opt)
+    )
+    if not df_ch.empty:
+        df_ch["expiry_date"] = df_ch["expiry_date"].astype(str)
+        df_ch["strike"]      = df_ch["strike"].astype(float)
+        df_all = df_e.merge(df_ch, on=["strike", "expiry_date"], how="left")
+    else:
+        df_all = df_e.copy()
+        df_all["call_close_now"] = np.nan
+        df_all["put_close_now"]  = np.nan
+        df_all["call_high_now"]  = df_all.get("call_high", 0)
+        df_all["put_high_now"]   = df_all.get("put_high", 0)
+
+    top_ce_filt = df_all[df_all["call_close_now"].fillna(0) >= 0.2].copy()
+    top_pe_filt = df_all[df_all["put_close_now"].fillna(0)  >= 0.2].copy()
+    top_ce_filt = top_ce_filt.sort_values("openInt_Call", ascending=False).head(3)
+    top_pe_filt = top_pe_filt.sort_values("openInt_Put",  ascending=False).head(3)
+
+    trade_date_db = pd.to_datetime(trade_date_opt, format="%d%b%Y").strftime("%m-%d-%Y")
+    data = {
+        "trade_date":  trade_date_db,
+        "ticker":      ticker,
+        "expiry_date": expiry,
+        "SUMCE": round(SUMCE, 2),
+        "SUMPE": round(SUMPE, 2),
+        "PCR":   round(PCR, 2) if not np.isnan(PCR) else None,
+    }
+
+    def sr_from_rows(pe_row, ce_row, use_filtered=False):
+        if pe_row is not None:
+            strike_p = float(pe_row["strike"])
+            if use_filtered and not np.isnan(pe_row.get("put_close_now", np.nan)):
+                lp_p = float(pe_row.get("put_close_now", 0) or 0)
+                hp_p = float(pe_row.get("put_high_now", 0)  or 0)
+            else:
+                lp_p = float(pe_row.get("lastPrice_Put", 0) or 0)
+                hp_p = float(pe_row.get("put_high", 0)      or 0)
+            S1  = strike_p - lp_p
+            S12 = strike_p - hp_p
+        else:
+            S1 = S12 = None
+
+        if ce_row is not None:
+            strike_c = float(ce_row["strike"])
+            if use_filtered and not np.isnan(ce_row.get("call_close_now", np.nan)):
+                lp_c = float(ce_row.get("call_close_now", 0) or 0)
+                hc_c = float(ce_row.get("call_high_now", 0)  or 0)
+            else:
+                lp_c = float(ce_row.get("lastPrice_Call", 0) or 0)
+                hc_c = float(ce_row.get("call_high", 0)      or 0)
+            R1  = strike_c + lp_c
+            R12 = strike_c + hc_c
+        else:
+            R1 = R12 = None
+        return S1, S12, R1, R12
+
+    # ALL
+    for i in range(3):
+        pe_row = top_pe_all.iloc[i] if i < len(top_pe_all) else None
+        ce_row = top_ce_all.iloc[i] if i < len(top_ce_all) else None
+        S1, S12, R1, R12 = sr_from_rows(pe_row, ce_row, use_filtered=False)
+        if i == 0:
+            data["S1_all"], data["S12_all"], data["R1_all"], data["R12_all"] = \
+                (round(S1,2) if S1 is not None else None,
+                 round(S12,2) if S12 is not None else None,
+                 round(R1,2) if R1 is not None else None,
+                 round(R12,2) if R12 is not None else None)
+        elif i == 1:
+            data["S2_all"], data["S22_all"], data["R2_all"], data["R22_all"] = \
+                (round(S1,2) if S1 is not None else None,
+                 round(S12,2) if S12 is not None else None,
+                 round(R1,2) if R1 is not None else None,
+                 round(R12,2) if R12 is not None else None)
+        else:
+            data["S3_all"], data["S32_all"], data["R3_all"], data["R32_all"] = \
+                (round(S1,2) if S1 is not None else None,
+                 round(S12,2) if S12 is not None else None,
+                 round(R1,2) if R1 is not None else None,
+                 round(R12,2) if R12 is not None else None)
+
+    # FILTER
+    for i in range(3):
+        pe_row = top_pe_filt.iloc[i] if i < len(top_pe_filt) else None
+        ce_row = top_ce_filt.iloc[i] if i < len(top_ce_filt) else None
+        S1, S12, R1, R12 = sr_from_rows(pe_row, ce_row, use_filtered=True)
+        if i == 0:
+            data["S1_filt"], data["S12_filt"], data["R1_filt"], data["R12_filt"] = \
+                (round(S1,2) if S1 is not None else None,
+                 round(S12,2) if S12 is not None else None,
+                 round(R1,2) if R1 is not None else None,
+                 round(R12,2) if R12 is not None else None)
+        elif i == 1:
+            data["S2_filt"], data["S22_filt"], data["R2_filt"], data["R22_filt"] = \
+                (round(S1,2) if S1 is not None else None,
+                 round(S12,2) if S12 is not None else None,
+                 round(R1,2) if R1 is not None else None,
+                 round(R12,2) if R12 is not None else None)
+        else:
+            data["S3_filt"], data["S32_filt"], data["R3_filt"], data["R32_filt"] = \
+                (round(S1,2) if S1 is not None else None,
+                 round(S12,2) if S12 is not None else None,
+                 round(R1,2) if R1 is not None else None,
+                 round(R12,2) if R12 is not None else None)
+
+    # spot
+    df_spot = pd.read_sql(
+        f"SELECT open, high, low, close, pcr_oi FROM {STOCK_TABLE} "
+        f"WHERE ticker=? AND trade_date=?",
+        conn, params=(ticker, trade_date_db)
+    )
+    if not df_spot.empty:
+        sr = df_spot.iloc[0]
+        data["OpnPric"]     = round(float(sr["open"]), 2)
+        data["HghPric"]     = round(float(sr["high"]), 2)
+        data["LwPric"]      = round(float(sr["low"]), 2)
+        data["ClsPric"]     = round(float(sr["close"]), 2)
+        data["spot_pcr_oi"] = round(float(sr["pcr_oi"]), 4) if not np.isnan(sr["pcr_oi"]) else None
+    else:
+        data["OpnPric"] = data["HghPric"] = data["LwPric"] = data["ClsPric"] = None
+        data["spot_pcr_oi"] = None
+
+    cols = ", ".join(data.keys())
+    qmarks = ", ".join(["?"] * len(data))
+    update = ", ".join(
+        [f"{k}=excluded.{k}" for k in data.keys()
+         if k not in ("trade_date", "ticker", "expiry_date")]
+    )
+    cur = conn.cursor()
+    cur.execute(
+        f"INSERT INTO {SUMMARY_TABLE} ({cols}) VALUES ({qmarks}) "
+        f"ON CONFLICT(trade_date,ticker,expiry_date) DO UPDATE SET {update}",
+        list(data.values())
+    )
+    conn.commit()
+    conn.close()
+
+
+# ================== LAYER HELPERS (1–3) ==================
+def print_layer1_tcs_style(ticker: str, trade_date_db: str) -> str:
+    buf = io.StringIO()
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"SELECT * FROM {SUMMARY_TABLE} WHERE ticker=? AND trade_date=?",
+        conn, params=(ticker, trade_date_db)
+    )
+    conn.close()
+    if df.empty:
+        buf.write("No Layer-1 data\n")
+    else:
+        row = df.iloc[0]
+        line_all = {
+            "S1":  row["S1_all"],  "S12":  row["S12_all"],
+            "S2":  row["S2_all"],  "S22":  row["S22_all"],
+            "S3":  row["S3_all"],  "S32":  row["S32_all"],
+            "R1":  row["R1_all"],  "R12":  row["R12_all"],
+            "R2":  row["R2_all"],  "R22":  row["R2_all"],
+            "R3":  row["R3_all"],  "R32":  row["R32_all"],
+            "Opn": row["OpnPric"], "High": row["HghPric"],
+            "Low": row["LwPric"],  "Close": row["ClsPric"],
+        }
+        line_filt = {
+            "S1":  row["S1_filt"],  "S12":  row["S12_filt"],
+            "S2":  row["S2_filt"],  "S22":  row["S22_filt"],
+            "S3":  row["S3_filt"],  "S32":  row["S32_filt"],
+            "R1":  row["R1_filt"],  "R12":  row["R12_filt"],
+            "R2":  row["R2_filt"],  "R22":  row["R2_filt"],
+            "R3":  row["R3_filt"],  "R32":  row["R32_filt"],
+            "Opn": row["OpnPric"],  "High": row["HghPric"],
+            "Low": row["LwPric"],   "Close": row["ClsPric"],
+        }
+        df_out = pd.DataFrame([line_all, line_filt], index=["ALL", "FILTER"])
+        num_cols = df_out.select_dtypes(include=[np.number]).columns
+        df_out[num_cols] = df_out[num_cols].round(2)
+        buf.write(df_out.to_string() + "\n")
+    return buf.getvalue()
+
+
+def get_layer2(ticker: str, trade_date_db: str, lookback_days: int = 5) -> pd.DataFrame:
+    conn = sqlite3.connect(US_DB_PATH)
+    df_stock = pd.read_sql(
+        f"""
+        SELECT trade_date, open, high, low, close, volume, pcr_oi
+        FROM {STOCK_TABLE}
+        WHERE ticker = ?
+        ORDER BY trade_date
+        """,
+        conn, params=(ticker,)
+    )
+    if df_stock.empty:
+        conn.close()
+        return pd.DataFrame()
+    df_stock["trade_date_dt"] = pd.to_datetime(df_stock["trade_date"], format="%m-%d-%Y")
+    target_dt = pd.to_datetime(trade_date_db, format="%m-%d-%Y")
+    df_stock = df_stock[df_stock["trade_date_dt"] <= target_dt].tail(lookback_days).copy()
+    df_stock["Vol10"] = df_stock["volume"].rolling(10, min_periods=1).mean()
+    df_stock["Vol20"] = df_stock["volume"].rolling(20, min_periods=1).mean()
+    df_stock["Vol10_R"] = df_stock["volume"] / df_stock["Vol10"]
+    df_stock["Vol20_R"] = df_stock["volume"] / df_stock["Vol20"]
+    df_stock["PricePctChg"] = df_stock["close"].pct_change() * 100
+
+    foi_list = []
+    for _, row in df_stock.iterrows():
+        t_db  = row["trade_date"]
+        t_opt = pd.to_datetime(t_db, format="%m-%d-%Y").strftime("%d%b%Y")
+        df_opt = pd.read_sql(
+            f"""
+            SELECT expiry_date, openInt_Call, openInt_Put
+            FROM {OPTIONS_TABLE}
+            WHERE ticker=? AND trade_date=?
+            """,
+            conn, params=(ticker, t_opt)
+        )
+        if df_opt.empty:
+            foi_list.append((t_db, None, None))
+            continue
+        df_opt["expiry_date"] = df_opt["expiry_date"].astype(str)
+        expiries = sorted(df_opt["expiry_date"].unique())
+        expiry = expiries[0]
+        df_e = df_opt[df_opt["expiry_date"] == expiry].copy()
+        df_e["openInt_Call"] = df_e["openInt_Call"].fillna(0)
+        df_e["openInt_Put"]  = df_e["openInt_Put"].fillna(0)
+        FOI = float(df_e["openInt_Call"].sum() + df_e["openInt_Put"].sum())
+        foi_list.append((t_db, expiry, FOI))
+
+    foi_df = pd.DataFrame(foi_list, columns=["trade_date","expiry_date","FOI"])
+    df_m = df_stock.merge(foi_df, on="trade_date", how="left")
+    df_m["FCOI"] = df_m["FOI"].diff()
+    conn.close()
+
+    df_out = df_m.copy()
+    df_out["Dates"]    = df_out["trade_date_dt"].dt.strftime("%m-%d")
+    df_out["OpnPric"]  = df_out["open"]
+    df_out["HghPric"]  = df_out["high"]
+    df_out["LwPric"]   = df_out["low"]
+    df_out["ClsPric"]  = df_out["close"]
+    df_out["PCR"]      = df_out["pcr_oi"]
+    df_out["FOI_val"]  = df_out["FOI"]
+    df_out["FCOI_val"] = df_out["FCOI"]
+    df_out["Vol10R"]   = df_out["Vol10_R"]
+    df_out["Vol20R"]   = df_out["Vol20_R"]
+    df_out["PricePct"] = df_out["PricePctChg"]
+
+    cols = [
+        "Dates","OpnPric","HghPric","LwPric","ClsPric",
+        "PCR","FOI_val","FCOI_val","Vol10R","Vol20R","PricePct"
+    ]
+    df_out = df_out[cols].iloc[::-1].reset_index(drop=True)
+    num_cols = df_out.select_dtypes(include=[np.number]).columns
+    df_out[num_cols] = df_out[num_cols].round(2)
+    return df_out
+
+
+def get_layer3_pivot_cpr(ticker: str, trade_date_db: str) -> pd.DataFrame:
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"""
+        SELECT open, high, low, close
+        FROM {STOCK_TABLE}
+        WHERE ticker=? AND trade_date=?
+        """,
+        conn, params=(ticker, trade_date_db)
+    )
+    conn.close()
+    if df.empty:
+        return pd.DataFrame()
+    row = df.iloc[0]
+    H = float(row["high"])
+    L = float(row["low"])
+    C = float(row["close"])
+    P  = (H + L + C) / 3.0
+    BC = (H + L) / 2.0
+    TC = 2 * P - BC
+    S1 = 2*P - H
+    R1 = 2*P - L
+    S2 = P - (H - L)
+    R2 = P + (H - L)
+    S3 = L - 2*(H - P)
+    R3 = H + 2*(P - L)
+    data = {"S3":S3,"S2":S2,"S1":S1,"BC":BC,"P":P,"TC":TC,"R1":R1,"R2":R2,"R3":R3}
+    df_out = pd.DataFrame([data])
+    num_cols = df_out.select_dtypes(include=[np.number]).columns
+    df_out[num_cols] = df_out[num_cols].round(2)
+    return df_out
+
+
+# ================== Layer-4 snapshot ==================
+def get_layer4_options_snapshot(ticker: str, trade_date_opt: str, top_n: int = 3):
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"""
+        SELECT ticker, strike, expiry_date, trade_date,
+               lastPrice_Call, openInt_Call, vol_Call,
+               lastPrice_Put,  openInt_Put,  vol_Put,
+               money_coi_call, money_oi_call,
+               vol_rank_call,  vol_rank_all_call,
+               money_coi_put,  money_oi_put,
+               vol_rank_put,   vol_rank_all_put,
+               chg_oi_call,    chg_oi_put
+        FROM {OPTIONS_TABLE}
+        WHERE ticker=? AND trade_date=?
+        """,
+        conn, params=(ticker, trade_date_opt)
+    )
+    conn.close()
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame(), None
+
+    df["expiry_date"] = df["expiry_date"].astype(str)
+    expiries = sorted(df["expiry_date"].unique())
+    expiry = expiries[0]
+    df_e = df[df["expiry_date"] == expiry].copy()
+
+    calls = df_e[df_e["openInt_Call"].notna() & (df_e["openInt_Call"] > 0)].copy()
+    calls = calls.sort_values(["openInt_Call", "vol_Call"], ascending=[False, False]).head(top_n)
+    calls_out = pd.DataFrame({
+        "Strike":        calls["strike"],
+        "Close":         calls["lastPrice_Call"],
+        "ChgOI":         calls["chg_oi_call"],
+        "OpenInt":       calls["openInt_Call"],
+        "MONEYCOI":      calls["money_coi_call"],
+        "MONEYOI":       calls["money_oi_call"],
+        "VOL_RANK_Stk":  calls["vol_rank_call"],
+        "VOL_RANK_All":  calls["vol_rank_all_call"],
+        "TotVol":        calls["vol_Call"],
+    })
+
+    puts = df_e[df_e["openInt_Put"].notna() & (df_e["openInt_Put"] > 0)].copy()
+    puts = puts.sort_values(["openInt_Put", "vol_Put"], ascending=[False, False]).head(top_n)
+    puts_out = pd.DataFrame({
+        "Strike":        puts["strike"],
+        "Close":         puts["lastPrice_Put"],
+        "ChgOI":         puts["chg_oi_put"],
+        "OpenInt":       puts["openInt_Put"],
+        "MONEYCOI":      puts["money_coi_put"],
+        "MONEYOI":       puts["money_oi_put"],
+        "VOL_RANK_Stk":  puts["vol_rank_put"],
+        "VOL_RANK_All":  puts["vol_rank_all_put"],
+        "TotVol":        puts["vol_Put"],
+    })
+
+    for df_x in (calls_out, puts_out):
+        if not df_x.empty:
+            num_cols = df_x.select_dtypes(include=[np.number]).columns
+            df_x[num_cols] = df_x[num_cols].round(2)
+
+    return calls_out.reset_index(drop=True), puts_out.reset_index(drop=True), expiry
+
+
+def format_layer4_snapshot(calls: pd.DataFrame, puts: pd.DataFrame, expiry: str) -> str:
+    buf = io.StringIO()
+    buf.write("——————— LAYER-4 (Options Snapshot) ———————\n")
+    if expiry:
+        buf.write(f"Top CALLS (nearest expiry: {expiry})\n")
+    else:
+        buf.write("Top CALLS (nearest expiry)\n")
+
+    if calls.empty:
+        buf.write("No CALL data\n")
+    else:
+        buf.write(
+            f"{'Strike':<6} | {'Close':<5} | {'ChgOI':<6} | {'OpenInt':<7} | "
+            f"{'MONEYCOI':<8} | {'MONEYOI':<8} | "
+            f"{'V_STK':<6} | {'V_ALL':<6} | {'TotVol':<6}\n"
+        )
+        for _, r in calls.iterrows():
+            buf.write(
+                f"{int(r['Strike']):<6} | "
+                f"{float(r['Close']):<5.2f} | "
+                f"{int(r['ChgOI']):<6} | "
+                f"{int(r['OpenInt']):<7} | "
+                f"{int(r['MONEYCOI'] or 0):<8} | "
+                f"{int(r['MONEYOI'] or 0):<8} | "
+                f"{int(r['VOL_RANK_Stk'] or 0):<6} | "
+                f"{int(r['VOL_RANK_All'] or 0):<6} | "
+                f"{int(r['TotVol'] or 0):<6}\n"
+            )
+
+    buf.write("\n")
+    if expiry:
+        buf.write(f"Top PUTS  (nearest expiry: {expiry})\n")
+    else:
+        buf.write("Top PUTS  (nearest expiry)\n")
+
+    if puts.empty:
+        buf.write("No PUT data\n")
+    else:
+        buf.write(
+            f"{'Strike':<6} | {'Close':<5} | {'ChgOI':<6} | {'OpenInt':<7} | "
+            f"{'MONEYCOI':<8} | {'MONEYOI':<8} | "
+            f"{'V_STK':<6} | {'V_ALL':<6} | {'TotVol':<6}\n"
+        )
+        for _, r in puts.iterrows():
+            buf.write(
+                f"{int(r['Strike']):<6} | "
+                f"{float(r['Close']):<5.2f} | "
+                f"{int(r['ChgOI']):<6} | "
+                f"{int(r['OpenInt']):<7} | "
+                f"{int(r['MONEYCOI'] or 0):<8} | "
+                f"{int(r['MONEYOI'] or 0):<8} | "
+                f"{int(r['VOL_RANK_Stk'] or 0):<6} | "
+                f"{int(r['VOL_RANK_All'] or 0):<6} | "
+                f"{int(r['TotVol'] or 0):<6}\n"
+            )
+
+    return buf.getvalue()
+
+
+# ================== SIMPLE OHLC CHART (IMAGE) ==================
+def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
+    """
+    Plot last 30 days close with horizontal SR levels from SUMMARY_TABLE
+    (S1,S12,S2,S22,S3,S32,R1,R12,R2,R22,R3,R32), each with its own color.
+    Labels show 'Name = value' on both left and right, alternately above
+    and below each line (clear dark text).
+    """
+
+    conn = sqlite3.connect(US_DB_PATH)
+
+    # 1) price series (30 days)
+    df = pd.read_sql(
+        f"""
+        SELECT trade_date, close
+        FROM {STOCK_TABLE}
+        WHERE ticker=?
+        ORDER BY trade_date
+        """,
+        conn, params=(ticker,)
+    )
+    if df.empty:
+        conn.close()
+        return ""
+
+    df["Date"] = pd.to_datetime(df["trade_date"], format="%m-%d-%Y")
+    target_dt = pd.to_datetime(trade_date_db, format="%m-%d-%Y")
+    df = df[df["Date"] <= target_dt].tail(30)
+    if df.empty:
+        conn.close()
+        return ""
+
+    # 2) SR levels for that date
+    df_sr = pd.read_sql(
+        f"""
+        SELECT S1_all, S12_all, S2_all, S22_all, S3_all, S32_all,
+               R1_all, R12_all, R2_all, R22_all, R3_all, R32_all
+        FROM {SUMMARY_TABLE}
+        WHERE ticker=? AND trade_date=?
+        """,
+        conn, params=(ticker, trade_date_db)
+    )
+    conn.close()
+
+    sr_vals = {}
+    if not df_sr.empty:
+        row = df_sr.iloc[0]
+        sr_vals = {
+            "S1":  row["S1_all"],
+            "S12": row["S12_all"],
+            "S2":  row["S2_all"],
+            "S22": row["S22_all"],
+            "S3":  row["S3_all"],
+            "S32": row["S32_all"],
+            "R1":  row["R1_all"],
+            "R12": row["R12_all"],
+            "R2":  row["R2_all"],
+            "R22": row["R22_all"],
+            "R3":  row["R3_all"],
+            "R32": row["R32_all"],
+        }
+
+    # 3) build plot
+    plt.figure(figsize=(9, 5))
+    ax = plt.gca()
+
+    # price line
+    ax.plot(df["Date"], df["close"], marker="o", color="black", label="Close (last 30d)")
+
+    # distinct colors for each SR line
+    level_colors = {
+        "S1":  "#1f77b4",
+        "S12": "#2ca02c",
+        "S2":  "#17becf",
+        "S22": "#9467bd",
+        "S3":  "#8c564b",
+        "S32": "#e377c2",
+        "R1":  "#d62728",
+        "R12": "#ff7f0e",
+        "R2":  "#7f7f7f",
+        "R22": "#bcbd22",
+        "R3":  "#17becf",
+        "R32": "#aec7e8",
+    }
+
+    if sr_vals:
+        levels = []
+        for name, val in sr_vals.items():
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                continue
+            levels.append((name, float(val)))
+
+        if levels:
+            x_min = df["Date"].min()
+            x_max = df["Date"].max()
+            left_x  = x_min - pd.Timedelta(days=0.5)
+            right_x = x_max + pd.Timedelta(days=0.5)
+
+            price_range = df["close"].max() - df["close"].min()
+            # vertical gap between line and its label (about 1% of range)
+            gap = price_range * 0.01 if price_range > 0 else 0.1
+
+            # sort by price so relative vertical positions are stable
+            levels.sort(key=lambda x: x[1])
+
+            # alternate labels above / below: +gap or -gap
+            above = True
+
+            for name, val in levels:
+                c = level_colors.get(name, "black")
+
+                # horizontal line
+                ax.axhline(y=val, xmin=0.0, xmax=1.0,
+                           color=c, linestyle="--", linewidth=0.9)
+
+                # y-position for labels
+                y_label = val + (gap if above else -gap)
+                above = not above  # flip for next level
+
+                label_text = f"{name} = {val:.2f}"
+
+                # left label (dark text)
+                ax.text(
+                    left_x,
+                    y_label,
+                    label_text,
+                    color="black",
+                    fontsize=7,
+                    va="center",
+                    ha="right",
+                    fontweight="bold"
+                )
+
+                # right label (dark text)
+                ax.text(
+                    right_x,
+                    y_label,
+                    label_text,
+                    color="black",
+                    fontsize=7,
+                    va="center",
+                    ha="left",
+                    fontweight="bold"
+                )
+
+    ax.set_title(f"{ticker} (US) - Last 30 days close + SR levels")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.3)
+
+    # widen x-limits for labels on both sides
+    ax.set_xlim(
+        df["Date"].min() - pd.Timedelta(days=1),
+        df["Date"].max() + pd.Timedelta(days=1),
+    )
+
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    return out_path
+
+
+# ================== FULL 4-LAYER TEXT ==================
+def build_us_layers_text(ticker: str, trade_date_db: str) -> str:
+    buf = io.StringIO()
+    trade_date_opt = pd.to_datetime(trade_date_db, format="%m-%d-%Y").strftime("%d%b%Y")
+    build_us_analytics_for_day(trade_date_opt, ticker)
+
+    buf.write("——————— LAYER-1 ———————\n")
+    buf.write(print_layer1_tcs_style(ticker, trade_date_db))
+
+    buf.write("\n——————— LAYER-2 ———————\n")
+    df_l2 = get_layer2(ticker, trade_date_db, lookback_days=5)
+    if df_l2.empty:
+        buf.write("No Layer-2 data\n")
+    else:
+        buf.write(df_l2.to_string(index=False) + "\n")
+
+    buf.write("\n——————— LAYER-3 (Pivot/CPR) ———————\n")
+    df_l3 = get_layer3_pivot_cpr(ticker, trade_date_db)
+    if df_l3.empty:
+        buf.write("No Layer-3 data\n")
+    else:
+        buf.write(df_l3.to_string(index=False) + "\n")
+
+    calls, puts, expiry = get_layer4_options_snapshot(ticker, trade_date_opt, top_n=3)
+    buf.write("\n")
+    buf.write(format_layer4_snapshot(calls, puts, expiry))
+    return buf.getvalue()
+
+
+# ================== DATE HELPERS ==================
+def get_latest_us_trade_date() -> str | None:
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"SELECT DISTINCT trade_date FROM {STOCK_TABLE} ORDER BY trade_date",
+        conn
+    )
+    conn.close()
+    if df.empty:
+        return None
+    return df["trade_date"].iloc[-1]
+
+
+def get_prev_us_trade_date(trade_date_db: str) -> str | None:
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"SELECT DISTINCT trade_date FROM {STOCK_TABLE} ORDER BY trade_date",
+        conn
+    )
+    conn.close()
+    if df.empty:
+        return None
+    dates = list(df["trade_date"])
+    if trade_date_db not in dates:
+        return None
+    idx = dates.index(trade_date_db)
+    if idx == 0:
+        return None
+    return dates[idx - 1]
+
+
+# ================== SR SCANNER ==================
+def scan_us_sr_levels(level: str, date_ddmm: str | None) -> str:
+    if date_ddmm:
+        d, m = date_ddmm.split("-")
+        y = dt.datetime.now().year
+        trade_date_db = f"{m.zfill(2)}-{d.zfill(2)}-{y}"
+    else:
+        trade_date_db = get_latest_us_trade_date()
+        if trade_date_db is None:
+            return "No US trade dates found."
+
+    lv = level.upper()
+    prev_date = get_prev_us_trade_date(trade_date_db)
+    if prev_date is None:
+        return f"No previous US trade date before {trade_date_db}."
+
+    conn = sqlite3.connect(US_DB_PATH)
+    df_y = pd.read_sql(
+        f"""
+        SELECT ticker, trade_date,
+               S1_all, S2_all, S3_all,
+               R1_all, R2_all, R3_all
+        FROM {SUMMARY_TABLE}
+        WHERE trade_date = ?
+        """,
+        conn, params=(prev_date,)
+    )
+    df_t = pd.read_sql(
+        f"""
+        SELECT ticker, trade_date,
+               HghPric, LwPric, OpnPric, ClsPric
+        FROM {SUMMARY_TABLE}
+        WHERE trade_date = ?
+        """,
+        conn, params=(trade_date_db,)
+    )
+    conn.close()
+
+    if df_y.empty or df_t.empty:
+        return f"No data for SR touch scan on {trade_date_db} (prev {prev_date})."
+
+    df_m = df_t.merge(
+        df_y,
+        on="ticker",
+        how="inner",
+        suffixes=("_today", "_yday")
+    )
+
+    tol = 0.5
+
+    def format_touch_table(df_sel: pd.DataFrame, title: str) -> str:
+        df_sel = df_sel.copy()
+        df_sel["Today"] = pd.to_datetime(df_sel["trade_date_today"]).dt.strftime("%m-%d")
+        df_sel["Prev"] = pd.to_datetime(prev_date).strftime("%m-%d")
+        cols = [
+            "ticker", "Today", "Prev",
+            "level_val", "OpnPric", "HghPric", "LwPric", "ClsPric", "diff"
+        ]
+        sub = df_sel[cols].copy()
+        num_cols = sub.select_dtypes(include=[np.number]).columns
+        sub[num_cols] = sub[num_cols].round(2)
+        buf = io.StringIO()
+        buf.write(f"{title}\n")
+        buf.write(f"Today : {trade_date_db} | Prev : {prev_date}\n")
+        buf.write("-" * 120 + "\n")
+        buf.write(sub.to_string(index=False))
+        buf.write("\n" + "-" * 120 + "\n")
+        return buf.getvalue()
+
+    if lv in {"S1", "S2", "S3"}:
+        col_map = {"S1": "S1_all", "S2": "S2_all", "S3": "S3_all"}
+        col = col_map[lv]
+        df_m["level_val"] = df_m[col]
+        df_m["diff"] = (df_m["HghPric"] - df_m["level_val"]).abs()
+        df_hit = df_m[df_m["diff"] <= tol]
+        if df_hit.empty:
+            return f"No {lv} touch stocks on {trade_date_db} (prev {prev_date}) within {tol}."
+        return format_touch_table(df_hit, f"{lv} TOUCH REPORT (US)")
+
+    if lv in {"R1", "R2", "R3"}:
+        col_map = {"R1": "R1_all", "R2": "R2_all", "R3": "R3_all"}
+        col = col_map[lv]
+        df_m["level_val"] = df_m[col]
+        df_m["diff"] = (df_m["LwPric"] - df_m["level_val"]).abs()
+        df_hit = df_m[df_m["diff"] <= tol]
+        if df_hit.empty:
+            return f"No {lv} touch stocks on {trade_date_db} (prev {prev_date}) within {tol}."
+        return format_touch_table(df_hit, f"{lv} TOUCH REPORT (US)")
+
+    if lv == "ALLS":
+        records = []
+        for col in ["S1_all", "S2_all", "S3_all"]:
+            tmp = df_m.copy()
+            tmp["level_val"] = tmp[col]
+            tmp["diff"] = (tmp["HghPric"] - tmp["level_val"]).abs()
+            tmp = tmp[tmp["diff"] <= tol]
+            tmp["LevelName"] = col.replace("_all", "")
+            records.append(tmp)
+        if not records:
+            return f"No S1/S2/S3 touch stocks on {trade_date_db} (prev {prev_date}) within {tol}."
+        df_all = pd.concat(records, ignore_index=True)
+        df_all = df_all.sort_values(["ticker", "LevelName"])
+        df_all["Today"] = pd.to_datetime(df_all["trade_date_today"]).dt.strftime("%m-%d")
+        df_all["Prev"] = pd.to_datetime(prev_date).strftime("%m-%d")
+        cols = [
+            "ticker", "Today", "Prev", "LevelName",
+            "level_val", "OpnPric", "HghPric", "LwPric", "ClsPric", "diff"
+        ]
+        sub = df_all[cols].copy()
+        num_cols = sub.select_dtypes(include=[np.number]).columns
+        sub[num_cols] = sub[num_cols].round(2)
+        buf = io.StringIO()
+        buf.write("ALLS TOUCH REPORT (US) [S1/S2/S3]\n")
+        buf.write(f"Today : {trade_date_db} | Prev : {prev_date}\n")
+        buf.write("-" * 140 + "\n")
+        buf.write(sub.to_string(index=False))
+        buf.write("\n" + "-" * 140 + "\n")
+        return buf.getvalue()
+
+    if lv == "ALLR":
+        records = []
+        for col in ["R1_all", "R2_all", "R3_all"]:
+            tmp = df_m.copy()
+            tmp["level_val"] = tmp[col]
+            tmp["diff"] = (tmp["LwPric"] - tmp["level_val"]).abs()
+            tmp = tmp[tmp["diff"] <= tol]
+            tmp["LevelName"] = col.replace("_all", "")
+            records.append(tmp)
+        if not records:
+            return f"No R1/R2/R3 touch stocks on {trade_date_db} (prev {prev_date}) within {tol}."
+        df_all = pd.concat(records, ignore_index=True)
+        df_all = df_all.sort_values(["ticker", "LevelName"])
+        df_all["Today"] = pd.to_datetime(df_all["trade_date_today"]).dt.strftime("%m-%d")
+        df_all["Prev"] = pd.to_datetime(prev_date).strftime("%m-%d")
+        cols = [
+            "ticker", "Today", "Prev", "LevelName",
+            "level_val", "OpnPric", "HghPric", "LwPric", "ClsPric", "diff"
+        ]
+        sub = df_all[cols].copy()
+        num_cols = sub.select_dtypes(include=[np.number]).columns
+        sub[num_cols] = sub[num_cols].round(2)
+        buf = io.StringIO()
+        buf.write("ALLR TOUCH REPORT (US) [R1/R2/R3]\n")
+        buf.write(f"Today : {trade_date_db} | Prev : {prev_date}\n")
+        buf.write("-" * 140 + "\n")
+        buf.write(sub.to_string(index=False))
+        buf.write("\n" + "-" * 140 + "\n")
+        return buf.getvalue()
+
+    return "Unknown level. Use S1/S2/S3/R1/R2/R3/ALLS/ALLR."
+
+
+# ================== OPTION 5-DAY SLICE ==================
+def build_us_option_slice_text(
+    ticker: str,
+    strike: float,
+    opt_type: str,
+    days: int = 5,
+    mmdd_anchor: str | None = None
+) -> str:
+    nearest = get_nearest_strike_for_us(ticker, strike)
+    if nearest is None:
+        return f"No strikes found for {ticker}."
+    strike = nearest
+
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"""
+        SELECT trade_date, strike, expiry_date,
+               lastPrice_Call, openInt_Call, vol_Call,
+               lastPrice_Put,  openInt_Put,  vol_Put,
+               money_coi_call, money_oi_call, vol_rank_call,
+               money_coi_put,  money_oi_put,  vol_rank_put
+        FROM {OPTIONS_TABLE}
+        WHERE ticker = ? AND strike = ?
+        ORDER BY trade_date
+        """,
+        conn,
+        params=(ticker, strike)
+    )
+    conn.close()
+    if df.empty:
+        return f"No options data for {ticker} @ {strike}."
+
+    try:
+        df["trade_date_dt"] = pd.to_datetime(df["trade_date"], format="%d%b%Y")
+    except Exception:
+        df["trade_date_dt"] = pd.to_datetime(df["trade_date"], errors="coerce")
+
+    df["expiry_dt"] = pd.to_datetime(df["expiry_date"], errors="coerce")
+
+    if mmdd_anchor:
+        try:
+            m, d = mmdd_anchor.split("-")
+            latest_dt = df["trade_date_dt"].max()
+            year = latest_dt.year if pd.notna(latest_dt) else dt.datetime.now().year
+            anchor_dt = dt.datetime(year, int(m), int(d))
+            df = df[df["trade_date_dt"] <= anchor_dt].copy()
+        except Exception:
+            pass
+
+    today = pd.Timestamp.today().normalize()
+    cutoff = today + pd.Timedelta(days=30)
+    df = df[(df["expiry_dt"] > today) & (df["expiry_dt"] <= cutoff)].copy()
+    if df.empty:
+        return f"No expiries in next 1 month for {ticker} @ {strike}."
+
+    df = df.sort_values(["trade_date_dt", "expiry_dt"])
+
+    last_dates = (
+        df["trade_date_dt"].dropna().drop_duplicates().sort_values().tail(days)
+    )
+    df = df[df["trade_date_dt"].isin(last_dates)].copy()
+    if df.empty:
+        return (
+            f"No data for last {days} days for {ticker} @ {strike} "
+            f"within next 1 month expiries."
+        )
+
+    opt_type = opt_type.upper()
+    if opt_type == "C":
+        df["ChgOI"] = df.groupby("expiry_dt")["openInt_Call"].diff().fillna(0)
+        df["Close"]    = df["lastPrice_Call"]
+        df["OpenInt"]  = df["openInt_Call"]
+        df["MONEYCOI"] = df["money_coi_call"]
+        df["MONEYOI"]  = df["money_oi_call"]
+        df["VOL_RANK"] = df["vol_rank_call"]
+        df["TotVol"]   = df["vol_Call"]
+        otype = "CE"
+    else:
+        df["ChgOI"] = df.groupby("expiry_dt")["openInt_Put"].diff().fillna(0)
+        df["Close"]    = df["lastPrice_Put"]
+        df["OpenInt"]  = df["openInt_Put"]
+        df["MONEYCOI"] = df["money_coi_put"]
+        df["MONEYOI"]  = df["money_oi_put"]
+        df["VOL_RANK"] = df["vol_rank_put"]
+        df["TotVol"]   = df["vol_Put"]
+        otype = "PE"
+
+    df["Open"] = df["Close"]
+    df["High"] = df["Close"]
+    df["Low"]  = df["Close"]
+
+    df["Date"] = df["trade_date_dt"].dt.strftime("%d-%m")
+    df["Expiry"] = df["expiry_dt"].dt.strftime("%d-%m")
+
+    df = df.sort_values(["expiry_dt", "trade_date_dt"], ascending=[False, True])
+
+    buf = io.StringIO()
+    title = (
+        f"{ticker} {strike} {otype} last {len(last_dates)} days "
+        f"(expiries next 1 month)"
+    )
+    if mmdd_anchor:
+        title += f"  | Anchor: {mmdd_anchor}"
+    buf.write(title + "\n\n")
+
+    for expiry_key, g in df.groupby("Expiry", sort=False):
+        tot_oi    = int(g["OpenInt"].iloc[-1] or 0)
+        chg_oi_ld = int(g["ChgOI"].iloc[-1] or 0)
+        sum_mcoi  = int(g["MONEYCOI"].sum() or 0)
+        avg_vr    = round(float(g["VOL_RANK"].mean() or 0), 1)
+        sum_vol   = int(g["TotVol"].sum() or 0)
+
+        buf.write("-" * 80 + "\n")
+        buf.write(
+            f"Expiry: {expiry_key} | "
+            f"TotOI: {tot_oi} | "
+            f"ChgOI(last): {chg_oi_ld} | "
+            f"ΣMONEYCOI: {sum_mcoi} | "
+            f"Avg VOL_RANK: {avg_vr} | "
+            f"ΣVol: {sum_vol}\n"
+        )
+        buf.write("-" * 80 + "\n")
+        buf.write(
+            f"{'Date':<6} | {'Strike':<6} | {'Type':<4} | "
+            f"{'Open':<5} | {'High':<5} | {'Low':<5} | {'Close':<5} | "
+            f"{'ChgOI':<6} | {'OpenInt':<7} | "
+            f"{'MONEYCOI':<8} | {'MONEYOI':<8} | {'VOL_RANK':<8} | {'TotVol':<6}\n"
+        )
+
+        for _, r in g.iterrows():
+            buf.write(
+                f"{str(r['Date']):<6} | "
+                f"{str(int(r['strike'])):<6} | "
+                f"{otype:<4} | "
+                f"{round((r['Open'] or 0), 2):<5} | "
+                f"{round((r['High'] or 0), 2):<5} | "
+                f"{round((r['Low'] or 0), 2):<5} | "
+                f"{round((r['Close'] or 0), 2):<5} | "
+                f"{int(r['ChgOI'] or 0):<6} | "
+                f"{int(r['OpenInt'] or 0):<7} | "
+                f"{int(r['MONEYCOI'] or 0):<8} | "
+                f"{int(r['MONEYOI'] or 0):<8} | "
+                f"{int(r['VOL_RANK'] or 0):<8} | "
+                f"{int(r['TotVol'] or 0):<6}\n"
+            )
+
+        buf.write("\n")
+
+    return buf.getvalue()
+
+
+# ================== /uscount HELPERS ==================
+def get_uscount_dates(ddmm: str | None) -> list[str]:
+    conn = sqlite3.connect(US_DB_PATH)
+    cur = conn.cursor()
+    if ddmm is None:
+        cur.execute(
+            f"""
+            SELECT DISTINCT trade_date_now
+            FROM {CHANGE_TABLE}
+            ORDER BY trade_date_now DESC
+            LIMIT 4
+            """
+        )
+    else:
+        cur.execute(f"SELECT MAX(trade_date_now) FROM {CHANGE_TABLE}")
+        latest = cur.fetchone()[0]
+        if not latest:
+            conn.close()
+            return []
+        try:
+            latest_dt = pd.to_datetime(latest, format="%d%b%Y")
+            year = latest_dt.year
+        except Exception:
+            year = dt.datetime.now().year
+        try:
+            d, m = map(int, ddmm.split("-"))
+            anchor_dt = dt.datetime(year, m, d)
+        except Exception:
+            conn.close()
+            return []
+        anchor_str = anchor_dt.strftime("%d%b%Y")
+        cur.execute(
+            f"""
+            SELECT DISTINCT trade_date_now
+            FROM {CHANGE_TABLE}
+            WHERE trade_date_now <= ?
+            ORDER BY trade_date_now DESC
+            LIMIT 4
+            """,
+            (anchor_str,)
+        )
+    rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows if r[0]]
+
+
+def build_uscount_table(ddmm: str | None) -> str:
+    dates = get_uscount_dates(ddmm)
+    if not dates:
+        if ddmm:
+            return "No US trade dates found for /uscount (check DD-MM input)."
+        return "No US trade dates found for /uscount."
+
+    conn = sqlite3.connect(US_DB_PATH)
+    placeholders = ",".join("?" * len(dates))
+
+    # 1) aggregate at symbol+date level (all expiries)
+    sql = f"""
+        SELECT
+            ticker,
+            trade_date_now,
+            SUM(openInt_Call_now) AS sum_call_oi,
+            SUM(openInt_Put_now)  AS sum_put_oi,
+            SUM(change_OI_Call)   AS sum_coi_call,
+            SUM(change_OI_Put)    AS sum_coi_put
+        FROM {CHANGE_TABLE}
+        WHERE trade_date_now IN ({placeholders})
+        GROUP BY ticker, trade_date_now
+    """
+    df = pd.read_sql(sql, conn, params=dates)
+    if df.empty:
+        conn.close()
+        return "No aggregated OI/COI rows for /uscount on those dates."
+
+    # 2) join spot close
+    stock_rows = []
+    for td in df["trade_date_now"].unique():
+        try:
+            d_dt = pd.to_datetime(td, format="%d%b%Y")
+            trade_date_db = d_dt.strftime("%m-%d-%Y")
+            sdf = pd.read_sql(
+                f"""
+                SELECT ticker, trade_date, close
+                FROM {STOCK_TABLE}
+                WHERE trade_date = ?
+                """,
+                conn,
+                params=(trade_date_db,)
+            )
+            if not sdf.empty:
+                stock_rows.append(sdf)
+        except Exception:
+            continue
+
+    conn.close()
+    if stock_rows:
+        sdf_all = pd.concat(stock_rows, ignore_index=True)
+        sdf_all["trade_date_now"] = pd.to_datetime(
+            sdf_all["trade_date"], format="%m-%d-%Y"
+        ).dt.strftime("%d%b%Y")
+        sdf_all = sdf_all.rename(columns={"close": "spot_close"})
+        df = df.merge(
+            sdf_all[["ticker", "trade_date_now", "spot_close"]],
+            on=["ticker", "trade_date_now"],
+            how="left"
+        )
+    else:
+        df["spot_close"] = np.nan
+
+    # 3) Count metric + side info
+    df["Count"] = df["sum_coi_call"].abs().fillna(0) + df["sum_coi_put"].abs().fillna(0)
+    df["side"] = np.where(
+        df["sum_coi_call"].abs() >= df["sum_coi_put"].abs(),
+        "CE",
+        "PE"
+    )
+    df["side_oi"] = np.where(
+        df["side"] == "CE",
+        df["sum_call_oi"].fillna(0),
+        df["sum_put_oi"].fillna(0),
+    )
+    df["side_coi"] = np.where(
+        df["side"] == "CE",
+        df["sum_coi_call"].fillna(0),
+        df["sum_coi_put"].fillna(0),
+    )
+
+    # optional minimum Count filter (tune as you like)
+    MIN_COUNT = 1  # set higher (e.g. 5000) to reduce noise
+    df = df[df["Count"] >= MIN_COUNT]
+
+    if df.empty:
+        return "No symbols with non-zero Count for /uscount on those dates."
+
+    # 4) top N per date
+    TOP_N = 30
+    out_rows = []
+    raw_dates = []
+
+    for td, g in df.groupby("trade_date_now"):
+        g = g.sort_values("Count", ascending=False).head(TOP_N)
+        for _, r in g.iterrows():
+            try:
+                d_dt = pd.to_datetime(td, format="%d%b%Y")
+                short_dt = d_dt.strftime("%d-%m")
+            except Exception:
+                short_dt = td
+            out_rows.append([
+                str(r["ticker"]),
+                str(r["side"]),
+                short_dt,
+                str(int(r["Count"])),
+                str(int(r["side_oi"] or 0)),
+                str(int(r["side_coi"] or 0)),
+                f"{float(r['spot_close']) if not pd.isna(r['spot_close']) else 0:.2f}",
+            ])
+            raw_dates.append(td)
+
+    headers = ["Ticker","Type","Date","Count","Side_OI","Side_COI","SpotClose"]
+    col_widths = [
+        max(len(headers[i]), max(len(row[i]) for row in out_rows))
+        for i in range(len(headers))
+    ]
+    header_line = " | ".join(headers[i].ljust(col_widths[i]) for i in range(len(headers)))
+    lines = [header_line]
+
+    last_dt = None
+    for idx, row in enumerate(out_rows):
+        curr_dt = raw_dates[idx]
+        if last_dt is not None and curr_dt != last_dt:
+            lines.append("")
+        lines.append(" | ".join(row[i].ljust(col_widths[i]) for i in range(len(headers))))
+        last_dt = curr_dt
+
+    return "\n".join(lines)
+
+
+# ================== HELP ==================
+HELP_TEXT = (
+    "US Market Bot\n\n"
+    "Commands:\n"
+    "/us TICKER [MM-DD-YYYY]\n"
+    "  - Full 4 layers (options S/R, OHLC+PCR+FOI/FCOI, CPR, options snapshot) for one US ticker.\n"
+    "    Sends chart image + text layers (no separate SR+OHLC block).\n"
+    "    Example: /us SPY\n"
+    "    Example: /us AVGO 12-24-2025\n\n"
+    "/ussr LEVEL [DD-MM]\n"
+    "  - SR touch scan across all US tickers (S1/S2/S3/R1/R2/R3/ALLS/ALLR).\n"
+    "    DD-MM is India-style date; defaults to latest US date if omitted.\n"
+    "    Example: /ussr S1\n"
+    "    Example: /ussr ALLR 24-12\n\n"
+    "/usopt TICKER STRIKE TYPE [DAYS] [MM-DD]\n"
+    "  - NSE-style multi-day option slice on US data.\n"
+    "    TYPE: C (Call) or P (Put).\n"
+    "    DAYS: last N distinct trade days (default 5).\n"
+    "    MM-DD (optional): US-style anchor date to cap the slice.\n"
+    "    Strike is auto-adjusted to nearest available strike.\n"
+    "    Examples:\n"
+    "      /usopt AVGO 350 C\n"
+    "      /usopt AVGO 350 C 7\n"
+    "      /usopt AVGO 350 C 5 12-24\n\n"
+    "/uscount [DD-MM]\n"
+    "  - Multi-day OI/COI scan (count-style) across US tickers.\n"
+    "    Aggregates all expiries per symbol/date, computes Count = |ΣCOI_call|+|ΣCOI_put|,\n"
+    "    and shows top names per date.\n"
+    "    Examples:\n"
+    "      /uscount\n"
+    "      /uscount 24-12\n"
+)
+
+
+# ================== TELEGRAM HANDLERS ==================
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    bot.reply_to(message, "US bot online.\nUse /help for commands.")
+
+
+@bot.message_handler(commands=['help'])
+def handle_help(message):
+    bot.reply_to(message, HELP_TEXT)
+
+
+@bot.message_handler(commands=['us', 'US'])
+def handle_us_command(message):
+    try:
+        parts = message.text.strip().split()
+        if len(parts) < 2:
+            bot.reply_to(
+                message,
+                "Format:\n"
+                "/us TICKER\n"
+                "/us TICKER MM-DD-YYYY\n"
+                "Example: /us AVGO 12-24-2025"
+            )
+            return
+
+        ticker = parts[1].upper()
+
+        if len(parts) >= 3:
+            dt_str = parts[2]
+        else:
+            latest = get_latest_us_trade_date()
+            if latest is None:
+                bot.reply_to(message, "No US trade dates in DB.")
+                return
+            dt_str = latest
+
+        temp_dir = tempfile.gettempdir()
+        chart_path = os.path.join(temp_dir, f"us_{ticker}_{dt_str}.png")
+        png = draw_us_ohlc_chart(ticker, dt_str, chart_path)
+        if png and os.path.exists(png):
+            with open(png, "rb") as f:
+                bot.send_photo(message.chat.id, f)
+
+        layers = build_us_layers_text(ticker, dt_str)
+        raw_text = layers
+
+        html = f"<b>US Analytics: {ticker} {dt_str}</b>\n<pre>{raw_text}</pre>"
+        if len(html) <= 4096:
+            bot.send_message(message.chat.id, html, parse_mode="HTML")
+        else:
+            bot.send_message(
+                message.chat.id,
+                f"<b>US Analytics: {ticker} {dt_str}</b>",
+                parse_mode="HTML"
+            )
+            chunk = 3500
+            for i in range(0, len(raw_text), chunk):
+                part = "<pre>" + raw_text[i:i+chunk] + "</pre>"
+                bot.send_message(message.chat.id, part, parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
+
+
+@bot.message_handler(commands=['ussr', 'USSR'])
+def handle_ussr_command(message):
+    try:
+        parts = message.text.strip().split()
+        if len(parts) < 2 or len(parts) > 3:
+            bot.reply_to(
+                message,
+                "Format:\n"
+                "/ussr LEVEL\n"
+                "/ussr LEVEL DD-MM\n"
+                "LEVEL: S1,S2,S3,R1,R2,R3,ALLS,ALLR\n"
+                "Example: /ussr S1 24-12"
+            )
+            return
+
+        level = parts[1]
+        date_ddmm = parts[2] if len(parts) == 3 else None
+
+        raw_text = scan_us_sr_levels(level, date_ddmm)
+        html = "<pre>" + raw_text + "</pre>"
+        if len(html) <= 4096:
+            bot.send_message(message.chat.id, html, parse_mode="HTML")
+        else:
+            chunk = 3500
+            for i in range(0, len(raw_text), chunk):
+                part = "<pre>" + raw_text[i:i+chunk] + "</pre>"
+                bot.send_message(message.chat.id, part, parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
+
+
+@bot.message_handler(commands=['usopt', 'USOPT'])
+def handle_usopt_command(message):
+    try:
+        parts = message.text.strip().split()
+        if len(parts) < 4:
+            bot.reply_to(
+                message,
+                "Format:\n"
+                "/usopt TICKER STRIKE TYPE [DAYS] [MM-DD]\n"
+                "TYPE: C or P\n"
+                "Examples:\n"
+                "  /usopt AVGO 350 C\n"
+                "  /usopt AVGO 350 C 7\n"
+                "  /usopt AVGO 350 C 5 12-24"
+            )
+            return
+
+        ticker = parts[1].upper()
+        strike = float(parts[2])
+        opt_type = parts[3].upper()
+
+        days = 5
+        mmdd_anchor = None
+
+        if len(parts) >= 5:
+            if "-" in parts[4]:
+                mmdd_anchor = parts[4]
+            else:
+                days = int(parts[4])
+        if len(parts) >= 6:
+            mmdd_anchor = parts[5]
+
+        if opt_type not in ("C", "P"):
+            bot.reply_to(message, "TYPE must be C or P.")
+            return
+
+        text = build_us_option_slice_text(ticker, strike, opt_type, days, mmdd_anchor)
+        html = "<pre>" + text + "</pre>"
+        if len(html) <= 4096:
+            bot.send_message(message.chat.id, html, parse_mode="HTML")
+        else:
+            chunk = 3500
+            for i in range(0, len(text), chunk):
+                part = "<pre>" + text[i:i+chunk] + "</pre>"
+                bot.send_message(message.chat.id, part, parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
+
+
+@bot.message_handler(commands=['uscount', 'USCOUNT'])
+def handle_uscount_command(message):
+    try:
+        parts = message.text.strip().split()
+        if len(parts) > 2:
+            bot.reply_to(
+                message,
+                "Format:\n"
+                "/uscount\n"
+                "/uscount DD-MM\n"
+                "Example: /uscount\n"
+                "         /uscount 24-12"
+            )
+            return
+
+        date_ddmm = parts[1] if len(parts) == 2 else None
+        text = build_uscount_table(date_ddmm)
+        html = "<pre>" + text + "</pre>"
+        if len(html) <= 4096:
+            bot.send_message(message.chat.id, html, parse_mode="HTML")
+        else:
+            chunk = 3500
+            for i in range(0, len(text), chunk):
+                part = "<pre>" + text[i:i+chunk] + "</pre>"
+                bot.send_message(message.chat.id, part, parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
+
+
+# ================== MAIN ==================
+if __name__ == "__main__":
+    ensure_options_money_columns()
+    update_options_money_fields_and_ranks()
+    bot.infinity_polling()
