@@ -18,7 +18,11 @@ OPTIONS_TABLE = "options_daily"
 CHANGE_TABLE  = "options_change"
 STOCK_TABLE   = "stock_daily"
 
+<<<<<<< HEAD
 TELEGRAM_TOKEN = "8407478799:AAG1GbQOeUVC-SJmZS0YmXiYyAZRWrdqUWE"
+=======
+TELEGRAM_TOKEN = "8018716820:AAEMAtRy6D0B0xt7SJgJB-bj7VF07ld4aVA"
+>>>>>>> 0e16f15ecc914f1590fb2903776bc8abfdc788e0
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 # ================== TABLE SETUP (optional full recreate) ==================
@@ -628,8 +632,8 @@ def print_layer1_tcs_style(ticker: str, trade_date_db: str) -> str:
             "S2":  row["S2_all"],  "S22":  row["S22_all"],
             "S3":  row["S3_all"],  "S32":  row["S32_all"],
             "R1":  row["R1_all"],  "R12":  row["R12_all"],
-            "R2":  row["R2_all"],  "R22":  row["R22_all"],
-            "R3":  row["R3_all"],  "R32":  row["R32_all"],
+            "R2":  row["R2_all"],  "R22":  row["R2_all"],
+            "R3":  row["R3_all"],  "R32":  row["R3_all"],
             "Opn": row["OpnPric"], "High": row["HghPric"],
             "Low": row["LwPric"],  "Close": row["ClsPric"],
         }
@@ -1247,7 +1251,13 @@ def scan_us_sr_levels(level: str, date_ddmm: str | None) -> str:
 
     return "Unknown level. Use S1/S2/S3/R1/R2/R3/ALLS/ALLR."
 
+<<<<<<< HEAD
 # ================== OPTION 5-DAY SLICE ==================
+=======
+
+
+# ================== OPTION 5-DAY SLICE (SR-style) ==================
+>>>>>>> 0e16f15ecc914f1590fb2903776bc8abfdc788e0
 def build_us_option_slice_text(
     ticker: str,
     strike: float,
@@ -1620,7 +1630,18 @@ HELP_TEXT = (
     "    DD-MM is day-month; defaults to latest US date if omitted.\n\n"
     "/usopt TICKER STRIKE TYPE [DAYS] [MM-DD]\n"
     "  - SR-style multi-day option slice on US data (chart + table).\n"
+<<<<<<< HEAD
     "    TYPE: C (Call) or P (Put).\n\n"
+=======
+    "    TYPE: C (Call) or P (Put).\n"
+    "    DAYS: last N distinct trade days (default 5).\n"
+    "    MM-DD (optional): US-style anchor date to cap the slice.\n"
+    "    Strike is auto-adjusted to nearest available strike.\n"
+    "    Examples:\n"
+    "      /usopt AVGO 350 C\n"
+    "      /usopt AVGO 350 C 7\n"
+    "      /usopt AVGO 350 C 5 12-24\n\n"
+>>>>>>> 0e16f15ecc914f1590fb2903776bc8abfdc788e0
     "/uscount [DD-MM]\n"
     "  - COUNT scan on US options using options_change.\n"
 )
@@ -1652,6 +1673,7 @@ def handle_us_command(message):
         ticker = parts[1].upper()
 
         if len(parts) == 2:
+<<<<<<< HEAD
             expiry_hint = get_nearest_expiry_on_or_after(ticker, None)
             if not expiry_hint:
                 bot.reply_to(message, "No expiries found for this ticker.")
@@ -1665,12 +1687,24 @@ def handle_us_command(message):
             user_date = parts[2]
             try:
                 pd.to_datetime(user_date, format="%m-%d-%Y")
+=======
+            latest = get_latest_us_trade_date()
+            if latest is None:
+                bot.reply_to(message, "No US trade dates in DB.")
+                return
+            dt_str = latest
+        elif len(parts) == 3:
+            dt_str = parts[2]
+            try:
+                pd.to_datetime(dt_str, format="%m-%d-%Y")
+>>>>>>> 0e16f15ecc914f1590fb2903776bc8abfdc788e0
             except Exception:
                 bot.reply_to(
                     message,
                     "Invalid date.\n"
                     "Use MM-DD-YYYY.\n"
                     "Examples:\n"
+<<<<<<< HEAD
                     "  /us GLD\n"
                     "  /us GLD 12-26-2025"
                 )
@@ -1686,6 +1720,12 @@ def handle_us_command(message):
                 bot.reply_to(message, f"Bad expiry format in DB: {expiry_hint}")
                 return
             dt_str = expiry_dt.strftime("%m-%d-%Y")
+=======
+                    "  /us AVGO\n"
+                    "  /us AVGO 12-24-2025"
+                )
+                return
+>>>>>>> 0e16f15ecc914f1590fb2903776bc8abfdc788e0
         else:
             bot.reply_to(
                 message,
@@ -1784,6 +1824,10 @@ def handle_usopt_command(message):
             bot.reply_to(message, "TYPE must be C or P.")
             return
 
+<<<<<<< HEAD
+=======
+        # 1) send SR-style chart (like /SR in India)
+>>>>>>> 0e16f15ecc914f1590fb2903776bc8abfdc788e0
         latest = get_latest_us_trade_date()
         if latest:
             temp_dir = tempfile.gettempdir()
@@ -1793,6 +1837,10 @@ def handle_usopt_command(message):
                 with open(png, "rb") as f:
                     bot.send_photo(message.chat.id, f)
 
+<<<<<<< HEAD
+=======
+        # 2) send multi-day option slice table
+>>>>>>> 0e16f15ecc914f1590fb2903776bc8abfdc788e0
         text = build_us_option_slice_text(ticker, strike, opt_type, days, mmdd_anchor)
         html = "<pre>" + text + "</pre>"
         if len(html) <= 4096:
