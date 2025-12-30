@@ -6,11 +6,10 @@ import pandas as pd
 import numpy as np
 import telebot
 import matplotlib
-matplotlib.use("Agg")  # non-GUI backend
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import tempfile
-
 
 # ================== CONFIG ==================
 US_DB_PATH    = r"C:\Users\srini\Options_chain_data\US_data.db"
@@ -19,11 +18,10 @@ OPTIONS_TABLE = "options_daily"
 CHANGE_TABLE  = "options_change"
 STOCK_TABLE   = "stock_daily"
 
-TELEGRAM_TOKEN = "8018716820:AAEMAtRy6D0B0xt7SJgJB-bj7VF07ld4aVA"
+TELEGRAM_TOKEN = "8407478799:AAG1GbQOeUVC-SJmZS0YmXiYyAZRWrdqUWE"
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-
-# ================== TABLE SETUP ==================
+# ================== TABLE SETUP (optional full recreate) ==================
 def recreate_us_analytics_table():
     if not os.path.exists(US_DB_PATH):
         print("DB not found:", US_DB_PATH)
@@ -33,24 +31,21 @@ def recreate_us_analytics_table():
     cur.execute(f"DROP TABLE IF EXISTS {SUMMARY_TABLE}")
     cur.execute(f"""
         CREATE TABLE {SUMMARY_TABLE} (
-            trade_date   TEXT NOT NULL,  -- MM-DD-YYYY (anchor date, usually expiry)
+            trade_date   TEXT NOT NULL,
             ticker       TEXT NOT NULL,
             expiry_date  TEXT NOT NULL,
             SUMCE        REAL,
             SUMPE        REAL,
             PCR          REAL,
 
-            -- top CE strikes
             SCE1         REAL, OICE1      REAL, SCE1_VOL      REAL,
             SCE2         REAL, OICE2      REAL, SCE2_VOL      REAL,
             SCE3         REAL, OICE3      REAL, SCE3_VOL      REAL,
 
-            -- top PE strikes
             SPE1         REAL, OIPE1      REAL, SPE1_VOL      REAL,
             SPE2         REAL, OIPE2      REAL, SPE2_VOL      REAL,
             SPE3         REAL, OIPE3      REAL, SPE3_VOL      REAL,
 
-            -- Layer-1 (ALL options) S/R
             S1_all       REAL, S12_all    REAL,
             S2_all       REAL, S22_all    REAL,
             S3_all       REAL, S32_all    REAL,
@@ -58,7 +53,6 @@ def recreate_us_analytics_table():
             R2_all       REAL, R22_all    REAL,
             R3_all       REAL, R32_all    REAL,
 
-            -- Layer-1 (FILTERED options) S/R
             S1_filt      REAL, S12_filt   REAL,
             S2_filt      REAL, S22_filt   REAL,
             S3_filt      REAL, S32_filt   REAL,
@@ -66,7 +60,14 @@ def recreate_us_analytics_table():
             R2_filt      REAL, R22_filt   REAL,
             R3_filt      REAL, R32_filt   REAL,
 
-            -- Spot OHLC + PCR from stock_daily (last available <= anchor)
+            -- pivot CPR levels (S1-S3, R1-R3) for chart overlays
+            S1_piv       REAL,
+            S2_piv       REAL,
+            S3_piv       REAL,
+            R1_piv       REAL,
+            R2_piv       REAL,
+            R3_piv       REAL,
+
             OpnPric      REAL,
             HghPric      REAL,
             LwPric       REAL,
@@ -80,7 +81,6 @@ def recreate_us_analytics_table():
     conn.close()
     print(f"Recreated {SUMMARY_TABLE}")
 
-
 # ================== OPTIONS MONEY COLUMNS ==================
 def ensure_options_money_columns():
     conn = sqlite3.connect(US_DB_PATH)
@@ -89,23 +89,18 @@ def ensure_options_money_columns():
     cols = {row[1] for row in cur.fetchall()}
 
     new_cols = [
-        ("money_coi_call", "REAL"),
-        ("money_oi_call",  "REAL"),
-        ("vol_rank_call",  "REAL"),
-        ("money_coi_put",  "REAL"),
-        ("money_oi_put",   "REAL"),
-        ("vol_rank_put",   "REAL"),
-        ("vol_rank_all_call", "REAL"),
-        ("vol_rank_all_put",  "REAL"),
-        ("chg_oi_call", "REAL"),
-        ("chg_oi_put",  "REAL"),
+        ("money_oi_call",       "REAL"),
+        ("vol_rank_call",       "REAL"),
+        ("money_oi_put",        "REAL"),
+        ("vol_rank_put",        "REAL"),
+        ("vol_rank_all_call",   "REAL"),
+        ("vol_rank_all_put",    "REAL"),
     ]
     for name, coltype in new_cols:
         if name not in cols:
             cur.execute(f"ALTER TABLE {OPTIONS_TABLE} ADD COLUMN {name} {coltype}")
     conn.commit()
     conn.close()
-
 
 def update_options_money_fields_and_ranks():
     conn = sqlite3.connect(US_DB_PATH)
@@ -117,55 +112,44 @@ def update_options_money_fields_and_ranks():
     df["expiry_date"] = df["expiry_date"].astype(str)
     df = df.sort_values(["ticker", "expiry_date", "trade_date", "strike"])
 
-    # CALL
+    # CALL side
     if {"lastPrice_Call", "openInt_Call", "vol_Call"}.issubset(df.columns):
-        df["openInt_Call"] = df["openInt_Call"].fillna(0)
+        df["openInt_Call"]   = df["openInt_Call"].fillna(0)
         df["lastPrice_Call"] = df["lastPrice_Call"].fillna(0)
-        df["vol_Call"] = df["vol_Call"].fillna(0)
-
-        # ChgOI will come from options_change; keep zeros here
-        df["chg_oi_call"] = 0.0
-        df["money_coi_call"] = df["lastPrice_Call"] * df["chg_oi_call"]
+        df["vol_Call"]       = df["vol_Call"].fillna(0)
         df["money_oi_call"]  = df["lastPrice_Call"] * df["openInt_Call"]
-
-        df["vol_rank_call"] = df.groupby(
+        df["vol_rank_call"]  = df.groupby(
             ["ticker", "trade_date", "expiry_date"]
         )["vol_Call"].rank(method="min", pct=True) * 100
     else:
-        df["chg_oi_call"]    = 0
-        df["money_coi_call"] = np.nan
-        df["money_oi_call"]  = np.nan
-        df["vol_rank_call"]  = np.nan
+        df["money_oi_call"] = np.nan
+        df["vol_rank_call"] = np.nan
 
-    # PUT
+    # PUT side
     if {"lastPrice_Put", "openInt_Put", "vol_Put"}.issubset(df.columns):
-        df["openInt_Put"] = df["openInt_Put"].fillna(0)
+        df["openInt_Put"]   = df["openInt_Put"].fillna(0)
         df["lastPrice_Put"] = df["lastPrice_Put"].fillna(0)
-        df["vol_Put"] = df["vol_Put"].fillna(0)
-
-        # ChgOI will come from options_change; keep zeros here
-        df["chg_oi_put"] = 0.0
-        df["money_coi_put"] = df["lastPrice_Put"] * df["chg_oi_put"]
+        df["vol_Put"]       = df["vol_Put"].fillna(0)
         df["money_oi_put"]  = df["lastPrice_Put"] * df["openInt_Put"]
-
-        df["vol_rank_put"] = df.groupby(
+        df["vol_rank_put"]  = df.groupby(
             ["ticker", "trade_date", "expiry_date"]
         )["vol_Put"].rank(method="min", pct=True) * 100
     else:
-        df["chg_oi_put"]    = 0
-        df["money_coi_put"] = np.nan
-        df["money_oi_put"]  = np.nan
-        df["vol_rank_put"]  = np.nan
+        df["money_oi_put"] = np.nan
+        df["vol_rank_put"] = np.nan
 
-    # Global ranks
-    df["vol_rank_all_call"] = df.groupby("trade_date")["vol_Call"].rank(method="min", pct=True) * 100
-    df["vol_rank_all_put"]  = df.groupby("trade_date")["vol_Put"].rank(method="min", pct=True) * 100
+    # Global volume ranks per trade_date
+    df["vol_rank_all_call"] = df.groupby("trade_date")["vol_Call"].rank(
+        method="min", pct=True
+    ) * 100
+    df["vol_rank_all_put"]  = df.groupby("trade_date")["vol_Put"].rank(
+        method="min", pct=True
+    ) * 100
 
     df.to_sql(OPTIONS_TABLE, conn, if_exists="replace", index=False)
     conn.close()
 
-
-# ================== NEAREST STRIKE HELPER ==================
+# ================== NEAREST STRIKE ==================
 def get_nearest_strike_for_us(
     ticker: str,
     requested_strike: float,
@@ -207,8 +191,7 @@ def get_nearest_strike_for_us(
     idx = np.abs(arr - float(requested_strike)).argmin()
     return float(arr[idx])
 
-
-# ================== EXPIRY + STOCK DATE HELPERS (US) ==================
+# ================== EXPIRY & DATE HELPERS ==================
 def get_nearest_expiry_for_us(ticker: str) -> str | None:
     conn = sqlite3.connect(US_DB_PATH)
     df = pd.read_sql(
@@ -240,7 +223,6 @@ def get_nearest_expiry_for_us(ticker: str) -> str | None:
 
     return str(row["expiry_date"])
 
-
 def get_latest_trade_for_expiry_us(ticker: str, expiry_date: str) -> str | None:
     conn = sqlite3.connect(US_DB_PATH)
     cur = conn.cursor()
@@ -257,13 +239,7 @@ def get_latest_trade_for_expiry_us(ticker: str, expiry_date: str) -> str | None:
     conn.close()
     return row[0] if row and row[0] else None
 
-
 def get_nearest_expiry_on_or_after(ticker: str, anchor_date_db: str | None) -> str | None:
-    """
-    Find nearest expiry_date >= anchor_date_db (MM-DD-YYYY) for this ticker.
-    If anchor_date_db is None, use 'today' as anchor.
-    If nothing >= anchor, fall back to min(expiry_date).
-    """
     conn = sqlite3.connect(US_DB_PATH)
     df = pd.read_sql(
         f"""
@@ -300,12 +276,7 @@ def get_nearest_expiry_on_or_after(ticker: str, anchor_date_db: str | None) -> s
 
     return str(row["expiry_date"])
 
-
 def get_nearest_stock_date_on_or_before(anchor_date_db: str) -> str | None:
-    """
-    Given MM-DD-YYYY, return nearest trade_date in STOCK_TABLE that is <= anchor_date_db.
-    If none <=, return earliest date; if no rows, None.
-    """
     conn = sqlite3.connect(US_DB_PATH)
     df = pd.read_sql(
         f"SELECT DISTINCT trade_date FROM {STOCK_TABLE}",
@@ -329,12 +300,7 @@ def get_nearest_stock_date_on_or_before(anchor_date_db: str) -> str | None:
 
     return row["trade_date"]
 
-
-# latest options trade_date <= anchor (Option-B)
 def get_options_trade_on_or_before_anchor(ticker: str, expiry: str, anchor_date_db: str) -> str | None:
-    """
-    Latest options trade_date <= anchor_date_db (MM-DD-YYYY) for this expiry.
-    """
     conn = sqlite3.connect(US_DB_PATH)
     df = pd.read_sql(
         f"SELECT DISTINCT trade_date FROM {OPTIONS_TABLE} WHERE ticker=? AND expiry_date=?",
@@ -357,18 +323,81 @@ def get_options_trade_on_or_before_anchor(ticker: str, expiry: str, anchor_date_
         row = df_le.loc[df_le["trade_date_dt"].idxmax()]
     return row["trade_date"]
 
+# extra helper for Layer-3 CPR (nearest stock date <= anchor)
+def get_nearest_stock_date_on_or_before_exact(trade_date_db: str) -> str | None:
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"SELECT DISTINCT trade_date FROM {STOCK_TABLE}",
+        conn
+    )
+    conn.close()
+    if df.empty:
+        return None
 
-# ================== PER-TICKER ANALYTICS BUILDER (EXPIRY-DRIVEN, Option-B) ==================
+    df["trade_date_dt"] = pd.to_datetime(df["trade_date"], format="%m-%d-%Y", errors="coerce")
+    anchor_dt = pd.to_datetime(trade_date_db, format="%m-%d-%Y", errors="coerce")
+    if pd.isna(anchor_dt):
+        return None
+
+    df = df.dropna(subset=["trade_date_dt"])
+    df_le = df[df["trade_date_dt"] <= anchor_dt]
+    if df_le.empty:
+        row = df.loc[df["trade_date_dt"].idxmin()]
+    else:
+        row = df_le.loc[df_le["trade_date_dt"].idxmax()]
+    return row["trade_date"]
+
+# ================== LAYER-3 PIVOT/CPR ==================
+def get_layer3_pivot_cpr(ticker: str, trade_date_db: str) -> pd.DataFrame:
+    """
+    Compute Pivot/CPR using the nearest available stock_daily row
+    on or before trade_date_db (MM-DD-YYYY).
+    """
+    nearest = get_nearest_stock_date_on_or_before_exact(trade_date_db)
+    if nearest is None:
+        return pd.DataFrame()
+
+    conn = sqlite3.connect(US_DB_PATH)
+    df = pd.read_sql(
+        f"""
+        SELECT open, high, low, close
+        FROM {STOCK_TABLE}
+        WHERE ticker=? AND trade_date=?
+        """,
+        conn, params=(ticker, nearest)
+    )
+    conn.close()
+    if df.empty:
+        return pd.DataFrame()
+
+    row = df.iloc[0]
+    H = float(row["high"])
+    L = float(row["low"])
+    C = float(row["close"])
+
+    P  = (H + L + C) / 3.0
+    BC = (H + L) / 2.0
+    TC = 2 * P - BC
+
+    S1 = 2 * P - H
+    R1 = 2 * P - L
+    S2 = P - (H - L)
+    R2 = P + (H - L)
+    S3 = L - 2 * (H - P)
+    R3 = H + 2 * (P - L)
+
+    data = {
+        "S3": S3, "S2": S2, "S1": S1,
+        "BC": BC, "P": P, "TC": TC,
+        "R1": R1, "R2": R2, "R3": R3,
+    }
+    df_out = pd.DataFrame([data])
+    num_cols = df_out.select_dtypes(include=[np.number]).columns
+    df_out[num_cols] = df_out[num_cols].round(2)
+    return df_out
+
+# ================== LAYER-1 ANALYTICS ==================
 def build_us_analytics_for_day(trade_date_opt: str, ticker: str, expiry_hint: str | None = None):
-    """
-    trade_date_opt: %d%b%Y – used for CHANGE_TABLE join.
-
-    Option-B:
-      - anchor date (MM-DD-YYYY) = converted from trade_date_opt (expiry-based anchor)
-      - expiry: expiry_hint or nearest from today
-      - options snapshot: latest options trade_date <= anchor for that expiry
-      - trade_date in SUMMARY_TABLE = anchor date
-    """
     if not os.path.exists(US_DB_PATH):
         return
 
@@ -403,6 +432,7 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str, expiry_hint: st
         return
 
     df_e["expiry_date"] = df_e["expiry_date"].astype(str)
+    df_e["strike"]      = df_e["strike"].astype(float)
 
     df_e["openInt_Call"] = df_e["openInt_Call"].fillna(0)
     df_e["openInt_Put"]  = df_e["openInt_Put"].fillna(0)
@@ -410,14 +440,18 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str, expiry_hint: st
     SUMPE = float(df_e["openInt_Put"].sum())
     PCR   = float(SUMPE / SUMCE) if SUMCE > 0 else np.nan
 
+    # top 3 by OI across that expiry (ALL)
     top_ce_all = df_e.sort_values("openInt_Call", ascending=False).head(3)
     top_pe_all = df_e.sort_values("openInt_Put",  ascending=False).head(3)
 
+    # merge with change for same trade_date_opt
     df_ch = pd.read_sql(
         f"""
         SELECT strike, expiry_date,
                call_close_now, put_close_now,
-               call_high_now,  put_high_now
+               call_high_now,  put_high_now,
+               openInt_Call_now, change_OI_Call,
+               openInt_Put_now,  change_OI_Put
         FROM {CHANGE_TABLE}
         WHERE ticker = ? AND trade_date_now = ?
         """,
@@ -434,8 +468,9 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str, expiry_hint: st
         df_all["call_high_now"]  = df_all.get("call_high", 0)
         df_all["put_high_now"]   = df_all.get("put_high", 0)
 
-    top_ce_filt = df_all[df_all["call_close_now"].fillna(0) >= 0.2].copy()
-    top_pe_filt = df_all[df_all["put_close_now"].fillna(0)  >= 0.2].copy()
+    # filtered: where current close > 0
+    top_ce_filt = df_all[df_all["call_close_now"].fillna(0) > 0].copy()
+    top_pe_filt = df_all[df_all["put_close_now"].fillna(0)  > 0].copy()
     top_ce_filt = top_ce_filt.sort_values("openInt_Call", ascending=False).head(3)
     top_pe_filt = top_pe_filt.sort_values("openInt_Put",  ascending=False).head(3)
 
@@ -476,7 +511,7 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str, expiry_hint: st
             R1 = R12 = None
         return S1, S12, R1, R12
 
-    # ALL
+    # ALL levels
     for i in range(3):
         pe_row = top_pe_all.iloc[i] if i < len(top_pe_all) else None
         ce_row = top_ce_all.iloc[i] if i < len(top_ce_all) else None
@@ -500,7 +535,7 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str, expiry_hint: st
                  round(R1,2) if R1 is not None else None,
                  round(R12,2) if R12 is not None else None)
 
-    # FILTER
+    # FILTERED levels
     for i in range(3):
         pe_row = top_pe_filt.iloc[i] if i < len(top_pe_filt) else None
         ce_row = top_ce_filt.iloc[i] if i < len(top_ce_filt) else None
@@ -524,7 +559,7 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str, expiry_hint: st
                  round(R1,2) if R1 is not None else None,
                  round(R12,2) if R12 is not None else None)
 
-    # spot: last available OHLC on or before anchor_db
+    # Spot OHLC + PCR_OI
     nearest_spot_date = get_nearest_stock_date_on_or_before(anchor_db)
     if nearest_spot_date:
         df_spot = pd.read_sql(
@@ -546,6 +581,20 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str, expiry_hint: st
         data["OpnPric"] = data["HghPric"] = data["LwPric"] = data["ClsPric"] = None
         data["spot_pcr_oi"] = None
 
+    # CPR levels into summary for charts
+    df_piv = get_layer3_pivot_cpr(ticker, anchor_db)
+    if not df_piv.empty:
+        piv = df_piv.iloc[0]
+        data["S1_piv"] = float(piv["S1"])
+        data["S2_piv"] = float(piv["S2"])
+        data["S3_piv"] = float(piv["S3"])
+        data["R1_piv"] = float(piv["R1"])
+        data["R2_piv"] = float(piv["R2"])
+        data["R3_piv"] = float(piv["R3"])
+    else:
+        data["S1_piv"] = data["S2_piv"] = data["S3_piv"] = None
+        data["R1_piv"] = data["R2_piv"] = data["R3_piv"] = None
+
     cols = ", ".join(data.keys())
     qmarks = ", ".join(["?"] * len(data))
     update = ", ".join(
@@ -561,8 +610,7 @@ def build_us_analytics_for_day(trade_date_opt: str, ticker: str, expiry_hint: st
     conn.commit()
     conn.close()
 
-
-# ================== LAYER HELPERS (1–3) ==================
+# ================== LAYER 1–3 FORMATTERS ==================
 def print_layer1_tcs_style(ticker: str, trade_date_db: str) -> str:
     buf = io.StringIO()
     conn = sqlite3.connect(US_DB_PATH)
@@ -590,8 +638,8 @@ def print_layer1_tcs_style(ticker: str, trade_date_db: str) -> str:
             "S2":  row["S2_filt"],  "S22":  row["S22_filt"],
             "S3":  row["S3_filt"],  "S32":  row["S32_filt"],
             "R1":  row["R1_filt"],  "R12":  row["R12_filt"],
-            "R2":  row["R2_filt"],  "R22":  row["R2_filt"],  # no separate R22_filt col
-            "R3":  row["R3_filt"],  "R32":  row["R3_filt"],  # no separate R32_filt col
+            "R2":  row["R2_filt"],  "R22":  row["R2_filt"],
+            "R3":  row["R3_filt"],  "R32":  row["R3_filt"],
             "Opn": row["OpnPric"],  "High": row["HghPric"],
             "Low": row["LwPric"],   "Close": row["ClsPric"],
         }
@@ -600,7 +648,6 @@ def print_layer1_tcs_style(ticker: str, trade_date_db: str) -> str:
         df_out[num_cols] = df_out[num_cols].round(2)
         buf.write(df_out.to_string() + "\n")
     return buf.getvalue()
-
 
 def get_layer2(ticker: str, trade_date_db: str, lookback_days: int = 5) -> pd.DataFrame:
     conn = sqlite3.connect(US_DB_PATH)
@@ -676,126 +723,91 @@ def get_layer2(ticker: str, trade_date_db: str, lookback_days: int = 5) -> pd.Da
     df_out[num_cols] = df_out[num_cols].round(2)
     return df_out
 
-
-def get_layer3_pivot_cpr(ticker: str, trade_date_db: str) -> pd.DataFrame:
-    conn = sqlite3.connect(US_DB_PATH)
-    df = pd.read_sql(
-        f"""
-        SELECT open, high, low, close
-        FROM {STOCK_TABLE}
-        WHERE ticker=? AND trade_date=?
-        """,
-        conn, params=(ticker, trade_date_db)
-    )
-    conn.close()
-    if df.empty:
-        return pd.DataFrame()
-    row = df.iloc[0]
-    H = float(row["high"])
-    L = float(row["low"])
-    C = float(row["close"])
-    P  = (H + L + C) / 3.0
-    BC = (H + L) / 2.0
-    TC = 2 * P - BC
-    S1 = 2*P - H
-    R1 = 2*P - L
-    S2 = P - (H - L)
-    R2 = P + (H - L)
-    S3 = L - 2*(H - P)
-    R3 = H + 2*(P - L)
-    data = {"S3":S3,"S2":S2,"S1":S1,"BC":BC,"P":P,"TC":TC,"R1":R1,"R2":R2,"R3":R3}
-    df_out = pd.DataFrame([data])
-    num_cols = df_out.select_dtypes(include=[np.number]).columns
-    df_out[num_cols] = df_out[num_cols].round(2)
-    return df_out
-
-
-# ================== Layer-4 snapshot (COI from options_change) ==================
+# ================== LAYER-4 FROM options_change ==================
 def get_layer4_options_snapshot(ticker: str, trade_date_opt: str, top_n: int = 3, expiry_hint: str | None = None):
-    if expiry_hint:
-        expiry = expiry_hint
-    else:
-        expiry = get_nearest_expiry_for_us(ticker)
-    if not expiry:
-        return pd.DataFrame(), pd.DataFrame(), None
-
-    latest_trade_for_exp = get_latest_trade_for_expiry_us(ticker, expiry)
-    if not latest_trade_for_exp:
-        return pd.DataFrame(), pd.DataFrame(), None
-
     conn = sqlite3.connect(US_DB_PATH)
-    df = pd.read_sql(
+    df_ch = pd.read_sql(
         f"""
-        SELECT ticker, strike, expiry_date, trade_date,
-               lastPrice_Call, openInt_Call, vol_Call,
-               lastPrice_Put,  openInt_Put,  vol_Put,
-               money_oi_call, money_oi_put,
-               vol_rank_call,  vol_rank_all_call,
-               vol_rank_put,   vol_rank_all_put
-        FROM {OPTIONS_TABLE}
-        WHERE ticker=? AND trade_date=? AND expiry_date=?
+        SELECT
+            strike,
+            expiry_date,
+            call_close_now,
+            call_high_now,
+            openInt_Call_now,
+            change_OI_Call,
+            put_close_now,
+            put_high_now,
+            openInt_Put_now,
+            change_OI_Put
+        FROM {CHANGE_TABLE}
+        WHERE ticker = ? AND trade_date_now = ?
         """,
-        conn, params=(ticker, latest_trade_for_exp, expiry)
+        conn,
+        params=(ticker, trade_date_opt)
     )
-    if df.empty:
+    if df_ch.empty:
         conn.close()
         return pd.DataFrame(), pd.DataFrame(), None
 
-    df["expiry_date"] = df["expiry_date"].astype(str)
-    df["strike"] = df["strike"].astype(float)
+    df_ch["expiry_date"] = df_ch["expiry_date"].astype(str)
+    df_ch["strike"]      = df_ch["strike"].astype(float)
 
-    df_chg = pd.read_sql(
-        f"""
-        SELECT strike, expiry_date, change_OI_Call, change_OI_Put
-        FROM {CHANGE_TABLE}
-        WHERE ticker=? AND trade_date_now=?
-        """,
-        conn, params=(ticker, trade_date_opt)
-    )
-    conn.close()
+    # Force Layer-4 to the same expiry as Layer-1 (/us)
+    if not expiry_hint:
+        conn.close()
+        return pd.DataFrame(), pd.DataFrame(), None
 
-    if not df_chg.empty:
-        df_chg["expiry_date"] = df_chg["expiry_date"].astype(str)
-        df_chg["strike"]      = df_chg["strike"].astype(float)
-        df = df.merge(df_chg, on=["strike","expiry_date"], how="left")
+    expiry = str(expiry_hint)
+    df_e = df_ch[df_ch["expiry_date"] == expiry].copy()
+    if df_e.empty:
+        conn.close()
+        return pd.DataFrame(), pd.DataFrame(), expiry
+
+    df_e["call_close_now"]   = df_e["call_close_now"].fillna(0)
+    df_e["put_close_now"]    = df_e["put_close_now"].fillna(0)
+    df_e["openInt_Call_now"] = df_e["openInt_Call_now"].fillna(0)
+    df_e["openInt_Put_now"]  = df_e["openInt_Put_now"].fillna(0)
+    df_e["change_OI_Call"]   = df_e["change_OI_Call"].fillna(0)
+    df_e["change_OI_Put"]    = df_e["change_OI_Put"].fillna(0)
+
+    df_e["MONEYCOI_Call"] = df_e["call_close_now"] * df_e["change_OI_Call"]
+    df_e["MONEYOI_Call"]  = df_e["call_close_now"] * df_e["openInt_Call_now"]
+    df_e["MONEYCOI_Put"]  = df_e["put_close_now"]  * df_e["change_OI_Put"]
+    df_e["MONEYOI_Put"]   = df_e["put_close_now"]  * df_e["openInt_Put_now"]
+
+    calls = df_e[df_e["openInt_Call_now"] > 0].copy()
+    if not calls.empty:
+        calls["abs_coi"] = calls["change_OI_Call"].abs()
+        calls = calls.sort_values(["openInt_Call_now", "abs_coi"], ascending=[False, False]).head(top_n)
+        calls_out = pd.DataFrame({
+            "Strike":   calls["strike"],
+            "Close":    calls["call_close_now"],
+            "ChgOI":    calls["change_OI_Call"],
+            "OpenInt":  calls["openInt_Call_now"],
+            "MONEYCOI": calls["MONEYCOI_Call"],
+            "MONEYOI":  calls["MONEYOI_Call"],
+            "TotVol":   np.nan,
+        })
     else:
-        df["change_OI_Call"] = np.nan
-        df["change_OI_Put"]  = np.nan
+        calls_out = pd.DataFrame(columns=["Strike","Close","ChgOI","OpenInt","MONEYCOI","MONEYOI","TotVol"])
 
-    df["chg_oi_call"] = df["change_OI_Call"].fillna(0)
-    df["chg_oi_put"]  = df["change_OI_Put"].fillna(0)
-    df["money_coi_call"] = df["lastPrice_Call"].fillna(0) * df["chg_oi_call"]
-    df["money_coi_put"]  = df["lastPrice_Put"].fillna(0)  * df["chg_oi_put"]
+    puts = df_e[df_e["openInt_Put_now"] > 0].copy()
+    if not puts.empty:
+        puts["abs_coi"] = puts["change_OI_Put"].abs()
+        puts = puts.sort_values(["openInt_Put_now", "abs_coi"], ascending=[False, False]).head(top_n)
+        puts_out = pd.DataFrame({
+            "Strike":   puts["strike"],
+            "Close":    puts["put_close_now"],
+            "ChgOI":    puts["change_OI_Put"],
+            "OpenInt":  puts["openInt_Put_now"],
+            "MONEYCOI": puts["MONEYCOI_Put"],
+            "MONEYOI":  puts["MONEYOI_Put"],
+            "TotVol":   np.nan,
+        })
+    else:
+        puts_out = pd.DataFrame(columns=["Strike","Close","ChgOI","OpenInt","MONEYCOI","MONEYOI","TotVol"])
 
-    df_e = df.copy()
-
-    calls = df_e[df_e["openInt_Call"].notna() & (df_e["openInt_Call"] > 0)].copy()
-    calls = calls.sort_values(["openInt_Call", "vol_Call"], ascending=[False, False]).head(top_n)
-    calls_out = pd.DataFrame({
-        "Strike":        calls["strike"],
-        "Close":         calls["lastPrice_Call"],
-        "ChgOI":         calls["chg_oi_call"],
-        "OpenInt":       calls["openInt_Call"],
-        "MONEYCOI":      calls["money_coi_call"],
-        "MONEYOI":       calls["money_oi_call"],
-        "VOL_RANK_Stk":  calls["vol_rank_call"],
-        "VOL_RANK_All":  calls["vol_rank_all_call"],
-        "TotVol":        calls["vol_Call"],
-    })
-
-    puts = df_e[df_e["openInt_Put"].notna() & (df_e["openInt_Put"] > 0)].copy()
-    puts = puts.sort_values(["openInt_Put", "vol_Put"], ascending=[False, False]).head(top_n)
-    puts_out = pd.DataFrame({
-        "Strike":        puts["strike"],
-        "Close":         puts["lastPrice_Put"],
-        "ChgOI":         puts["chg_oi_put"],
-        "OpenInt":       puts["openInt_Put"],
-        "MONEYCOI":      puts["money_coi_put"],
-        "MONEYOI":       puts["money_oi_put"],
-        "VOL_RANK_Stk":  puts["vol_rank_put"],
-        "VOL_RANK_All":  puts["vol_rank_all_put"],
-        "TotVol":        puts["vol_Put"],
-    })
+    conn.close()
 
     for df_x in (calls_out, puts_out):
         if not df_x.empty:
@@ -803,7 +815,6 @@ def get_layer4_options_snapshot(ticker: str, trade_date_opt: str, top_n: int = 3
             df_x[num_cols] = df_x[num_cols].round(2)
 
     return calls_out.reset_index(drop=True), puts_out.reset_index(drop=True), expiry
-
 
 def format_layer4_snapshot(calls: pd.DataFrame, puts: pd.DataFrame, expiry: str) -> str:
     buf = io.StringIO()
@@ -818,8 +829,7 @@ def format_layer4_snapshot(calls: pd.DataFrame, puts: pd.DataFrame, expiry: str)
     else:
         buf.write(
             f"{'Strike':<6} | {'Close':<5} | {'ChgOI':<6} | {'OpenInt':<7} | "
-            f"{'MONEYCOI':<8} | {'MONEYOI':<8} | "
-            f"{'V_STK':<6} | {'V_ALL':<6} | {'TotVol':<6}\n"
+            f"{'MONEYCOI':<8} | {'MONEYOI':<8} | {'TotVol':<6}\n"
         )
         for _, r in calls.iterrows():
             buf.write(
@@ -829,8 +839,6 @@ def format_layer4_snapshot(calls: pd.DataFrame, puts: pd.DataFrame, expiry: str)
                 f"{int(r['OpenInt']):<7} | "
                 f"{int(r['MONEYCOI'] or 0):<8} | "
                 f"{int(r['MONEYOI'] or 0):<8} | "
-                f"{int(r['VOL_RANK_Stk'] or 0):<6} | "
-                f"{int(r['VOL_RANK_All'] or 0):<6} | "
                 f"{int(r['TotVol'] or 0):<6}\n"
             )
 
@@ -845,8 +853,7 @@ def format_layer4_snapshot(calls: pd.DataFrame, puts: pd.DataFrame, expiry: str)
     else:
         buf.write(
             f"{'Strike':<6} | {'Close':<5} | {'ChgOI':<6} | {'OpenInt':<7} | "
-            f"{'MONEYCOI':<8} | {'MONEYOI':<8} | "
-            f"{'V_STK':<6} | {'V_ALL':<6} | {'TotVol':<6}\n"
+            f"{'MONEYCOI':<8} | {'MONEYOI':<8} | {'TotVol':<6}\n"
         )
         for _, r in puts.iterrows():
             buf.write(
@@ -856,15 +863,12 @@ def format_layer4_snapshot(calls: pd.DataFrame, puts: pd.DataFrame, expiry: str)
                 f"{int(r['OpenInt']):<7} | "
                 f"{int(r['MONEYCOI'] or 0):<8} | "
                 f"{int(r['MONEYOI'] or 0):<8} | "
-                f"{int(r['VOL_RANK_Stk'] or 0):<6} | "
-                f"{int(r['VOL_RANK_All'] or 0):<6} | "
                 f"{int(r['TotVol'] or 0):<6}\n"
             )
 
     return buf.getvalue()
 
-
-# ================== SIMPLE OHLC CHART (IMAGE) ==================
+# ================== CHART ==================
 def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
     conn = sqlite3.connect(US_DB_PATH)
 
@@ -891,7 +895,9 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
     df_sr = pd.read_sql(
         f"""
         SELECT S1_all, S12_all, S2_all, S22_all, S3_all, S32_all,
-               R1_all, R12_all, R2_all, R22_all, R3_all, R32_all
+               R1_all, R12_all, R2_all, R22_all, R3_all, R32_all,
+               S1_piv, S2_piv, S3_piv,
+               R1_piv, R2_piv, R3_piv
         FROM {SUMMARY_TABLE}
         WHERE ticker=? AND trade_date=?
         """,
@@ -902,7 +908,7 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
     sr_vals = {}
     if not df_sr.empty:
         row = df_sr.iloc[0]
-        sr_vals = {
+        sr_vals.update({
             "S1":  row["S1_all"],
             "S12": row["S12_all"],
             "S2":  row["S2_all"],
@@ -915,7 +921,15 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
             "R22": row["R22_all"],
             "R3":  row["R3_all"],
             "R32": row["R32_all"],
-        }
+        })
+        sr_vals.update({
+            "S1_piv": row.get("S1_piv"),
+            "S2_piv": row.get("S2_piv"),
+            "S3_piv": row.get("S3_piv"),
+            "R1_piv": row.get("R1_piv"),
+            "R2_piv": row.get("R2_piv"),
+            "R3_piv": row.get("R3_piv"),
+        })
 
     plt.figure(figsize=(9, 5))
     ax = plt.gca()
@@ -923,18 +937,24 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
     ax.plot(df["Date"], df["close"], marker="o", color="black", label="Close (last 30d)")
 
     level_colors = {
-        "S1":  "#1f77b4",
-        "S12": "#2ca02c",
-        "S2":  "#17becf",
-        "S22": "#9467bd",
-        "S3":  "#8c564b",
-        "S32": "#e377c2",
-        "R1":  "#d62728",
-        "R12": "#ff7f0e",
-        "R2":  "#7f7f7f",
-        "R22": "#bcbd22",
-        "R3":  "#17becf",
-        "R32": "#aec7e8",
+        "S1":   "#1f77b4",
+        "S12":  "#2ca02c",
+        "S2":   "#17becf",
+        "S22":  "#9467bd",
+        "S3":   "#8c564b",
+        "S32":  "#e377c2",
+        "R1":   "#d62728",
+        "R12":  "#ff7f0e",
+        "R2":   "#7f7f7f",
+        "R22":  "#bcbd22",
+        "R3":   "#17becf",
+        "R32":  "#aec7e8",
+        "S1_piv": "#0000ff",
+        "S2_piv": "#004080",
+        "S3_piv": "#0080ff",
+        "R1_piv": "#ff0000",
+        "R2_piv": "#800000",
+        "R3_piv": "#ff8080",
     }
 
     if sr_vals:
@@ -1017,7 +1037,6 @@ def draw_us_ohlc_chart(ticker: str, trade_date_db: str, out_path: str) -> str:
     plt.close()
     return out_path
 
-
 # ================== FULL 4-LAYER TEXT ==================
 def build_us_layers_text(ticker: str, trade_date_db: str, expiry_hint: str | None = None) -> str:
     buf = io.StringIO()
@@ -1048,7 +1067,6 @@ def build_us_layers_text(ticker: str, trade_date_db: str, expiry_hint: str | Non
     buf.write(format_layer4_snapshot(calls, puts, expiry))
     return buf.getvalue()
 
-
 # ================== DATE HELPERS ==================
 def get_latest_us_trade_date() -> str | None:
     conn = sqlite3.connect(US_DB_PATH)
@@ -1060,7 +1078,6 @@ def get_latest_us_trade_date() -> str | None:
     if df.empty:
         return None
     return df["trade_date"].iloc[-1]
-
 
 def get_prev_us_trade_date(trade_date_db: str) -> str | None:
     conn = sqlite3.connect(US_DB_PATH)
@@ -1078,7 +1095,6 @@ def get_prev_us_trade_date(trade_date_db: str) -> str | None:
     if idx == 0:
         return None
     return dates[idx - 1]
-
 
 # ================== SR SCANNER ==================
 def scan_us_sr_levels(level: str, date_ddmm: str | None) -> str:
@@ -1231,8 +1247,7 @@ def scan_us_sr_levels(level: str, date_ddmm: str | None) -> str:
 
     return "Unknown level. Use S1/S2/S3/R1/R2/R3/ALLS/ALLR."
 
-
-# ================== OPTION 5-DAY SLICE (SR-style) ==================
+# ================== OPTION 5-DAY SLICE ==================
 def build_us_option_slice_text(
     ticker: str,
     strike: float,
@@ -1251,8 +1266,8 @@ def build_us_option_slice_text(
         SELECT trade_date, strike, expiry_date,
                lastPrice_Call, openInt_Call, vol_Call,
                lastPrice_Put,  openInt_Put,  vol_Put,
-               money_coi_call, money_oi_call, vol_rank_call,
-               money_coi_put,  money_oi_put,  vol_rank_put
+               money_oi_call, vol_rank_call,
+               money_oi_put,  vol_rank_put
         FROM {OPTIONS_TABLE}
         WHERE ticker = ? AND strike = ?
         ORDER BY trade_date
@@ -1304,7 +1319,7 @@ def build_us_option_slice_text(
         df["ChgOI"] = df.groupby("expiry_dt")["openInt_Call"].diff().fillna(0)
         df["Close"]    = df["lastPrice_Call"]
         df["OpenInt"]  = df["openInt_Call"]
-        df["MONEYCOI"] = df["money_coi_call"]
+        df["MONEYCOI"] = df["Close"] * df["ChgOI"]
         df["MONEYOI"]  = df["money_oi_call"]
         df["VOL_RANK"] = df["vol_rank_call"]
         df["TotVol"]   = df["vol_Call"]
@@ -1313,7 +1328,7 @@ def build_us_option_slice_text(
         df["ChgOI"] = df.groupby("expiry_dt")["openInt_Put"].diff().fillna(0)
         df["Close"]    = df["lastPrice_Put"]
         df["OpenInt"]  = df["openInt_Put"]
-        df["MONEYCOI"] = df["money_coi_put"]
+        df["MONEYCOI"] = df["Close"] * df["ChgOI"]
         df["MONEYOI"]  = df["money_oi_put"]
         df["VOL_RANK"] = df["vol_rank_put"]
         df["TotVol"]   = df["vol_Put"]
@@ -1382,7 +1397,6 @@ def build_us_option_slice_text(
 
     return buf.getvalue()
 
-
 # ================== /uscount HELPERS ==================
 def get_uscount_dates(ddmm: str | None) -> list[str]:
     conn = sqlite3.connect(US_DB_PATH)
@@ -1427,7 +1441,6 @@ def get_uscount_dates(ddmm: str | None) -> list[str]:
     rows = cur.fetchall()
     conn.close()
     return [r[0] for r in rows if r[0]]
-
 
 def build_uscount_table(ddmm: str | None) -> str:
     dates = get_uscount_dates(ddmm)
@@ -1592,8 +1605,7 @@ def build_uscount_table(ddmm: str | None) -> str:
 
     return "\n".join(lines)
 
-
-# ================== HELP ==================
+# ================== HELP TEXT ==================
 HELP_TEXT = (
     "US Market Bot\n\n"
     "Commands:\n"
@@ -1605,25 +1617,22 @@ HELP_TEXT = (
     "    Example: /us GLD 12-26-2025\n\n"
     "/ussr LEVEL [DD-MM]\n"
     "  - SR touch scan across all US tickers (S1/S2/S3/R1/R2/R3/ALLS/ALLR).\n"
-    "    DD-MM is India-style date; defaults to latest US date if omitted.\n\n"
+    "    DD-MM is day-month; defaults to latest US date if omitted.\n\n"
     "/usopt TICKER STRIKE TYPE [DAYS] [MM-DD]\n"
     "  - SR-style multi-day option slice on US data (chart + table).\n"
     "    TYPE: C (Call) or P (Put).\n\n"
     "/uscount [DD-MM]\n"
-    "  - India-style COUNT scan on US options.\n"
+    "  - COUNT scan on US options using options_change.\n"
 )
-
 
 # ================== TELEGRAM HANDLERS ==================
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     bot.reply_to(message, "US bot online.\nUse /help for commands.")
 
-
 @bot.message_handler(commands=['help'])
 def handle_help(message):
     bot.reply_to(message, HELP_TEXT)
-
 
 @bot.message_handler(commands=['us', 'US'])
 def handle_us_command(message):
@@ -1643,7 +1652,6 @@ def handle_us_command(message):
         ticker = parts[1].upper()
 
         if len(parts) == 2:
-            # /us TICKER: anchor = nearest expiry from today
             expiry_hint = get_nearest_expiry_on_or_after(ticker, None)
             if not expiry_hint:
                 bot.reply_to(message, "No expiries found for this ticker.")
@@ -1652,9 +1660,8 @@ def handle_us_command(message):
             if pd.isna(expiry_dt):
                 bot.reply_to(message, f"Bad expiry format in DB: {expiry_hint}")
                 return
-            dt_str = expiry_dt.strftime("%m-%d-%Y")  # anchor = expiry date
+            dt_str = expiry_dt.strftime("%m-%d-%Y")
         elif len(parts) == 3:
-            # /us TICKER MM-DD-YYYY: anchor = nearest expiry on/after user date
             user_date = parts[2]
             try:
                 pd.to_datetime(user_date, format="%m-%d-%Y")
@@ -1678,7 +1685,7 @@ def handle_us_command(message):
             if pd.isna(expiry_dt):
                 bot.reply_to(message, f"Bad expiry format in DB: {expiry_hint}")
                 return
-            dt_str = expiry_dt.strftime("%m-%d-%Y")  # anchor = expiry date
+            dt_str = expiry_dt.strftime("%m-%d-%Y")
         else:
             bot.reply_to(
                 message,
@@ -1716,7 +1723,6 @@ def handle_us_command(message):
     except Exception as e:
         bot.reply_to(message, f"Error: {e}")
 
-
 @bot.message_handler(commands=['ussr', 'USSR'])
 def handle_ussr_command(message):
     try:
@@ -1745,7 +1751,6 @@ def handle_ussr_command(message):
                 bot.send_message(message.chat.id, part, parse_mode="HTML")
     except Exception as e:
         bot.reply_to(message, f"Error: {e}")
-
 
 @bot.message_handler(commands=['usopt', 'USOPT'])
 def handle_usopt_command(message):
@@ -1800,7 +1805,6 @@ def handle_usopt_command(message):
     except Exception as e:
         bot.reply_to(message, f"Error: {e}")
 
-
 @bot.message_handler(commands=['uscount', 'USCOUNT'])
 def handle_uscount_command(message):
     try:
@@ -1826,7 +1830,6 @@ def handle_uscount_command(message):
                 bot.send_message(message.chat.id, part, parse_mode="HTML")
     except Exception as e:
         bot.reply_to(message, f"Error: {e}")
-
 
 # ================== MAIN ==================
 if __name__ == "__main__":
