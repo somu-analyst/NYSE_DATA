@@ -267,10 +267,16 @@ def prepare_universe_and_name_map():
         whole_df = pd.concat([whole_df, pd.DataFrame(new_rows_whole)], ignore_index=True)
 
     if not active_df.empty and not whole_df.empty:
-        whole_map = whole_df.set_index("ticker")[["name", "category"]]
+        # Make sure each ticker appears only once in whole_df
+        whole_df = whole_df.drop_duplicates(subset=["ticker"], keep="first")  # or 'last' if you prefer [web:552]
+
+        # Build plain dicts for mapping; avoids non-unique index issues
+        name_map_full = dict(zip(whole_df["ticker"], whole_df["name"]))
+        cat_map_full  = dict(zip(whole_df["ticker"], whole_df["category"]))
+
         active_df = active_df.set_index("ticker")
-        active_df["name"] = active_df.index.to_series().map(whole_map["name"]).fillna(active_df["name"])
-        active_df["category"] = active_df.index.to_series().map(whole_map["category"]).fillna(active_df["category"])
+        active_df["name"] = active_df.index.to_series().map(name_map_full).fillna(active_df["name"])
+        active_df["category"] = active_df.index.to_series().map(cat_map_full).fillna(active_df["category"])
         active_df = active_df.reset_index()
 
     save_universe_sheets(active_df, whole_df, UNIVERSE_FILE)
@@ -1028,7 +1034,7 @@ def cleanup_old_files(data_dir, days=90):
     print(f"\n✅ Cleanup completed: {len(files_to_delete)} files deleted.")
 
 
-def archive_old_excels(us_charts_dir, archive_dir, keep_days=1):
+def archive_old_excels(us_charts_dir, archive_dir, keep_days=5):
     """
     Move options-related Excel/CSV files older than 'keep_days' days
     from US_CHARTS_DIR to ARCHIVE_DIR.
@@ -1078,7 +1084,7 @@ if __name__ == "__main__":
     cleanup_old_files(DATA_DIR, 90)
 
     print("\n📦 Phase 1b: Archive old US_CHARTS Excel/CSV")
-    archive_old_excels(US_CHARTS_DIR, ARCHIVE_DIR, keep_days=1)
+    # archive_old_excels(US_CHARTS_DIR, ARCHIVE_DIR, keep_days=1)
 
     print("\n🏢 Phase 2: Universe & name map")
     company_name_map, all_tickers = prepare_universe_and_name_map()
@@ -1107,3 +1113,6 @@ if __name__ == "__main__":
 
     elapsed = time.time() - SCRIPT_START_TIME
     print(f"\n⏱ Total runtime: {elapsed:.1f} seconds")
+
+
+
