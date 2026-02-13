@@ -1034,7 +1034,7 @@ def cleanup_old_files(data_dir, days=90):
     print(f"\n✅ Cleanup completed: {len(files_to_delete)} files deleted.")
 
 
-def archive_old_excels(us_charts_dir, archive_dir, keep_days=1):
+def archive_old_excels(us_charts_dir, archive_dir, keep_days=5):
     """
     Move options-related Excel/CSV files older than 'keep_days' days
     from US_CHARTS_DIR to ARCHIVE_DIR.
@@ -1084,7 +1084,7 @@ if __name__ == "__main__":
     cleanup_old_files(DATA_DIR, 90)
 
     print("\n📦 Phase 1b: Archive old US_CHARTS Excel/CSV")
-    archive_old_excels(US_CHARTS_DIR, ARCHIVE_DIR, keep_days=1)
+    # archive_old_excels(US_CHARTS_DIR, ARCHIVE_DIR, keep_days=1)
 
     print("\n🏢 Phase 2: Universe & name map")
     company_name_map, all_tickers = prepare_universe_and_name_map()
