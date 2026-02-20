@@ -462,6 +462,12 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
     fig.update_yaxes(showticklabels=True, title_font=dict(size=11))
     fig.update_layout(barmode="overlay")
 
+    # keep bar text reasonably large
+    fig.update_layout(
+        uniformtext_minsize=8,
+        uniformtext_mode="show",
+    )
+
     for idx, (expiry, df) in enumerate(zip(expiries, slices), start=1):
         row = idx + extra_blank_row
         if df is None or df.empty:
@@ -504,7 +510,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         max_vol_here = abs(vol_vals).max() if not vol_vals.empty else 1.0
         vol_max_k = max_vol_here / 1000.0
 
-        # LEFT: OI bars (unchanged)
+        # LEFT: OI bars
         fig.add_trace(
             go.Bar(
                 x=df["x_pos"],
@@ -556,7 +562,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             row=row, col=1, secondary_y=False
         )
 
-        # RIGHT: price + volume + 60d avg (prev prices unchanged)
+        # RIGHT: price + volume + 60d avg
         fig.add_trace(
             go.Bar(
                 x=df["x_pos"],
@@ -580,7 +586,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             row=row, col=2, secondary_y=False
         )
 
-        # CURRENT PRICES: same data, add black labels (1 decimal)
+        # CURRENT PRICES: integer labels, black, readable size
         fig.add_trace(
             go.Bar(
                 x=df["x_pos"],
@@ -592,9 +598,9 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
                 opacity=1.0,
                 width=inner_width,
                 showlegend=show_legend,
-                text=[f"{v:.1f}" if pd.notna(v) else "" for v in df["call_close_now_val"]],
+                text=[f"{int(round(v))}" if pd.notna(v) else "" for v in df["call_close_now_val"]],
                 textposition="outside",
-                textfont=dict(size=50, color="black"),
+                textfont=dict(size=8, color="black"),
                 cliponaxis=False,
             ),
             row=row, col=2, secondary_y=False
@@ -610,15 +616,15 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
                 opacity=1.0,
                 width=inner_width,
                 showlegend=show_legend,
-                text=[f"{abs(v):.1f}" if pd.notna(v) else "" for v in df["put_close_now_val"]],
+                text=[f"{int(round(abs(v)))}" if pd.notna(v) else "" for v in df["put_close_now_val"]],
                 textposition="outside",
-                textfont=dict(size=50, color="black"),
+                textfont=dict(size=8, color="black"),
                 cliponaxis=False,
             ),
             row=row, col=2, secondary_y=False
         )
 
-        # volume + 60d avg (unchanged)
+        # volume + 60d avg
         fig.add_trace(
             go.Scatter(
                 x=df["x_pos"],
@@ -666,14 +672,13 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             row=row, col=2, secondary_y=True
         )
 
-        # y‑axes: more headroom for labels
         fig.update_yaxes(
             range=[-max_oi_here * 1.2, max_oi_here * 1.2],
             title_text="OI",
             row=row, col=1, secondary_y=False,
         )
         fig.update_yaxes(
-            range=[-max_price_here * 1.8, max_price_here * 1.8],
+            range=[-max_price_here * 2.0, max_price_here * 2.0],
             title_text="Price",
             row=row, col=2, secondary_y=False,
         )
@@ -842,7 +847,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             borderwidth=1,
             font=dict(size=9),
         ),
-        margin=dict(l=140, r=10, t=280, b=60),
+        margin=dict(l=140, r=10, t=260, b=60),
     )
 
     return fig, company_name, spot
