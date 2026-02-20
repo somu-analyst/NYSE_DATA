@@ -298,10 +298,10 @@ def summarize_symbol_view(symbol, trade_date_now, yahoo_prices):
     sym = symbol.upper()
     expiries = get_all_expiries(sym, trade_date_now)
     if not expiries:
-        return f"{sym} – {trade_date_now}\nNo expiries for summary."
+        return f"{sym} â€“ {trade_date_now}\nNo expiries for summary."
     spot = get_stock_close(sym, trade_date_now)
     if spot is None:
-        return f"{sym} – {trade_date_now}\nNo stock close for summary."
+        return f"{sym} â€“ {trade_date_now}\nNo stock close for summary."
 
     rows = []
     for expiry in expiries:
@@ -315,7 +315,7 @@ def summarize_symbol_view(symbol, trade_date_now, yahoo_prices):
         rows.append((expiry, expiry_type, pcr_oi))
 
     if not rows:
-        return f"{sym} – {trade_date_now}\nNo OI rows for summary."
+        return f"{sym} â€“ {trade_date_now}\nNo OI rows for summary."
 
     weekly  = [r for r in rows if r[1] == "WEEKLY"  and np.isfinite(r[2])]
     monthly = [r for r in rows if r[1] == "MONTHLY" and np.isfinite(r[2])]
@@ -343,7 +343,7 @@ def summarize_symbol_view(symbol, trade_date_now, yahoo_prices):
     monthly_txt = summarize_group("Monthly", monthly)
 
     text = []
-    text.append(f"{sym} – {trade_date_now} (spot ~{spot:.2f})")   # line 1
+    text.append(f"{sym} â€“ {trade_date_now} (spot ~{spot:.2f})")   # line 1
     text.append(weekly_txt)                                      # line 2
     text.append(monthly_txt)                                     # line 3
     text.append("View: Short-term sideways, watch key range near spot")  # line 4
@@ -427,21 +427,18 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
 
     n = len(expiries)
 
-    # --------- layout logic: special handling for 1–3 expiries ---------
-    # If a stock has 1–3 expiries, add a blank block at top and larger vertical spacing.
     extra_blank_row = 1 if 1 <= n <= 3 else 0
     total_rows = n + extra_blank_row
 
     if 1 <= n <= 3:
-        vert_spacing = 0.12  # larger gap between expiry rows
+        vert_spacing = 0.12
     else:
-        vert_spacing = 0.05  # default
+        vert_spacing = 0.05
 
     specs = []
     subplot_titles = []
     for row_idx in range(total_rows):
         if extra_blank_row and row_idx == 0:
-            # blank row at the very top
             specs.append([{"secondary_y": True}, {"secondary_y": True}])
             subplot_titles.extend(["", ""])
         else:
@@ -465,7 +462,6 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
     fig.update_yaxes(showticklabels=True, title_font=dict(size=11))
     fig.update_layout(barmode="overlay")
 
-    # fill rows, offset by extra_blank_row
     for idx, (expiry, df) in enumerate(zip(expiries, slices), start=1):
         row = idx + extra_blank_row
         if df is None or df.empty:
@@ -508,7 +504,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         max_vol_here = abs(vol_vals).max() if not vol_vals.empty else 1.0
         vol_max_k = max_vol_here / 1000.0
 
-        # LEFT: OI bars
+        # LEFT: OI bars (unchanged)
         fig.add_trace(
             go.Bar(
                 x=df["x_pos"],
@@ -560,7 +556,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             row=row, col=1, secondary_y=False
         )
 
-        # RIGHT: price + volume + 60d avg
+        # RIGHT: price + volume + 60d avg (prev prices unchanged)
         fig.add_trace(
             go.Bar(
                 x=df["x_pos"],
@@ -583,6 +579,8 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             ),
             row=row, col=2, secondary_y=False
         )
+
+        # CURRENT PRICES: same data, add black labels (1 decimal)
         fig.add_trace(
             go.Bar(
                 x=df["x_pos"],
@@ -594,6 +592,10 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
                 opacity=1.0,
                 width=inner_width,
                 showlegend=show_legend,
+                text=[f"{v:.1f}" if pd.notna(v) else "" for v in df["call_close_now_val"]],
+                textposition="outside",
+                textfont=dict(size=50, color="black"),
+                cliponaxis=False,
             ),
             row=row, col=2, secondary_y=False
         )
@@ -608,9 +610,15 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
                 opacity=1.0,
                 width=inner_width,
                 showlegend=show_legend,
+                text=[f"{abs(v):.1f}" if pd.notna(v) else "" for v in df["put_close_now_val"]],
+                textposition="outside",
+                textfont=dict(size=50, color="black"),
+                cliponaxis=False,
             ),
             row=row, col=2, secondary_y=False
         )
+
+        # volume + 60d avg (unchanged)
         fig.add_trace(
             go.Scatter(
                 x=df["x_pos"],
@@ -658,13 +666,14 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             row=row, col=2, secondary_y=True
         )
 
+        # y‑axes: more headroom for labels
         fig.update_yaxes(
             range=[-max_oi_here * 1.2, max_oi_here * 1.2],
             title_text="OI",
             row=row, col=1, secondary_y=False,
         )
         fig.update_yaxes(
-            range=[-max_price_here * 1.15, max_price_here * 1.15],
+            range=[-max_price_here * 1.8, max_price_here * 1.8],
             title_text="Price",
             row=row, col=2, secondary_y=False,
         )
@@ -777,11 +786,8 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             row=row, col=2,
         )
 
-    # ------------ TOP BAND: NAME + ANALYTICS + LEGEND ------------
-
     band_y = 1.12
 
-    # STOCK NAME – left (larger)
     name_text = f"{company_name} ({sym})"
     if len(name_text) > 40:
         name_text = name_text[:40] + "<br>" + name_text[40:]
@@ -799,7 +805,6 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         ),
     )
 
-    # ANALYTICS – center-right
     summary_text = summarize_symbol_view(sym, trade_date_now, yahoo_prices)
     summary_html = "<br>" + "<br>".join(summary_text.split("\n"))
     fig.add_annotation(
@@ -815,8 +820,6 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
         borderwidth=1,
         font=dict(size=16),
     )
-
-    # ------------ LAYOUT: legend visually flush to right border ------------
 
     rows = max(1, total_rows)
     base_height_per_row = 260
@@ -839,7 +842,7 @@ def make_oi_chart(symbol, trade_date_now, yahoo_prices):
             borderwidth=1,
             font=dict(size=9),
         ),
-        margin=dict(l=140, r=10, t=260, b=60),
+        margin=dict(l=140, r=10, t=280, b=60),
     )
 
     return fig, company_name, spot
@@ -929,7 +932,7 @@ def build_strategies_for_symbol(symbol, trade_date_now, spot_from_oi):
         "Stock": symbol.upper(),
         "Price": base["spot"],
         "Change": "+0.0%",
-        "View": "🟢 Bull",
+        "View": "ðŸŸ¢ Bull",
         "Strategy": "Bull Call Spread",
         "Type": "Growth",
         "Market": "Bullish Stable",
@@ -941,7 +944,7 @@ def build_strategies_for_symbol(symbol, trade_date_now, spot_from_oi):
         "Profit": base["max_profit"],
         "RR": base["rr"],
         "Assignment": "Low",
-        "Liquidity": "High ✅",
+        "Liquidity": "High âœ…",
         "Breakeven_or_Range": f"{base['breakeven']:.2f}",
         "Max_Loss": base["risk"],
         "Easy_to_Implement": "Easy",
@@ -956,7 +959,7 @@ def build_strategies_for_symbol(symbol, trade_date_now, spot_from_oi):
         "Stock": symbol.upper(),
         "Price": base["spot"],
         "Change": "+0.0%",
-        "View": "🟢 Bull",
+        "View": "ðŸŸ¢ Bull",
         "Strategy": "Bull Put Spread",
         "Type": "Income",
         "Market": "Bullish Stable",
@@ -968,7 +971,7 @@ def build_strategies_for_symbol(symbol, trade_date_now, spot_from_oi):
         "Profit": 220,
         "RR": 1.0,
         "Assignment": "Medium",
-        "Liquidity": "High ✅",
+        "Liquidity": "High âœ…",
         "Breakeven_or_Range": f"{breakeven_bp:.2f}",
         "Max_Loss": 1780,
         "Easy_to_Implement": "Easy",
@@ -980,7 +983,7 @@ def build_strategies_for_symbol(symbol, trade_date_now, spot_from_oi):
         "Stock": symbol.upper(),
         "Price": base["spot"],
         "Change": "+0.0%",
-        "View": "🟡 Neut",
+        "View": "ðŸŸ¡ Neut",
         "Strategy": "Iron Condor",
         "Type": "Income",
         "Market": "Neutral Stable",
@@ -992,8 +995,8 @@ def build_strategies_for_symbol(symbol, trade_date_now, spot_from_oi):
         "Profit": 850,
         "RR": 5.7,
         "Assignment": "Medium",
-        "Liquidity": "High ✅",
-        "Breakeven_or_Range": "650–720",
+        "Liquidity": "High âœ…",
+        "Breakeven_or_Range": "650â€“720",
         "Max_Loss": 150,
         "Easy_to_Implement": "Moderate",
         "Comment": "Range-bound income strategy; max profit if price stays between inner short strikes. Loss capped by long wings.",
@@ -1102,7 +1105,7 @@ def build_payoff_figure_for_row(row, company_name, spot):
     profit_index = float(row.get("RR", 0) or 0)
 
     try:
-        breakeven = float(str(breakeven_txt).split("–")[0])
+        breakeven = float(str(breakeven_txt).split("â€“")[0])
     except Exception:
         breakeven = spot
 
@@ -1226,10 +1229,10 @@ def build_payoff_figure_for_row(row, company_name, spot):
     )
 
     metrics_html = (
-        f"<span style='color:#006400; font-weight:bold;'>Prem: ${premium_received:.0f}</span> · "
-        f"<span style='color:#00008B; font-weight:bold;'>MaxP: ${max_profit:.0f}</span> · "
-        f"<span style='color:#8B0000; font-weight:bold;'>MaxL: ${max_loss:.0f}</span> · "
-        f"<span style='color:#8B008B; font-weight:bold;'>PI: {profit_index:.2f}</span> · "
+        f"<span style='color:#006400; font-weight:bold;'>Prem: ${premium_received:.0f}</span> Â· "
+        f"<span style='color:#00008B; font-weight:bold;'>MaxP: ${max_profit:.0f}</span> Â· "
+        f"<span style='color:#8B0000; font-weight:bold;'>MaxL: ${max_loss:.0f}</span> Â· "
+        f"<span style='color:#8B008B; font-weight:bold;'>PI: {profit_index:.2f}</span> Â· "
         f"<span style='color:#0000FF; font-weight:bold;'>BE: {breakeven}</span>"
     )
     fig.add_annotation(
@@ -1243,9 +1246,9 @@ def build_payoff_figure_for_row(row, company_name, spot):
         font=dict(size=7),
     )
 
-    view_text = str(row.get("View", "🟢 Bull"))
+    view_text = str(row.get("View", "ðŸŸ¢ Bull"))
     market_text = str(row.get("Market", "Bullish Stable"))
-    tags_html = f"<span style='font-weight:bold;'>{view_text} · {market_text}</span>"
+    tags_html = f"<span style='font-weight:bold;'>{view_text} Â· {market_text}</span>"
     fig.add_annotation(
         xref="paper", yref="paper",
         x=0.5, y=0.90,
@@ -1258,7 +1261,7 @@ def build_payoff_figure_for_row(row, company_name, spot):
     )
 
     theta_text = "Fast"
-    vix_text = "High↓"
+    vix_text = "Highâ†“"
     trend_text = "Flat/Down"
     vol_oi_text = "OK"
     call_text = "Good"
@@ -1312,7 +1315,7 @@ def build_payoff_figure_for_row(row, company_name, spot):
     )
     structure = f"Strikes: {strikes_txt} | Spot: {spot:.2f}"
     comment_text = (
-        f"{company_name} ({sym}) – {strategy}\n"
+        f"{company_name} ({sym}) â€“ {strategy}\n"
         f"{subtitle}\n"
         f"{structure}\n"
         f"B/E or Range: {breakeven_txt}\n"
