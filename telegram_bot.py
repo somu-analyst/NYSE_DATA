@@ -2987,6 +2987,8 @@ async def mirofish_menu(query):
     # ── Section 2: Top OI signals from options_change ─────────────
     try:
         conn = get_conn()
+        signals_df = pd.DataFrame()
+        dt = ""
         latest = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change
             ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1
@@ -3008,11 +3010,10 @@ async def mirofish_menu(query):
                 ORDER BY (ABS(SUM(change_OI_Call)) + ABS(SUM(change_OI_Put))) DESC
                 LIMIT 20
             """, conn, params=(dt,))
-        conn.close()
 
+        bull_tickers = []
+        bear_tickers = []
         if not signals_df.empty:
-            bull_tickers = []
-            bear_tickers = []
             for _, sr in signals_df.iterrows():
                 tk = str(sr["ticker"])
                 c_chg = float(sr["call_oi_chg"] or 0)
@@ -3026,6 +3027,42 @@ async def mirofish_menu(query):
                     bear_tickers.append((tk, p_chg, p_pct))
                 # HEDGE / STRADDLE excluded from directional lists intentionally
 
+        # Query top put strikes for top 3 bearish tickers while conn still open
+        bear_strikes = {}
+        for _btk, _, _ in bear_tickers[:3]:
+            try:
+                _sp_df = pd.read_sql(
+                    "SELECT close FROM stock_daily WHERE ticker=? ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                    conn, params=(_btk,))
+                _spot = float(_sp_df["close"].iloc[0]) if not _sp_df.empty else 0
+                _sk_df = pd.read_sql("""
+                    SELECT strike, change_OI_Put, openInt_Put_now
+                    FROM options_change
+                    WHERE ticker=? AND trade_date_now=? AND change_OI_Put > 0
+                    ORDER BY change_OI_Put DESC LIMIT 3
+                """, conn, params=(_btk, dt))
+                rows_out = []
+                for _, _skr in _sk_df.iterrows():
+                    _st   = float(_skr["strike"] or 0)
+                    _pd_  = float(_skr["change_OI_Put"] or 0)
+                    _pfs  = (_st - _spot) / _spot * 100 if _spot > 0 else 0
+                    if abs(_pfs) <= 3:
+                        _zone = "ATM"
+                    elif _pfs < -3 and _pfs >= -10:
+                        _zone = "NEAR"
+                    elif _pfs < -10:
+                        _zone = "DEEP"
+                    else:
+                        _zone = "OTM↑"
+                    _nt = _fmt_notional(_pd_ * _st * 100)
+                    _why = {"ATM": "directional short", "NEAR": "hedge/short", "DEEP": "tail hedge", "OTM↑": "OTM put"}.get(_zone, "")
+                    rows_out.append((_st, _pd_, _zone, _nt, _why))
+                bear_strikes[_btk] = rows_out
+            except Exception:
+                pass
+        conn.close()
+
+        if not signals_df.empty:
             parts.append(f"\n📡 <b>TOP OI SIGNALS · {dt}</b>")
 
             if bull_tickers:
@@ -3048,6 +3085,12 @@ async def mirofish_menu(query):
                 for tk, chg, pct in bear_tickers[:5]:
                     rows.append(f"{tk:<7} {chg:>+8,.0f} {pct:>+6.1f}%")
                 parts.append(mono("\n".join(rows)))
+                # Strike breakdown for top 3 bearish tickers
+                for _btk, _, _ in bear_tickers[:3]:
+                    if bear_strikes.get(_btk):
+                        parts.append(f"\n📍 <b>{_btk}</b> top put strikes:")
+                        for _st, _pd_, _zone, _nt, _why in bear_strikes[_btk]:
+                            parts.append(f"  ${_st:.0f} <b>{_zone}</b> · {_why} · +{_pd_/1000:.1f}K · {_nt}")
                 for tk, _, _ in bear_tickers[:3]:
                     btn_rows.append([InlineKeyboardButton(
                         f"🔴 {tk} signal detail", callback_data=f"miro_ticker_{tk}"
@@ -12422,6 +12465,8 @@ async def mirofish_menu(query):
     # ── Section 2: Top OI signals from options_change ─────────────
     try:
         conn = get_conn()
+        signals_df = pd.DataFrame()
+        dt = ""
         latest = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change
             ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1
@@ -12443,11 +12488,10 @@ async def mirofish_menu(query):
                 ORDER BY (ABS(SUM(change_OI_Call)) + ABS(SUM(change_OI_Put))) DESC
                 LIMIT 20
             """, conn, params=(dt,))
-        conn.close()
 
+        bull_tickers = []
+        bear_tickers = []
         if not signals_df.empty:
-            bull_tickers = []
-            bear_tickers = []
             for _, sr in signals_df.iterrows():
                 tk = str(sr["ticker"])
                 c_chg = float(sr["call_oi_chg"] or 0)
@@ -12461,6 +12505,42 @@ async def mirofish_menu(query):
                     bear_tickers.append((tk, p_chg, p_pct))
                 # HEDGE / STRADDLE excluded from directional lists intentionally
 
+        # Query top put strikes for top 3 bearish tickers while conn still open
+        bear_strikes = {}
+        for _btk, _, _ in bear_tickers[:3]:
+            try:
+                _sp_df = pd.read_sql(
+                    "SELECT close FROM stock_daily WHERE ticker=? ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                    conn, params=(_btk,))
+                _spot = float(_sp_df["close"].iloc[0]) if not _sp_df.empty else 0
+                _sk_df = pd.read_sql("""
+                    SELECT strike, change_OI_Put, openInt_Put_now
+                    FROM options_change
+                    WHERE ticker=? AND trade_date_now=? AND change_OI_Put > 0
+                    ORDER BY change_OI_Put DESC LIMIT 3
+                """, conn, params=(_btk, dt))
+                rows_out = []
+                for _, _skr in _sk_df.iterrows():
+                    _st   = float(_skr["strike"] or 0)
+                    _pd_  = float(_skr["change_OI_Put"] or 0)
+                    _pfs  = (_st - _spot) / _spot * 100 if _spot > 0 else 0
+                    if abs(_pfs) <= 3:
+                        _zone = "ATM"
+                    elif _pfs < -3 and _pfs >= -10:
+                        _zone = "NEAR"
+                    elif _pfs < -10:
+                        _zone = "DEEP"
+                    else:
+                        _zone = "OTM↑"
+                    _nt = _fmt_notional(_pd_ * _st * 100)
+                    _why = {"ATM": "directional short", "NEAR": "hedge/short", "DEEP": "tail hedge", "OTM↑": "OTM put"}.get(_zone, "")
+                    rows_out.append((_st, _pd_, _zone, _nt, _why))
+                bear_strikes[_btk] = rows_out
+            except Exception:
+                pass
+        conn.close()
+
+        if not signals_df.empty:
             parts.append(f"\n📡 <b>TOP OI SIGNALS · {dt}</b>")
 
             if bull_tickers:
@@ -12483,6 +12563,12 @@ async def mirofish_menu(query):
                 for tk, chg, pct in bear_tickers[:5]:
                     rows.append(f"{tk:<7} {chg:>+8,.0f} {pct:>+6.1f}%")
                 parts.append(mono("\n".join(rows)))
+                # Strike breakdown for top 3 bearish tickers
+                for _btk, _, _ in bear_tickers[:3]:
+                    if bear_strikes.get(_btk):
+                        parts.append(f"\n📍 <b>{_btk}</b> top put strikes:")
+                        for _st, _pd_, _zone, _nt, _why in bear_strikes[_btk]:
+                            parts.append(f"  ${_st:.0f} <b>{_zone}</b> · {_why} · +{_pd_/1000:.1f}K · {_nt}")
                 for tk, _, _ in bear_tickers[:3]:
                     btn_rows.append([InlineKeyboardButton(
                         f"🔴 {tk} signal detail", callback_data=f"miro_ticker_{tk}"
