@@ -3283,7 +3283,10 @@ elif page == "💼 Portfolio & Suggestions":
                                     try: _eexp_def=datetime.strptime(pos["Expiry"],"%Y-%m-%d").date()
                                     except: _eexp_def=datetime.now().date()
                                     _eexp=_e6.date_input("Expiry",value=_eexp_def,key=f"eexp_{pos['ID']}")
-                                    _estrat=st.selectbox("Strategy",["manual","long_call","long_put","spread","iron_condor","covered_call","cash_secured_put"],key=f"estrat_{pos['ID']}")
+                                    _strat_opts=["manual","long_call","long_put","spread","iron_condor","covered_call","cash_secured_put"]
+                                    _cur_strat=str(pos.get("Strategy","manual") or "manual").lower()
+                                    _strat_idx=_strat_opts.index(_cur_strat) if _cur_strat in _strat_opts else 0
+                                    _estrat=st.selectbox("Strategy",_strat_opts,index=_strat_idx,key=f"estrat_{pos['ID']}")
                                     if st.form_submit_button("💾 Save Changes"):
                                         if _etk and _estk>0 and _eep>0:
                                             try:

@@ -8615,10 +8615,14 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
             stk = float(tr.get("strike", 0) or 0)
             ep  = float(tr.get("entry_price", 0) or 0)
             try:
-                spot = float(yf.Ticker(tr["ticker"]).history(period="5d")["Close"].iloc[-1])
-                pnl_pct = ((spot - ep) / ep * 100) if ot != "PUT" else ((ep - spot) / ep * 100)
+                _h5 = yf.Ticker(tr["ticker"]).history(period="7d")
+                spot = float(_h5["Close"].iloc[-1])
+                spot_prev = float(_h5["Close"].iloc[0])
+                stock_ret = (spot - spot_prev) / spot_prev * 100 if spot_prev > 0 else 0
+                # delta-neutral estimate: calls gain with rising stock, puts with falling
+                pnl_pct = stock_ret * 0.5 if not ot.startswith("PUT") else -stock_ret * 0.5
                 st_p = "[+]" if pnl_pct > 0 else "[!]"
-                pnl_s = f"{pnl_pct:+.1f}%"
+                pnl_s = f"~{pnl_pct:+.1f}%"
             except Exception:
                 st_p = "[ ]"; pnl_s = "N/A"
             _prows.append([st_p, str(tr.get("ticker","?"))[:6], side_s, f"{stk:.0f}", pnl_s])
@@ -8653,7 +8657,8 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
         elif _ma_fg >= 25: _ma_fg_lb = "FEAR 😨"
         else:              _ma_fg_lb = "EXTREME FEAR 😱"
         _ma_bar = "█" * (_ma_fg // 10) + "░" * (10 - _ma_fg // 10)
-        parts.append(f"\n😱 <b>Fear/Greed:</b> {_ma_fg}/100 — {_ma_fg_lb}\n   <code>{_ma_bar}</code>")
+        _fg_ico = "🤑" if _ma_fg >= 75 else ("😀" if _ma_fg >= 55 else ("😐" if _ma_fg >= 45 else ("😨" if _ma_fg >= 25 else "😱")))
+        parts.append(f"\n{_fg_ico} <b>Fear/Greed:</b> {_ma_fg}/100 — {_ma_fg_lb}\n   <code>{_ma_bar}</code>")
         parts.append(f"🌡 <b>VIX:</b> {_ma_vix:.1f}  {'EXTREME FEAR' if _ma_vix > 30 else 'HIGH FEAR' if _ma_vix > 25 else 'ELEVATED' if _ma_vix > 20 else 'CALM'}")
     except Exception: pass
 
@@ -8665,10 +8670,13 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
             if len(_msh) >= 2:
                 _mp = (float(_msh["Close"].iloc[-1]) - float(_msh["Close"].iloc[-2])) / float(_msh["Close"].iloc[-2]) * 100
                 _ma_sp.append((_ml, _mp))
-        if _ma_sp:
+        if len(_ma_sp) >= 2:
             _ma_sp.sort(key=lambda x: x[1], reverse=True)
-            parts.append(f"🏆 <b>Leading:</b> {_ma_sp[0][0]} {_ma_sp[0][1]:+.1f}%  {_ma_sp[1][0]} {_ma_sp[1][1]:+.1f}%")
-            parts.append(f"⬇ <b>Lagging:</b> {_ma_sp[-1][0]} {_ma_sp[-1][1]:+.1f}%  {_ma_sp[-2][0]} {_ma_sp[-2][1]:+.1f}%")
+            _top2 = _ma_sp[:2]; _bot2 = _ma_sp[-2:]
+            parts.append(f"🏆 <b>Leading:</b> {_top2[0][0]} {_top2[0][1]:+.1f}%  {_top2[1][0]} {_top2[1][1]:+.1f}%")
+            parts.append(f"⬇ <b>Lagging:</b> {_bot2[-1][0]} {_bot2[-1][1]:+.1f}%  {_bot2[-2][0]} {_bot2[-2][1]:+.1f}%")
+        elif len(_ma_sp) == 1:
+            parts.append(f"🏆 <b>Sector:</b> {_ma_sp[0][0]} {_ma_sp[0][1]:+.1f}%")
     except Exception: pass
 
     # ── Macro Calendar — key weekly indicators with trade impact ───
@@ -8679,69 +8687,68 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
         # We fetch current-week proxies to derive direction signals
         _macro_events = []
 
-        # Jobless Claims proxy — weekly Thursday; use ^IRX (13-week T-Bill) as stress proxy
+        # Jobless Claims proxy — ^IRX (13-week T-Bill) as stress proxy
         try:
             _jc_h = yf.Ticker("^IRX").history(period="10d")
             if len(_jc_h) >= 2:
                 _jc_chg = float(_jc_h["Close"].iloc[-1]) - float(_jc_h["Close"].iloc[-2])
-                _jc_lbl = "Claims proxy: T-Bill yld"
-                _jc_imp = "Rising claims → short consumer, long defensives" if _jc_chg < -0.05 else (
-                           "Falling claims → risk-on, long growth" if _jc_chg > 0.05 else "Stable")
-                _macro_events.append(("Jobless Claims", f"{float(_jc_h['Close'].iloc[-1]):.2f}%", _jc_imp))
+                _jc_sig = "Def↑" if _jc_chg < -0.05 else ("Grwth↑" if _jc_chg > 0.05 else "Stable")
+                _macro_events.append(("Claims", f"{float(_jc_h['Close'].iloc[-1]):.2f}%", _jc_sig))
         except Exception: pass
 
-        # GDP proxy — DXY (dollar strength reflects growth expectations)
+        # DXY — dollar index
         try:
             _dxy_h = yf.Ticker("DX=F").history(period="5d")
             if len(_dxy_h) >= 2:
-                _dxy_chg = (float(_dxy_h["Close"].iloc[-1]) - float(_dxy_h["Close"].iloc[-2])) / float(_dxy_h["Close"].iloc[-2]) * 100
-                _dxy_imp = ("DXY strong → EM/Gold weak, US export pressure" if _dxy_chg > 0.3 else
-                            "DXY weak → EM outperform, Gold/Oil support" if _dxy_chg < -0.3 else "Neutral")
-                _macro_events.append(("DXY (USD)", f"{float(_dxy_h['Close'].iloc[-1]):.2f} ({_dxy_chg:+.1f}%)", _dxy_imp))
+                _dxy_v = float(_dxy_h["Close"].iloc[-1])
+                _dxy_c = (_dxy_v - float(_dxy_h["Close"].iloc[-2])) / float(_dxy_h["Close"].iloc[-2]) * 100
+                _dxy_sig = ("EM/Au↓" if _dxy_c > 0.3 else ("EM/Au↑" if _dxy_c < -0.3 else "Neutral"))
+                _macro_events.append(("DXY", f"{_dxy_v:.1f}{_dxy_c:+.1f}%", _dxy_sig))
         except Exception: pass
 
-        # 10Y yield — key rate signal
+        # 10Y yield
         try:
             _tnx_h = yf.Ticker("^TNX").history(period="5d")
             if len(_tnx_h) >= 2:
                 _tnx_v = float(_tnx_h["Close"].iloc[-1])
-                _tnx_c = float(_tnx_h["Close"].iloc[-1]) - float(_tnx_h["Close"].iloc[-2])
-                _tnx_imp = ("Rates rising → short REITs/growth, long banks" if _tnx_c > 0.05 else
-                            "Rates falling → long REITs/utilities, short banks" if _tnx_c < -0.05 else "Stable")
-                _macro_events.append(("10Y Yield", f"{_tnx_v:.2f}% ({_tnx_c:+.2f})", _tnx_imp))
+                _tnx_c = _tnx_v - float(_tnx_h["Close"].iloc[-2])
+                _tnx_sig = ("Bnk↑REIT↓" if _tnx_c > 0.05 else ("REIT↑Bnk↓" if _tnx_c < -0.05 else "Stable"))
+                _macro_events.append(("10Y", f"{_tnx_v:.2f}%{_tnx_c:+.2f}", _tnx_sig))
         except Exception: pass
 
-        # Crude Oil — energy & consumer impact
+        # Crude Oil
         try:
             _oil_h = yf.Ticker("CL=F").history(period="5d")
             if len(_oil_h) >= 2:
-                _oil_c = (float(_oil_h["Close"].iloc[-1]) - float(_oil_h["Close"].iloc[-2])) / float(_oil_h["Close"].iloc[-2]) * 100
-                _oil_imp = ("Oil up → long XLE/CVX, short DAL/airlines" if _oil_c > 1.5 else
-                            "Oil down → long DAL/LUV, short XLE" if _oil_c < -1.5 else "Neutral")
-                _macro_events.append(("Crude Oil", f"${float(_oil_h['Close'].iloc[-1]):.1f} ({_oil_c:+.1f}%)", _oil_imp))
+                _oil_v = float(_oil_h["Close"].iloc[-1])
+                _oil_c = (_oil_v - float(_oil_h["Close"].iloc[-2])) / float(_oil_h["Close"].iloc[-2]) * 100
+                _oil_sig = ("XLE↑DAL↓" if _oil_c > 1.5 else ("DAL↑XLE↓" if _oil_c < -1.5 else "Neutral"))
+                _macro_events.append(("Oil", f"${_oil_v:.1f}{_oil_c:+.1f}%", _oil_sig))
         except Exception: pass
 
-        # VIX — vol regime
+        # VIX vol regime
         try:
             _vix_h = yf.Ticker("^VIX").history(period="5d")
             if len(_vix_h) >= 1:
                 _vix_v = float(_vix_h["Close"].iloc[-1])
-                _vix_imp = ("VIX>30 extreme fear → buy dips, sell premium" if _vix_v > 30 else
-                            "VIX>20 elevated → hedge positions, reduce size" if _vix_v > 20 else
-                            "VIX calm → sell premium, iron condors")
-                _macro_events.append(("VIX", f"{_vix_v:.1f}", _vix_imp))
+                _vix_sig = ("BuyDips" if _vix_v > 30 else ("Hedge" if _vix_v > 20 else "SellPrm"))
+                _macro_events.append(("VIX", f"{_vix_v:.1f}", _vix_sig))
         except Exception: pass
 
         if _macro_events:
-            _mhdr2 = ["Indicator", "Value", "Trade Idea"]
-            _mfw2 = [max(len(_mhdr2[i]), max(len(str(r[i])) for r in _macro_events)) for i in range(3)]
-            _mfw2[2] = min(_mfw2[2], 42)  # cap note width
-            _mj2 = lambda i, v: v.ljust(_mfw2[i]) if i < 2 else v[:_mfw2[2]].ljust(_mfw2[2])
+            # Compact 3-col table: Ind(7) | Val(9) | Signal(9) = ~30 chars total
+            _mhdr2 = ["Ind", "Val", "Signal"]
+            _mfw2 = [
+                max(len(_mhdr2[0]), max(len(r[0]) for r in _macro_events)),
+                max(len(_mhdr2[1]), max(len(r[1]) for r in _macro_events)),
+                max(len(_mhdr2[2]), max(len(r[2]) for r in _macro_events)),
+            ]
+            _mj2 = lambda i, v: v.ljust(_mfw2[i]) if i == 0 else v.rjust(_mfw2[i]) if i == 1 else v.ljust(_mfw2[i])
             _msep2 = "-+-".join("-" * w for w in _mfw2)
-            _ml2 = ["MACRO & TRADE IDEAS",
+            _ml2 = ["MACRO SIGNALS",
                     " | ".join(_mj2(i, _mhdr2[i]) for i in range(3)), _msep2]
             for r in _macro_events:
-                _ml2.append(" | ".join(_mj2(i, str(r[i])) for i in range(3)))
+                _ml2.append(" | ".join(_mj2(i, r[i]) for i in range(3)))
             parts.append("<pre>" + "\n".join(_ml2) + "</pre>")
     except Exception as _mce:
         log.warning(f"morning macro section failed: {_mce}")
@@ -17841,10 +17848,14 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
             stk = float(tr.get("strike", 0) or 0)
             ep  = float(tr.get("entry_price", 0) or 0)
             try:
-                spot = float(yf.Ticker(tr["ticker"]).history(period="5d")["Close"].iloc[-1])
-                pnl_pct = ((spot - ep) / ep * 100) if ot != "PUT" else ((ep - spot) / ep * 100)
+                _h5 = yf.Ticker(tr["ticker"]).history(period="7d")
+                spot = float(_h5["Close"].iloc[-1])
+                spot_prev = float(_h5["Close"].iloc[0])
+                stock_ret = (spot - spot_prev) / spot_prev * 100 if spot_prev > 0 else 0
+                # delta-neutral estimate: calls gain with rising stock, puts with falling
+                pnl_pct = stock_ret * 0.5 if not ot.startswith("PUT") else -stock_ret * 0.5
                 st_p = "[+]" if pnl_pct > 0 else "[!]"
-                pnl_s = f"{pnl_pct:+.1f}%"
+                pnl_s = f"~{pnl_pct:+.1f}%"
             except Exception:
                 st_p = "[ ]"; pnl_s = "N/A"
             _prows.append([st_p, str(tr.get("ticker","?"))[:6], side_s, f"{stk:.0f}", pnl_s])
@@ -17879,7 +17890,8 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
         elif _ma_fg >= 25: _ma_fg_lb = "FEAR 😨"
         else:              _ma_fg_lb = "EXTREME FEAR 😱"
         _ma_bar = "█" * (_ma_fg // 10) + "░" * (10 - _ma_fg // 10)
-        parts.append(f"\n😱 <b>Fear/Greed:</b> {_ma_fg}/100 — {_ma_fg_lb}\n   <code>{_ma_bar}</code>")
+        _fg_ico = "🤑" if _ma_fg >= 75 else ("😀" if _ma_fg >= 55 else ("😐" if _ma_fg >= 45 else ("😨" if _ma_fg >= 25 else "😱")))
+        parts.append(f"\n{_fg_ico} <b>Fear/Greed:</b> {_ma_fg}/100 — {_ma_fg_lb}\n   <code>{_ma_bar}</code>")
         parts.append(f"🌡 <b>VIX:</b> {_ma_vix:.1f}  {'EXTREME FEAR' if _ma_vix > 30 else 'HIGH FEAR' if _ma_vix > 25 else 'ELEVATED' if _ma_vix > 20 else 'CALM'}")
     except Exception: pass
 
@@ -17891,10 +17903,13 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
             if len(_msh) >= 2:
                 _mp = (float(_msh["Close"].iloc[-1]) - float(_msh["Close"].iloc[-2])) / float(_msh["Close"].iloc[-2]) * 100
                 _ma_sp.append((_ml, _mp))
-        if _ma_sp:
+        if len(_ma_sp) >= 2:
             _ma_sp.sort(key=lambda x: x[1], reverse=True)
-            parts.append(f"🏆 <b>Leading:</b> {_ma_sp[0][0]} {_ma_sp[0][1]:+.1f}%  {_ma_sp[1][0]} {_ma_sp[1][1]:+.1f}%")
-            parts.append(f"⬇ <b>Lagging:</b> {_ma_sp[-1][0]} {_ma_sp[-1][1]:+.1f}%  {_ma_sp[-2][0]} {_ma_sp[-2][1]:+.1f}%")
+            _top2 = _ma_sp[:2]; _bot2 = _ma_sp[-2:]
+            parts.append(f"🏆 <b>Leading:</b> {_top2[0][0]} {_top2[0][1]:+.1f}%  {_top2[1][0]} {_top2[1][1]:+.1f}%")
+            parts.append(f"⬇ <b>Lagging:</b> {_bot2[-1][0]} {_bot2[-1][1]:+.1f}%  {_bot2[-2][0]} {_bot2[-2][1]:+.1f}%")
+        elif len(_ma_sp) == 1:
+            parts.append(f"🏆 <b>Sector:</b> {_ma_sp[0][0]} {_ma_sp[0][1]:+.1f}%")
     except Exception: pass
 
     # ── Macro Calendar — key weekly indicators with trade impact ───
@@ -17905,69 +17920,68 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
         # We fetch current-week proxies to derive direction signals
         _macro_events = []
 
-        # Jobless Claims proxy — weekly Thursday; use ^IRX (13-week T-Bill) as stress proxy
+        # Jobless Claims proxy — ^IRX (13-week T-Bill) as stress proxy
         try:
             _jc_h = yf.Ticker("^IRX").history(period="10d")
             if len(_jc_h) >= 2:
                 _jc_chg = float(_jc_h["Close"].iloc[-1]) - float(_jc_h["Close"].iloc[-2])
-                _jc_lbl = "Claims proxy: T-Bill yld"
-                _jc_imp = "Rising claims → short consumer, long defensives" if _jc_chg < -0.05 else (
-                           "Falling claims → risk-on, long growth" if _jc_chg > 0.05 else "Stable")
-                _macro_events.append(("Jobless Claims", f"{float(_jc_h['Close'].iloc[-1]):.2f}%", _jc_imp))
+                _jc_sig = "Def↑" if _jc_chg < -0.05 else ("Grwth↑" if _jc_chg > 0.05 else "Stable")
+                _macro_events.append(("Claims", f"{float(_jc_h['Close'].iloc[-1]):.2f}%", _jc_sig))
         except Exception: pass
 
-        # GDP proxy — DXY (dollar strength reflects growth expectations)
+        # DXY — dollar index
         try:
             _dxy_h = yf.Ticker("DX=F").history(period="5d")
             if len(_dxy_h) >= 2:
-                _dxy_chg = (float(_dxy_h["Close"].iloc[-1]) - float(_dxy_h["Close"].iloc[-2])) / float(_dxy_h["Close"].iloc[-2]) * 100
-                _dxy_imp = ("DXY strong → EM/Gold weak, US export pressure" if _dxy_chg > 0.3 else
-                            "DXY weak → EM outperform, Gold/Oil support" if _dxy_chg < -0.3 else "Neutral")
-                _macro_events.append(("DXY (USD)", f"{float(_dxy_h['Close'].iloc[-1]):.2f} ({_dxy_chg:+.1f}%)", _dxy_imp))
+                _dxy_v = float(_dxy_h["Close"].iloc[-1])
+                _dxy_c = (_dxy_v - float(_dxy_h["Close"].iloc[-2])) / float(_dxy_h["Close"].iloc[-2]) * 100
+                _dxy_sig = ("EM/Au↓" if _dxy_c > 0.3 else ("EM/Au↑" if _dxy_c < -0.3 else "Neutral"))
+                _macro_events.append(("DXY", f"{_dxy_v:.1f}{_dxy_c:+.1f}%", _dxy_sig))
         except Exception: pass
 
-        # 10Y yield — key rate signal
+        # 10Y yield
         try:
             _tnx_h = yf.Ticker("^TNX").history(period="5d")
             if len(_tnx_h) >= 2:
                 _tnx_v = float(_tnx_h["Close"].iloc[-1])
-                _tnx_c = float(_tnx_h["Close"].iloc[-1]) - float(_tnx_h["Close"].iloc[-2])
-                _tnx_imp = ("Rates rising → short REITs/growth, long banks" if _tnx_c > 0.05 else
-                            "Rates falling → long REITs/utilities, short banks" if _tnx_c < -0.05 else "Stable")
-                _macro_events.append(("10Y Yield", f"{_tnx_v:.2f}% ({_tnx_c:+.2f})", _tnx_imp))
+                _tnx_c = _tnx_v - float(_tnx_h["Close"].iloc[-2])
+                _tnx_sig = ("Bnk↑REIT↓" if _tnx_c > 0.05 else ("REIT↑Bnk↓" if _tnx_c < -0.05 else "Stable"))
+                _macro_events.append(("10Y", f"{_tnx_v:.2f}%{_tnx_c:+.2f}", _tnx_sig))
         except Exception: pass
 
-        # Crude Oil — energy & consumer impact
+        # Crude Oil
         try:
             _oil_h = yf.Ticker("CL=F").history(period="5d")
             if len(_oil_h) >= 2:
-                _oil_c = (float(_oil_h["Close"].iloc[-1]) - float(_oil_h["Close"].iloc[-2])) / float(_oil_h["Close"].iloc[-2]) * 100
-                _oil_imp = ("Oil up → long XLE/CVX, short DAL/airlines" if _oil_c > 1.5 else
-                            "Oil down → long DAL/LUV, short XLE" if _oil_c < -1.5 else "Neutral")
-                _macro_events.append(("Crude Oil", f"${float(_oil_h['Close'].iloc[-1]):.1f} ({_oil_c:+.1f}%)", _oil_imp))
+                _oil_v = float(_oil_h["Close"].iloc[-1])
+                _oil_c = (_oil_v - float(_oil_h["Close"].iloc[-2])) / float(_oil_h["Close"].iloc[-2]) * 100
+                _oil_sig = ("XLE↑DAL↓" if _oil_c > 1.5 else ("DAL↑XLE↓" if _oil_c < -1.5 else "Neutral"))
+                _macro_events.append(("Oil", f"${_oil_v:.1f}{_oil_c:+.1f}%", _oil_sig))
         except Exception: pass
 
-        # VIX — vol regime
+        # VIX vol regime
         try:
             _vix_h = yf.Ticker("^VIX").history(period="5d")
             if len(_vix_h) >= 1:
                 _vix_v = float(_vix_h["Close"].iloc[-1])
-                _vix_imp = ("VIX>30 extreme fear → buy dips, sell premium" if _vix_v > 30 else
-                            "VIX>20 elevated → hedge positions, reduce size" if _vix_v > 20 else
-                            "VIX calm → sell premium, iron condors")
-                _macro_events.append(("VIX", f"{_vix_v:.1f}", _vix_imp))
+                _vix_sig = ("BuyDips" if _vix_v > 30 else ("Hedge" if _vix_v > 20 else "SellPrm"))
+                _macro_events.append(("VIX", f"{_vix_v:.1f}", _vix_sig))
         except Exception: pass
 
         if _macro_events:
-            _mhdr2 = ["Indicator", "Value", "Trade Idea"]
-            _mfw2 = [max(len(_mhdr2[i]), max(len(str(r[i])) for r in _macro_events)) for i in range(3)]
-            _mfw2[2] = min(_mfw2[2], 42)  # cap note width
-            _mj2 = lambda i, v: v.ljust(_mfw2[i]) if i < 2 else v[:_mfw2[2]].ljust(_mfw2[2])
+            # Compact 3-col table: Ind(7) | Val(9) | Signal(9) = ~30 chars total
+            _mhdr2 = ["Ind", "Val", "Signal"]
+            _mfw2 = [
+                max(len(_mhdr2[0]), max(len(r[0]) for r in _macro_events)),
+                max(len(_mhdr2[1]), max(len(r[1]) for r in _macro_events)),
+                max(len(_mhdr2[2]), max(len(r[2]) for r in _macro_events)),
+            ]
+            _mj2 = lambda i, v: v.ljust(_mfw2[i]) if i == 0 else v.rjust(_mfw2[i]) if i == 1 else v.ljust(_mfw2[i])
             _msep2 = "-+-".join("-" * w for w in _mfw2)
-            _ml2 = ["MACRO & TRADE IDEAS",
+            _ml2 = ["MACRO SIGNALS",
                     " | ".join(_mj2(i, _mhdr2[i]) for i in range(3)), _msep2]
             for r in _macro_events:
-                _ml2.append(" | ".join(_mj2(i, str(r[i])) for i in range(3)))
+                _ml2.append(" | ".join(_mj2(i, r[i]) for i in range(3)))
             parts.append("<pre>" + "\n".join(_ml2) + "</pre>")
     except Exception as _mce:
         log.warning(f"morning macro section failed: {_mce}")
