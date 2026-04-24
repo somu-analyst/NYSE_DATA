@@ -4013,6 +4013,7 @@ async def inst_signals_detail(query, ticker):
 
     spot = sig.get("notional", {}).get("avg_spot", 0) if sig.get("notional") else 0
     parts = [hdr(f"INSTITUTIONAL SIGNALS -- {tk}")]
+    parts.append("<i>Max Pain = strike where most options expire worthless. Gamma Walls = high-OI strikes where dealers hedge hard, acting as price magnets/barriers.</i>")
 
     # 1. Max Pain
     mp_list = sig.get("max_pain", [])
@@ -4332,6 +4333,7 @@ async def mean_rev_detail(query, ticker):
     conn.close()
 
     parts = [hdr(f"MEAN REVERSION / Z-SCORE -- {tk}")]
+    parts.append("<i>PCR = Put/Call Ratio. Z-score = how far from normal (|Z|>2 = extreme). Composite &gt;+3 \u2192 consider LONG, &lt;-3 \u2192 consider SHORT.</i>")
     any_data = False
 
     # 1. PCR Z-Score
@@ -5972,7 +5974,7 @@ async def oi_change_chart_eod_view(query, ticker):
     try:
         await query.message.reply_photo(
             photo=chart_buf,
-            caption=f"📊 <b>{ticker} OI Change Analysis (EOD)</b>\n{prev_date} → {today_date}\n\nNext 2 Expiries Comparison",
+            caption=f"📊 <b>{ticker} OI Change Analysis (EOD)</b>\n{prev_date} → {today_date}\n\n🟦 Blue=Calls above 0 · 🟥 Red=Puts below 0\nTaller bars = more contracts. Call OI rising = bullish flow. Put OI rising = bearish/hedge flow.",
             parse_mode=H
         )
         kb = InlineKeyboardMarkup([
@@ -6250,10 +6252,11 @@ async def oi_change_chart_live_view(query, ticker):
         
         await query.message.reply_photo(
             photo=chart_buf,
-            caption=f"🔴 <b>{ticker} LIVE OI vs Last EOD</b>\n\n"
-                   f"EOD Date: {eod_date}\n"
-                   f"Live Pull: {now_time}\n\n"
-                   f"Next 2 Expiries Comparison",
+            caption=f"🔴 <b>{ticker} LIVE OI vs Last EOD</b>\n"
+                   f"EOD: {eod_date} · Live: {now_time}\n\n"
+                   f"🟦 Blue=Calls(above 0) · 🟥 Red=Puts(below 0)\n"
+                   f"Striped=yesterday · Solid=live now\n"
+                   f"Call OI growing = bullish flow. Put OI growing = bearish/hedge.",
             parse_mode=H
         )
         kb = InlineKeyboardMarkup([
@@ -13246,6 +13249,7 @@ async def inst_signals_detail(query, ticker):
 
     spot = sig.get("notional", {}).get("avg_spot", 0) if sig.get("notional") else 0
     parts = [hdr(f"INSTITUTIONAL SIGNALS -- {tk}")]
+    parts.append("<i>Max Pain = strike where most options expire worthless. Gamma Walls = high-OI strikes where dealers hedge hard, acting as price magnets/barriers.</i>")
 
     # 1. Max Pain
     mp_list = sig.get("max_pain", [])
@@ -13565,6 +13569,7 @@ async def mean_rev_detail(query, ticker):
     conn.close()
 
     parts = [hdr(f"MEAN REVERSION / Z-SCORE -- {tk}")]
+    parts.append("<i>PCR = Put/Call Ratio. Z-score = how far from normal (|Z|>2 = extreme). Composite &gt;+3 \u2192 consider LONG, &lt;-3 \u2192 consider SHORT.</i>")
     any_data = False
 
     # 1. PCR Z-Score
@@ -15205,7 +15210,7 @@ async def oi_change_chart_eod_view(query, ticker):
     try:
         await query.message.reply_photo(
             photo=chart_buf,
-            caption=f"📊 <b>{ticker} OI Change Analysis (EOD)</b>\n{prev_date} → {today_date}\n\nNext 2 Expiries Comparison",
+            caption=f"📊 <b>{ticker} OI Change Analysis (EOD)</b>\n{prev_date} → {today_date}\n\n🟦 Blue=Calls above 0 · 🟥 Red=Puts below 0\nTaller bars = more contracts. Call OI rising = bullish flow. Put OI rising = bearish/hedge flow.",
             parse_mode=H
         )
         kb = InlineKeyboardMarkup([
@@ -15483,10 +15488,11 @@ async def oi_change_chart_live_view(query, ticker):
         
         await query.message.reply_photo(
             photo=chart_buf,
-            caption=f"🔴 <b>{ticker} LIVE OI vs Last EOD</b>\n\n"
-                   f"EOD Date: {eod_date}\n"
-                   f"Live Pull: {now_time}\n\n"
-                   f"Next 2 Expiries Comparison",
+            caption=f"🔴 <b>{ticker} LIVE OI vs Last EOD</b>\n"
+                   f"EOD: {eod_date} · Live: {now_time}\n\n"
+                   f"🟦 Blue=Calls(above 0) · 🟥 Red=Puts(below 0)\n"
+                   f"Striped=yesterday · Solid=live now\n"
+                   f"Call OI growing = bullish flow. Put OI growing = bearish/hedge.",
             parse_mode=H
         )
         kb = InlineKeyboardMarkup([
