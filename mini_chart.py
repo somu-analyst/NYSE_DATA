@@ -10,9 +10,15 @@ def make_mini_chart(ticker: str, days: int = 7) -> bytes:
     tk = yf.Ticker(ticker)
     hist = tk.history(period=f"{days}d")
 
+    close = hist["Close"]
+    y_min = float(close.min())
+    y_max = float(close.max())
+    pad   = (y_max - y_min) * 0.05 or y_min * 0.005  # 5% padding, fallback for flat data
+
     fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
-    ax.plot(hist.index, hist["Close"], color="#00aaff", linewidth=1.5)
-    ax.fill_between(hist.index, hist["Close"], alpha=0.15, color="#00aaff")
+    ax.plot(close.index, close, color="#00aaff", linewidth=1.5)
+    ax.fill_between(close.index, close, alpha=0.15, color="#00aaff")
+    ax.set_ylim(y_min - pad, y_max + pad)
     ax.set_title(ticker, fontsize=9, color="white", pad=3)
     ax.tick_params(axis="both", labelsize=6, colors="gray")
     ax.spines[:].set_visible(False)
