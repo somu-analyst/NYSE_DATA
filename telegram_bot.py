@@ -26,6 +26,41 @@ async def group_stock_detail(query, ticker):
     if spot:
         parts.append(f"<b>Spot:</b> ${spot:.2f}\n")
 
+    # IV Rank + Earnings warning
+    try:
+        _tkr_iv = yf.Ticker(ticker)
+        _h_iv = _tkr_iv.history(period="1y")
+        if len(_h_iv) >= 60:
+            _lr_iv = np.log(_h_iv["Close"] / _h_iv["Close"].shift(1)).dropna()
+            _hv_iv = _lr_iv.rolling(20).std() * np.sqrt(252)
+            _hvc_iv = float(_hv_iv.iloc[-1]) if not pd.isna(_hv_iv.iloc[-1]) else None
+            if _hvc_iv:
+                _hvc2 = _hv_iv.dropna()
+                _ivr = (_hvc_iv - float(_hvc2.min())) / (float(_hvc2.max()) - float(_hvc2.min()) + 1e-9) * 100
+                _ivl = "HIGH" if _ivr > 75 else ("LOW" if _ivr < 25 else "MID")
+                _iva = "sell premium" if _ivr > 75 else ("buy premium" if _ivr < 25 else "standard approach")
+                parts.append(f"<b>IV Rank:</b> {_ivr:.0f}% {_ivl} -> favour {_iva}\n")
+
+    except Exception:
+        pass
+    try:
+        _cal_iv = yf.Ticker(ticker).calendar
+        _earn_d = None
+        if isinstance(_cal_iv, dict):
+            _ed_iv = _cal_iv.get("Earnings Date")
+            if _ed_iv:
+                _ed_iv = pd.to_datetime(_ed_iv[0] if isinstance(_ed_iv, list) else _ed_iv)
+                _earn_d = (_ed_iv.date() - datetime.now().date()).days
+        elif hasattr(_cal_iv, "loc") and "Earnings Date" in _cal_iv.index:
+            _ed_iv = pd.to_datetime(_cal_iv.loc["Earnings Date"].iloc[0])
+            _earn_d = (_ed_iv.date() - datetime.now().date()).days
+        if _earn_d is not None and 0 <= _earn_d < 30:
+            parts.append(f"<b>EARNINGS IN {_earn_d} DAYS</b> - IV crush risk.\n")
+
+    except Exception:
+        pass
+
+
     leg_advice = []
 
     for _, trade in trades_df.iterrows():
@@ -75,18 +110,62 @@ async def group_stock_detail(query, ticker):
 
     leg_advice.sort(key=lambda x: x[0])
 
-    for (priority, pnl, advice, tid, ot, st, entry, exp, qty, cur, pnl_pct, dte, side_s, em) in leg_advice:
+    r_rate = 0.05
+    for leg_idx, (priority, pnl, advice, tid, ot, st, entry, exp, qty, cur, pnl_pct, dte, side_s, em) in enumerate(leg_advice):
         pnl_s = f"${pnl:+,.0f} ({pnl_pct:+.0f}%)"
+        side_label = "BUY" if side_s == "LONG" else "SELL"
+        abs_qty = abs(qty)
+
+        # Greeks via B-S
+        greek_line = ""
+        try:
+            T = max(dte / 365, 1/365)
+            _chain = yf.Ticker(ticker).option_chain(exp)
+            _df_c = _chain.puts if ot == "PUT" else _chain.calls
+            _row = _df_c.iloc[(_df_c["strike"] - st).abs().argsort()[:1]]
+            iv = float(_row["impliedVolatility"].iloc[0]) if not _row.empty else 0.25
+            g = bs_greeks(spot, st, T, r_rate, iv, opt=ot.lower())
+            delta_sign = "+" if g["delta"] >= 0 else ""
+            theta_day = g["theta"] * abs_qty * 100
+            greek_line = f"   Δ:{delta_sign}{g['delta']:.3f}  Θ:${theta_day:.2f}/d  γ:{g['gamma']:.4f}  IV:{iv*100:.0f}%"
+        except Exception:
+            pass
+
+        # Price context explanation
+        price_move = cur - entry
+        price_move_pct = (price_move / entry * 100) if entry > 0 else 0
+        price_dir = "↑" if price_move >= 0 else "↓"
+        price_context = (
+            f"Option premium: paid ${entry:.2f}, now ${cur:.2f} "
+            f"({price_dir}{abs(price_move_pct):.0f}% move in option value)"
+        )
+
+        btn_row = [
+            InlineKeyboardButton(f"↳ Close L{leg_idx+1}: {side_label} {ot} ${st:.0f}",
+                                 callback_data=f"exitmc|{ticker}|{ot.lower()}|{st}|{entry}|{exp}|{qty}")
+        ]
+
         parts.append(
-            f"{em} <b>#{tid} {ot} ${st:.0f} [{side_s}]</b>  DTE:{dte}\n"
-            f"   Entry ${entry:.2f} → Now ${cur:.2f}  |  P&L <b>{pnl_s}</b>\n"
-            f"   {advice}"
+            f"{em} <b>L{leg_idx+1}: {side_label} {ot} ${st:.0f}  exp {exp}  ×{abs_qty}</b>  DTE:{dte}\n"
+            f"   {em} P&L <b>{pnl_s}</b>\n"
+            f"   📌 {price_context}\n"
+            f"   💡 {advice}"
+            + (f"\n{greek_line}" if greek_line else "")
         )
 
     net_em = "🟢" if total_pnl >= 0 else "🔴"
-    parts.append(f"\n{net_em} <b>Net P&L: ${total_pnl:+,.0f}</b>")
+    net_qty = trades_df["quantity"].apply(lambda x: int(x or 1)).sum()
+    parts.append(f"\n{net_em} <b>Group P&L: ${total_pnl:+,.0f}</b>  ({len(leg_advice)} legs, net qty: {net_qty:+d})")
 
-    btn_rows = [[InlineKeyboardButton("⬅️ Groups", callback_data="menu_groups"), BACK_BTN]]
+    # Per-leg close buttons
+    close_btns = []
+    for leg_idx, (priority, pnl, advice, tid, ot, st, entry, exp, qty, cur, pnl_pct, dte, side_s, em) in enumerate(leg_advice):
+        side_label = "BUY" if side_s == "LONG" else "SELL"
+        close_btns.append([InlineKeyboardButton(
+            f"↳ Close/Edit L{leg_idx+1}: {side_label} {ot} ${st:.0f}",
+            callback_data=f"exitmc|{ticker}|{ot.lower()}|{st}|{entry}|{exp}|{abs(qty)}"
+        )])
+    btn_rows = close_btns + [[InlineKeyboardButton("⬅️ Groups", callback_data="menu_groups"), BACK_BTN]]
     await query.message.reply_text("\n\n".join(parts), parse_mode=H, reply_markup=InlineKeyboardMarkup(btn_rows))
 import importlib.util
 import sys
@@ -1590,12 +1669,15 @@ async def market_overview(query):
     for _sec, name, d, tag in all_rows:
         sections[_sec].append((name, d, tag))
 
+    # Global column widths so all sections align at the same vertical positions
+    all_items_flat = [(n, d, t) for _, sec_items in sections.items() for n, d, t in sec_items]
+    name_w  = max(len(n) for n, _, _ in all_items_flat)
+    price_w = max((len(d["px_s"]) if d else 3) for _, d, _ in all_items_flat)
+
     colour_lines = []
     for sec_name, items in sections.items():
         colour_lines.append(shdr(sec_name))
         pre_rows = []
-        name_w = max(len(n) for n, _, _ in items)
-        price_w = max((len(d["px_s"]) if d else 3) for _, d, _ in items)
         for name, d, tag in items:
             if d:
                 arrow = _col_arrow(d["chg"])
@@ -1806,6 +1888,12 @@ async def exit_planner_menu(query):
         data = f"exitmc|{tk}|{ot}|{st}|{ep}|{ex}|{qty}"
         btns.append([InlineKeyboardButton(label, callback_data=data)])
     btns.append([BACK_BTN])
+    # Batch mode buttons
+    tickers_open = sorted(open_trades["ticker"].unique())
+    batch_top = [[InlineKeyboardButton("📊 All Positions Summary", callback_data="exit_batch_all")]]
+    if len(tickers_open) > 1:
+        batch_top.append([InlineKeyboardButton(f"🏢 {t}", callback_data=f"exit_batch_tk|{t}") for t in tickers_open[:4]])
+    btns = batch_top + [[InlineKeyboardButton("── Individual ──", callback_data="noop")]] + btns
     await query.message.reply_text(
         f"{hdr('🎯 EXIT PLANNER')}\n\nSelect a position to analyze:",
         parse_mode=H, reply_markup=InlineKeyboardMarkup(btns),
@@ -7383,6 +7471,223 @@ async def position_monitor_adhoc(query, ctx):
         await query.message.reply_text(f"Position monitor error: {e}", parse_mode=H)
 
 
+
+# ═══════════════════════════════════════════════════════════════════
+# ── LIVE MOMENTUM SCANNER ENGINE
+# ═══════════════════════════════════════════════════════════════════
+
+SCAN_UNIVERSE = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","AVGO","ORCL",
+    "AMD","MRVL","MU","QCOM","INTC","ARM","SMCI","ON","TXN","AMAT","LRCX","KLAC",
+    "PLTR","SNOW","NET","CRWD","ZS","DDOG","PANW","NOW","OKTA","FTNT",
+    "JPM","GS","MS","BAC","V","MA","PYPL","COIN","HOOD",
+    "TSLA","RIVN","LCID","ENPH","FSLR","NEE",
+    "LLY","ABBV","MRNA","BIIB","PFE","GILD",
+    "COST","WMT","TGT","NKE",
+    "MSTR","RKLB","SOFI","IBIT","SQQQ","TQQQ",
+    "SPY","QQQ","IWM","XLK","XLE","GLD","SLV","USO",
+]
+
+
+def _live_momentum_scanner(top_n: int = 5):
+    """Scan SCAN_UNIVERSE for bull runners and breakdown stocks. Returns (bull_list, bear_list)."""
+    import warnings; warnings.filterwarnings("ignore")
+    try:
+        raw = yf.download(
+            tickers=" ".join(SCAN_UNIVERSE),
+            period="60d", interval="1d",
+            group_by="ticker", auto_adjust=True,
+            progress=False, threads=True,
+        )
+    except Exception as e:
+        log.warning(f"momentum scanner download failed: {e}")
+        return [], []
+
+    results = []
+    for tk in SCAN_UNIVERSE:
+        try:
+            h = raw[tk] if tk in raw.columns.get_level_values(0) else pd.DataFrame()
+            if h.empty or len(h) < 10:
+                continue
+            h = h.dropna(subset=["Close"])
+            if len(h) < 10:
+                continue
+            close   = float(h["Close"].iloc[-1])
+            vol_now = float(h["Volume"].iloc[-1])
+            vol_20d = float(h["Volume"].iloc[-21:-1].mean()) if len(h) > 21 else vol_now
+            ret_5d  = (close / float(h["Close"].iloc[-6])  - 1) * 100 if len(h) > 5  else 0
+            ret_10d = (close / float(h["Close"].iloc[-11]) - 1) * 100 if len(h) > 10 else 0
+            ret_20d = (close / float(h["Close"].iloc[-21]) - 1) * 100 if len(h) > 20 else 0
+            vol_rat = vol_now / max(vol_20d, 1)
+            closes  = h["Close"].values
+            consec_up = consec_dn = 0
+            for i in range(len(closes) - 1, 0, -1):
+                if closes[i] > closes[i - 1]: consec_up += 1
+                else: break
+            for i in range(len(closes) - 1, 0, -1):
+                if closes[i] < closes[i - 1]: consec_dn += 1
+                else: break
+            high_20d = float(h["High"].iloc[-20:].max())
+            low_20d  = float(h["Low"].iloc[-20:].min())
+            atr      = float((h["High"] - h["Low"]).rolling(14).mean().iloc[-1])
+            momentum  = ret_5d * 3 + ret_10d * 2 + ret_20d
+            vol_bonus = 20 if vol_rat >= 2.5 else (12 if vol_rat >= 2.0 else (5 if vol_rat >= 1.5 else 0))
+            if momentum > 0: momentum += vol_bonus
+            elif momentum < 0: momentum -= vol_bonus
+            results.append(dict(
+                ticker=tk, close=close, ret_5d=ret_5d, ret_10d=ret_10d,
+                ret_20d=ret_20d, vol_rat=vol_rat, consec_up=consec_up,
+                consec_dn=consec_dn, momentum=momentum, atr=max(atr, close * 0.01),
+                high_20d=high_20d, low_20d=low_20d, pcr=1.0,
+            ))
+        except Exception:
+            continue
+
+    if not results:
+        return [], []
+    df = pd.DataFrame(results)
+    try:
+        conn = get_conn()
+        for idx, row in df.iterrows():
+            _p = pd.read_sql(
+                "SELECT pcr_oi FROM stock_daily WHERE ticker=? ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                conn, params=(row["ticker"],))
+            if not _p.empty and _p["pcr_oi"].iloc[0]:
+                df.at[idx, "pcr"] = float(_p["pcr_oi"].iloc[0])
+        conn.close()
+    except Exception:
+        pass
+    df = df.sort_values("momentum", ascending=False)
+    bull = df[df["momentum"] > 15].head(top_n).to_dict("records")
+    bear = df[df["momentum"] < -15].tail(top_n).iloc[::-1].to_dict("records")
+    return bull, bear
+
+
+def _signal_strength(rec: dict, direction: str) -> int:
+    r5   = abs(rec.get("ret_5d", 0))
+    r20  = abs(rec.get("ret_20d", 0))
+    vr   = rec.get("vol_rat", 1.0)
+    pcr  = rec.get("pcr", 1.0)
+    cons = rec.get("consec_up" if direction == "BULL" else "consec_dn", 0)
+    s = int(r5 / 2 + r20 / 5 +
+            (3 if vr >= 2.5 else 2 if vr >= 2.0 else 1 if vr >= 1.5 else 0) +
+            (1 if (direction == "BULL" and pcr < 0.7) or (direction == "BEAR" and pcr > 1.3) else 0) +
+            (1 if cons >= 3 else 0))
+    return max(1, min(10, s))
+
+
+def _format_trade_signal(rec: dict, direction: str) -> str:
+    """Format scanner pick as portfolio-manager trade signal card (Telegram HTML)."""
+    tk    = rec["ticker"]
+    close = rec["close"]
+    atr   = rec.get("atr", close * 0.02)
+    r5    = rec.get("ret_5d", 0)
+    r10   = rec.get("ret_10d", 0)
+    r20   = rec.get("ret_20d", 0)
+    vr    = rec.get("vol_rat", 1.0)
+    pcr   = rec.get("pcr", 1.0)
+    cons  = rec.get("consec_up" if direction == "BULL" else "consec_dn", 0)
+    h20   = rec.get("high_20d", close)
+    l20   = rec.get("low_20d", close)
+    ss    = _signal_strength(rec, direction)
+    stars = "⭐" * min(ss, 5) + ("+" if ss > 5 else "")
+    pcr_s = f"PCR {pcr:.2f} {'🟢' if pcr < 0.7 else '🔴' if pcr > 1.3 else '⚪'}"
+    if direction == "BULL":
+        stop  = round(max(close - atr * 1.8, l20 * 0.99), 2)
+        t1    = round(close + atr * 2.0, 2)
+        t2    = round(close + atr * 4.5, 2)
+        entry = f"${close - atr*0.3:.1f}–${close + atr*0.2:.1f}"
+        ph    = round(close * 0.97, 0)
+        pl    = round(stop  * 0.97, 0)
+        rr    = (t1 - close) / max(close - stop, 0.01)
+        em    = "🚀" if ss >= 8 else ("📈" if ss >= 5 else "↗️")
+        tag   = "UNSTOPPABLE" if r5 > 15 else ("BULL RUNNER" if r5 > 7 else "BUILDING")
+        return "\n".join([
+            f"{em} <b>{tk}  ${close:.2f}</b>  ·  <b>{tag}</b>  [{stars}]",
+            f"  Momentum · 5d {r5:+.1f}%  10d {r10:+.1f}%  20d {r20:+.1f}%",
+            f"  Vol {vr:.1f}×avg · {cons}d consec up · {pcr_s}",
+            f"  20d range ${l20:.1f}–${h20:.1f}",
+            f"  📥 Entry {entry}",
+            f"  🛑 Stop  ${stop:.2f} ({(stop/close-1)*100:.1f}%)  ·  R:R 1:{rr:.1f}",
+            f"  🎯 T1 ${t1:.2f} ({(t1/close-1)*100:+.1f}%)  ·  T2 ${t2:.2f} ({(t2/close-1)*100:+.1f}%)",
+            f"  🛡 Hedge: Buy ${ph:.0f}p/Sell ${pl:.0f}p put spread (≥21DTE)",
+            f"  ⚠️ ≤2% NAV · Trail stop after T1 · Reduce if VIX>25",
+        ])
+    else:
+        stop  = round(min(close + atr * 1.8, h20 * 1.01), 2)
+        t1    = round(close - atr * 2.0, 2)
+        t2    = round(close - atr * 4.5, 2)
+        entry = f"${close - atr*0.2:.1f}–${close + atr*0.3:.1f} (bounce)"
+        ch    = round(close * 1.03, 0)
+        cl_   = round(stop  * 1.01, 0)
+        rr    = (close - t1) / max(stop - close, 0.01)
+        em    = "🔥" if ss >= 8 else ("📉" if ss >= 5 else "↘️")
+        tag   = "FALLING KNIFE" if r5 < -15 else ("BREAKDOWN" if r5 < -7 else "WEAKENING")
+        return "\n".join([
+            f"{em} <b>{tk}  ${close:.2f}</b>  ·  <b>{tag}</b>  [{stars}]",
+            f"  Momentum · 5d {r5:+.1f}%  10d {r10:+.1f}%  20d {r20:+.1f}%",
+            f"  Vol {vr:.1f}×avg · {cons}d consec dn · {pcr_s}",
+            f"  20d range ${l20:.1f}–${h20:.1f}",
+            f"  📥 Short entry {entry}",
+            f"  🛑 Stop  ${stop:.2f} ({(stop/close-1)*100:+.1f}%)  ·  R:R 1:{rr:.1f}",
+            f"  🎯 T1 ${t1:.2f} ({(t1/close-1)*100:+.1f}%)  ·  T2 ${t2:.2f} ({(t2/close-1)*100:+.1f}%)",
+            f"  🛡 Hedge: Buy ${ch:.0f}c/Sell ${cl_:.0f}c call spread (≥21DTE)",
+            f"  ⚠️ Puts ≥21DTE · Avoid expiry pins · Cover on gap-down open",
+        ])
+
+
+async def scanner_menu(query):
+    """On-demand live momentum scanner from Telegram button."""
+    _loading = await query.message.reply_text("🔍 Scanning 60+ tickers (~30s)...", parse_mode=H)
+    try:
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+        bull, bear = await loop.run_in_executor(None, lambda: _live_momentum_scanner(top_n=4))
+    except Exception as e:
+        try: await _loading.delete()
+        except Exception: pass
+        await query.message.reply_text(f"❌ Scanner error: {e}", parse_mode=H)
+        return
+
+    now_et = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)
+    parts  = [hdr(f"🚀 MOMENTUM SCANNER · {now_et.strftime('%H:%M ET')}")]
+    parts.append("<i>Live data · 60+ tickers · yfinance</i>")
+    if bull:
+        parts.append(f"\n{'━'*28}\n🟢 <b>BULLS / UNSTOPPABLE ({len(bull)})</b>")
+        for rec in bull:
+            parts.append("\n" + _format_trade_signal(rec, "BULL"))
+    else:
+        parts.append("\n🟢 No strong bull momentum right now.")
+    if bear:
+        parts.append(f"\n{'━'*28}\n🔴 <b>BEARS / FALLING ({len(bear)})</b>")
+        for rec in bear:
+            parts.append("\n" + _format_trade_signal(rec, "BEAR"))
+    else:
+        parts.append("\n🔴 No strong breakdown signals right now.")
+    parts.append("\n<i>⚠️ Algo signals only — verify with OI + news before trading.</i>")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="menu_scanner"),
+         InlineKeyboardButton("📡 MiroFish", callback_data="menu_mirofish")],
+        [BACK_BTN],
+    ])
+    try: await _loading.delete()
+    except Exception: pass
+    full = "\n".join(parts)
+    if len(full) > 4000:
+        chunks, cur = [], ""
+        for p in parts:
+            if len(cur) + len(p) + 1 > 3800:
+                chunks.append(cur); cur = p
+            else:
+                cur += "\n" + p
+        if cur: chunks.append(cur)
+        for i, chunk in enumerate(chunks):
+            _kb = kb if i == len(chunks) - 1 else InlineKeyboardMarkup([])
+            await query.message.reply_text(chunk, parse_mode=H, reply_markup=_kb)
+    else:
+        await query.message.reply_text(full, parse_mode=H, reply_markup=kb)
+
+
 async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
     """15-min scheduled alert: futures snapshot + OI changes for open position tickers."""
     # Only fire Mon-Fri during US market hours (14:30-21:00 UTC = 9:30 AM - 4:00 PM ET)
@@ -7656,6 +7961,27 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
         log.warning(f"intraday_alert OI query failed: {e}")
     finally:
         conn.close()
+
+    # ── Momentum scanner: top bull + bear signals ─────────────────
+    try:
+        import asyncio as _aio
+        _scan_bull, _scan_bear = await _aio.get_event_loop().run_in_executor(
+            None, lambda: _live_momentum_scanner(top_n=3))
+        if _scan_bull or _scan_bear:
+            parts.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            parts.append("🚀 <b>TOP MOMENTUM SIGNALS</b>")
+        if _scan_bull:
+            parts.append("🟢 <b>BULL RUNNERS</b>")
+            for _sr in _scan_bull:
+                parts.append(_format_trade_signal(_sr, "BULL"))
+        if _scan_bear:
+            parts.append("🔴 <b>FALLING / BREAKDOWN</b>")
+            for _sr in _scan_bear:
+                parts.append(_format_trade_signal(_sr, "BEAR"))
+        if _scan_bull or _scan_bear:
+            parts.append("<i>⚠️ Algo signals — verify with OI + news before trading.</i>")
+    except Exception as _se:
+        log.warning(f"intraday scanner failed: {_se}")
 
     parts.append(f"\n<i>🕐 Data pulled at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>")
     msg = "\n".join(parts)
@@ -8014,6 +8340,10 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await news_for_ticker(query, ticker)
         elif data == "menu_exit":
             await exit_planner_menu(query)
+        elif data == "exit_batch_all":
+            await exit_batch_all(query)
+        elif data.startswith("exit_batch_tk|"):
+            await exit_batch_ticker(query, data.split("|", 1)[1])
         elif data.startswith("exitmc|"):
             # exitmc|TICKER|type|strike|entry|expiry[|qty]
             parts_mc = data.split("|", 6)
@@ -8432,6 +8762,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await oi_detail(query, ticker)
         elif data == "menu_mirofish":
             await mirofish_menu(query)
+        elif data == "menu_scanner":
+            await scanner_menu(query)
         elif data.startswith("miro_pos_"):
             tid = _safe_int(data.replace("miro_pos_", ""), 0)
             await mirofish_position_detail(query, tid)
@@ -9504,6 +9836,41 @@ async def group_stock_detail(query, ticker):
     if spot:
         parts.append(f"<b>Spot:</b> ${spot:.2f}\n")
 
+    # IV Rank + Earnings warning
+    try:
+        _tkr_iv = yf.Ticker(ticker)
+        _h_iv = _tkr_iv.history(period="1y")
+        if len(_h_iv) >= 60:
+            _lr_iv = np.log(_h_iv["Close"] / _h_iv["Close"].shift(1)).dropna()
+            _hv_iv = _lr_iv.rolling(20).std() * np.sqrt(252)
+            _hvc_iv = float(_hv_iv.iloc[-1]) if not pd.isna(_hv_iv.iloc[-1]) else None
+            if _hvc_iv:
+                _hvc2 = _hv_iv.dropna()
+                _ivr = (_hvc_iv - float(_hvc2.min())) / (float(_hvc2.max()) - float(_hvc2.min()) + 1e-9) * 100
+                _ivl = "HIGH" if _ivr > 75 else ("LOW" if _ivr < 25 else "MID")
+                _iva = "sell premium" if _ivr > 75 else ("buy premium" if _ivr < 25 else "standard approach")
+                parts.append(f"<b>IV Rank:</b> {_ivr:.0f}% {_ivl} -> favour {_iva}\n")
+
+    except Exception:
+        pass
+    try:
+        _cal_iv = yf.Ticker(ticker).calendar
+        _earn_d = None
+        if isinstance(_cal_iv, dict):
+            _ed_iv = _cal_iv.get("Earnings Date")
+            if _ed_iv:
+                _ed_iv = pd.to_datetime(_ed_iv[0] if isinstance(_ed_iv, list) else _ed_iv)
+                _earn_d = (_ed_iv.date() - datetime.now().date()).days
+        elif hasattr(_cal_iv, "loc") and "Earnings Date" in _cal_iv.index:
+            _ed_iv = pd.to_datetime(_cal_iv.loc["Earnings Date"].iloc[0])
+            _earn_d = (_ed_iv.date() - datetime.now().date()).days
+        if _earn_d is not None and 0 <= _earn_d < 30:
+            parts.append(f"<b>EARNINGS IN {_earn_d} DAYS</b> - IV crush risk.\n")
+
+    except Exception:
+        pass
+
+
     leg_advice = []
 
     for _, trade in trades_df.iterrows():
@@ -9553,18 +9920,62 @@ async def group_stock_detail(query, ticker):
 
     leg_advice.sort(key=lambda x: x[0])
 
-    for (priority, pnl, advice, tid, ot, st, entry, exp, qty, cur, pnl_pct, dte, side_s, em) in leg_advice:
+    r_rate = 0.05
+    for leg_idx, (priority, pnl, advice, tid, ot, st, entry, exp, qty, cur, pnl_pct, dte, side_s, em) in enumerate(leg_advice):
         pnl_s = f"${pnl:+,.0f} ({pnl_pct:+.0f}%)"
+        side_label = "BUY" if side_s == "LONG" else "SELL"
+        abs_qty = abs(qty)
+
+        # Greeks via B-S
+        greek_line = ""
+        try:
+            T = max(dte / 365, 1/365)
+            _chain = yf.Ticker(ticker).option_chain(exp)
+            _df_c = _chain.puts if ot == "PUT" else _chain.calls
+            _row = _df_c.iloc[(_df_c["strike"] - st).abs().argsort()[:1]]
+            iv = float(_row["impliedVolatility"].iloc[0]) if not _row.empty else 0.25
+            g = bs_greeks(spot, st, T, r_rate, iv, opt=ot.lower())
+            delta_sign = "+" if g["delta"] >= 0 else ""
+            theta_day = g["theta"] * abs_qty * 100
+            greek_line = f"   Δ:{delta_sign}{g['delta']:.3f}  Θ:${theta_day:.2f}/d  γ:{g['gamma']:.4f}  IV:{iv*100:.0f}%"
+        except Exception:
+            pass
+
+        # Price context explanation
+        price_move = cur - entry
+        price_move_pct = (price_move / entry * 100) if entry > 0 else 0
+        price_dir = "↑" if price_move >= 0 else "↓"
+        price_context = (
+            f"Option premium: paid ${entry:.2f}, now ${cur:.2f} "
+            f"({price_dir}{abs(price_move_pct):.0f}% move in option value)"
+        )
+
+        btn_row = [
+            InlineKeyboardButton(f"↳ Close L{leg_idx+1}: {side_label} {ot} ${st:.0f}",
+                                 callback_data=f"exitmc|{ticker}|{ot.lower()}|{st}|{entry}|{exp}|{qty}")
+        ]
+
         parts.append(
-            f"{em} <b>#{tid} {ot} ${st:.0f} [{side_s}]</b>  DTE:{dte}\n"
-            f"   Entry ${entry:.2f} → Now ${cur:.2f}  |  P&L <b>{pnl_s}</b>\n"
-            f"   {advice}"
+            f"{em} <b>L{leg_idx+1}: {side_label} {ot} ${st:.0f}  exp {exp}  ×{abs_qty}</b>  DTE:{dte}\n"
+            f"   {em} P&L <b>{pnl_s}</b>\n"
+            f"   📌 {price_context}\n"
+            f"   💡 {advice}"
+            + (f"\n{greek_line}" if greek_line else "")
         )
 
     net_em = "🟢" if total_pnl >= 0 else "🔴"
-    parts.append(f"\n{net_em} <b>Net P&L: ${total_pnl:+,.0f}</b>")
+    net_qty = trades_df["quantity"].apply(lambda x: int(x or 1)).sum()
+    parts.append(f"\n{net_em} <b>Group P&L: ${total_pnl:+,.0f}</b>  ({len(leg_advice)} legs, net qty: {net_qty:+d})")
 
-    btn_rows = [[InlineKeyboardButton("⬅️ Groups", callback_data="menu_groups"), BACK_BTN]]
+    # Per-leg close buttons
+    close_btns = []
+    for leg_idx, (priority, pnl, advice, tid, ot, st, entry, exp, qty, cur, pnl_pct, dte, side_s, em) in enumerate(leg_advice):
+        side_label = "BUY" if side_s == "LONG" else "SELL"
+        close_btns.append([InlineKeyboardButton(
+            f"↳ Close/Edit L{leg_idx+1}: {side_label} {ot} ${st:.0f}",
+            callback_data=f"exitmc|{ticker}|{ot.lower()}|{st}|{entry}|{exp}|{abs(qty)}"
+        )])
+    btn_rows = close_btns + [[InlineKeyboardButton("⬅️ Groups", callback_data="menu_groups"), BACK_BTN]]
     await query.message.reply_text("\n\n".join(parts), parse_mode=H, reply_markup=InlineKeyboardMarkup(btn_rows))
 import importlib.util
 import sys
@@ -11068,12 +11479,15 @@ async def market_overview(query):
     for _sec, name, d, tag in all_rows:
         sections[_sec].append((name, d, tag))
 
+    # Global column widths so all sections align at the same vertical positions
+    all_items_flat = [(n, d, t) for _, sec_items in sections.items() for n, d, t in sec_items]
+    name_w  = max(len(n) for n, _, _ in all_items_flat)
+    price_w = max((len(d["px_s"]) if d else 3) for _, d, _ in all_items_flat)
+
     colour_lines = []
     for sec_name, items in sections.items():
         colour_lines.append(shdr(sec_name))
         pre_rows = []
-        name_w = max(len(n) for n, _, _ in items)
-        price_w = max((len(d["px_s"]) if d else 3) for _, d, _ in items)
         for name, d, tag in items:
             if d:
                 arrow = _col_arrow(d["chg"])
@@ -11248,6 +11662,111 @@ async def market_headlines(query):
         "\n".join(parts), parse_mode=H, reply_markup=kb, disable_web_page_preview=True)
 
 
+
+async def _exit_batch_analysis(open_trades):
+    """Return compact text summary for a set of open trades."""
+    today = datetime.now().date()
+    lines = []
+    total_pnl = 0.0
+    for _, r in open_trades.iterrows():
+        try:
+            tk  = str(r['ticker']).upper()
+            ot  = str(r['option_type']).lower()
+            st  = float(r['strike'])
+            ep  = float(r['entry_price'])
+            qty = abs(int(r.get('quantity', 1) or 1))
+            ex  = str(r['expiry'])
+            try:
+                exp_dt = datetime.strptime(ex, '%Y-%m-%d').date()
+                dte = (exp_dt - today).days
+            except Exception:
+                dte = None
+            mid = None
+            try:
+                tk_obj = yf.Ticker(tk)
+                avail = tk_obj.options
+                exp_str = ex
+                if avail and ex not in avail:
+                    try:
+                        req_dt = datetime.strptime(ex, '%Y-%m-%d').date()
+                        avail_dts = [datetime.strptime(e, '%Y-%m-%d').date() for e in avail]
+                        exp_str = min(avail_dts, key=lambda d: abs((d - req_dt).days)).strftime('%Y-%m-%d')
+                    except Exception:
+                        pass
+                chain  = tk_obj.option_chain(exp_str)
+                df_c   = chain.puts if ot == 'put' else chain.calls
+                row_c  = df_c.iloc[(df_c['strike'] - st).abs().argsort()[:1]]
+                if not row_c.empty:
+                    bid = float(row_c['bid'].iloc[0])
+                    ask = float(row_c['ask'].iloc[0])
+                    mid = (bid + ask) / 2 if bid >= 0 and ask >= 0 else None
+            except Exception:
+                pass
+            if mid is not None:
+                pnl = (mid - ep) * qty * 100
+                pnl_pct = (mid - ep) / ep * 100 if ep > 0 else 0
+                total_pnl += pnl
+                if pnl_pct >= 50:
+                    sig = 'PROFIT'
+                elif pnl_pct <= -30:
+                    sig = 'CUT'
+                elif dte is not None and dte <= 5:
+                    sig = 'EXPIRY'
+                else:
+                    sig = 'HOLD'
+                dte_s = f'{dte}d' if dte is not None else '?'
+                lines.append(
+                    f'{sig} {tk} {ot[0].upper()} ${st:.0f} DTE:{dte_s}\n'
+                    f'  Entry:${ep:.2f} Now:${mid:.2f} P&L:{pnl_pct:+.0f}%')
+            else:
+                lines.append(f'{tk} {ot[0].upper()} ${st:.0f} no data')
+        except Exception:
+            continue
+    summary = '\n'.join(lines) if lines else 'No data available.'
+    if lines:
+        n_with_data = sum(1 for l in lines if 'no data' not in l)
+        winners = sum(1 for l in lines if 'P&L:+' in l or ('P&L:' in l and 'P&L:-' not in l and 'P&L:0' not in l))
+        losers = n_with_data - winners
+        em = '🟢' if total_pnl >= 0 else '🔴'
+        summary += f'\n\n{em} <b>Total P&L: ${total_pnl:+,.0f}</b>  ({winners}W/{losers}L of {n_with_data} legs)'
+    return summary
+
+
+async def exit_batch_all(query):
+    conn = get_conn()
+    open_trades = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", conn)
+    conn.close()
+    if open_trades.empty:
+        await query.message.reply_text('No open positions.', reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
+        return
+    _msg = await query.message.reply_text(f'Analysing {len(open_trades)} positions...', parse_mode=H)
+    summary = await _exit_batch_analysis(open_trades)
+    try: await _msg.delete()
+    except Exception: pass
+    await query.message.reply_text(
+        hdr('ALL POSITIONS SUMMARY') + f'\n\n<pre>{summary[:3800]}</pre>',
+        parse_mode=H, reply_markup=InlineKeyboardMarkup([[BACK_BTN]]),
+    )
+
+
+async def exit_batch_ticker(query, ticker):
+    conn = get_conn()
+    open_trades = pd.read_sql(
+        "SELECT * FROM trades WHERE status='OPEN' AND ticker=?", conn, params=(ticker,))
+    conn.close()
+    if open_trades.empty:
+        await query.message.reply_text(f'No open positions for {ticker}.', reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
+        return
+    _msg = await query.message.reply_text(f'Analysing {len(open_trades)} {ticker} position(s)...', parse_mode=H)
+    summary = await _exit_batch_analysis(open_trades)
+    try: await _msg.delete()
+    except Exception: pass
+    await query.message.reply_text(
+        hdr(f'{ticker} POSITIONS') + f'\n\n<pre>{summary[:3800]}</pre>',
+        parse_mode=H, reply_markup=InlineKeyboardMarkup([[BACK_BTN]]),
+    )
+
+
 # ═══════════════════════════════════════════════════════════
 #  3) EXIT PLANNER (MC simulation)
 # ═══════════════════════════════════════════════════════════
@@ -11284,6 +11803,12 @@ async def exit_planner_menu(query):
         data = f"exitmc|{tk}|{ot}|{st}|{ep}|{ex}|{qty}"
         btns.append([InlineKeyboardButton(label, callback_data=data)])
     btns.append([BACK_BTN])
+    # Batch mode buttons
+    tickers_open = sorted(open_trades["ticker"].unique())
+    batch_top = [[InlineKeyboardButton("📊 All Positions Summary", callback_data="exit_batch_all")]]
+    if len(tickers_open) > 1:
+        batch_top.append([InlineKeyboardButton(f"🏢 {t}", callback_data=f"exit_batch_tk|{t}") for t in tickers_open[:4]])
+    btns = batch_top + [[InlineKeyboardButton("── Individual ──", callback_data="noop")]] + btns
     await query.message.reply_text(
         f"{hdr('🎯 EXIT PLANNER')}\n\nSelect a position to analyze:",
         parse_mode=H, reply_markup=InlineKeyboardMarkup(btns),
@@ -16936,6 +17461,27 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
     finally:
         conn.close()
 
+    # ── Momentum scanner: top bull + bear signals ─────────────────
+    try:
+        import asyncio as _aio
+        _scan_bull, _scan_bear = await _aio.get_event_loop().run_in_executor(
+            None, lambda: _live_momentum_scanner(top_n=3))
+        if _scan_bull or _scan_bear:
+            parts.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            parts.append("🚀 <b>TOP MOMENTUM SIGNALS</b>")
+        if _scan_bull:
+            parts.append("🟢 <b>BULL RUNNERS</b>")
+            for _sr in _scan_bull:
+                parts.append(_format_trade_signal(_sr, "BULL"))
+        if _scan_bear:
+            parts.append("🔴 <b>FALLING / BREAKDOWN</b>")
+            for _sr in _scan_bear:
+                parts.append(_format_trade_signal(_sr, "BEAR"))
+        if _scan_bull or _scan_bear:
+            parts.append("<i>⚠️ Algo signals — verify with OI + news before trading.</i>")
+    except Exception as _se:
+        log.warning(f"intraday scanner failed: {_se}")
+
     parts.append(f"\n<i>🕐 Data pulled at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>")
     msg = "\n".join(parts)
     try:
@@ -17293,6 +17839,10 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await news_for_ticker(query, ticker)
         elif data == "menu_exit":
             await exit_planner_menu(query)
+        elif data == "exit_batch_all":
+            await exit_batch_all(query)
+        elif data.startswith("exit_batch_tk|"):
+            await exit_batch_ticker(query, data.split("|", 1)[1])
         elif data.startswith("exitmc|"):
             # exitmc|TICKER|type|strike|entry|expiry[|qty]
             parts_mc = data.split("|", 6)
@@ -17711,6 +18261,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await oi_detail(query, ticker)
         elif data == "menu_mirofish":
             await mirofish_menu(query)
+        elif data == "menu_scanner":
+            await scanner_menu(query)
         elif data.startswith("miro_pos_"):
             tid = _safe_int(data.replace("miro_pos_", ""), 0)
             await mirofish_position_detail(query, tid)
