@@ -193,6 +193,83 @@ def _cached_trades(status: str = None):
     params = [status] if status else []
     return q(sql, params)
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _iv_rank_pct(ticker: str):
+    """52-week IV rank and IV percentile using 20-day HV as IV proxy. Returns (rank, pct, cur_hv)."""
+    try:
+        h = yf.Ticker(ticker).history(period="1y")
+        if len(h) < 60:
+            return None, None, None
+        lr = np.log(h["Close"] / h["Close"].shift(1)).dropna()
+        hv = lr.rolling(20).std() * np.sqrt(252)
+        cur = float(hv.iloc[-1]) if not np.isnan(hv.iloc[-1]) else None
+        if cur is None:
+            return None, None, None
+        hv_clean = hv.dropna()
+        mn, mx = float(hv_clean.min()), float(hv_clean.max())
+        rank = round((cur - mn) / (mx - mn) * 100, 1) if mx > mn else 50.0
+        pct  = round(float((hv_clean <= cur).sum() / len(hv_clean) * 100), 1)
+        return rank, pct, round(cur * 100, 1)
+    except Exception:
+        return None, None, None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _days_to_earnings(ticker: str):
+    """Days to next earnings. Returns int or None."""
+    try:
+        cal = yf.Ticker(ticker).calendar
+        if cal is None:
+            return None
+        if isinstance(cal, dict):
+            ed = cal.get("Earnings Date")
+            if ed:
+                ed = pd.to_datetime(ed[0] if isinstance(ed, list) else ed)
+                days = (ed.date() - datetime.now().date()).days
+                return days if days >= 0 else None
+        elif hasattr(cal, "loc") and "Earnings Date" in cal.index:
+            ed = pd.to_datetime(cal.loc["Earnings Date"].iloc[0])
+            days = (ed.date() - datetime.now().date()).days
+            return days if days >= 0 else None
+    except Exception:
+        pass
+    return None
+
+def _roll_suggestion(leg: dict, spot: float) -> str:
+    """Generate a specific roll recommendation for a losing/expiring leg."""
+    dte = leg.get("DTE", 99)
+    pnl_pct = leg.get("PnL%", 0)
+    opt_type = leg.get("Type", "CALL")
+    strike = leg.get("Strike", 0)
+    qty = leg.get("Qty", 1)
+    side = "BUY" if qty > 0 else "SELL"
+
+    if dte > 21 and pnl_pct > -30:
+        return ""  # No roll needed yet
+
+    today = datetime.now().date()
+    # Target roll: next monthly expiry 30-45 days out
+    roll_dte = 35
+    target_month = today + timedelta(days=roll_dte)
+    # Find 3rd Friday of that month
+    first_day = target_month.replace(day=1)
+    fridays = [first_day + timedelta(days=d) for d in range(31) if (first_day + timedelta(days=d)).weekday() == 4]
+    roll_exp = fridays[2].strftime("%Y-%m-%d") if len(fridays) >= 3 else target_month.strftime("%Y-%m-%d")
+
+    # Suggest roll strike: ATM for losing positions, same strike for mild loss
+    if pnl_pct < -40:
+        roll_strike = round(spot / 5) * 5  # Round to nearest $5 = ATM
+        reason = "roll to ATM (stop digging deeper)"
+    elif pnl_pct < -20:
+        roll_strike = strike
+        reason = "roll same strike, extend time"
+    else:
+        roll_strike = strike
+        reason = "roll before theta accelerates"
+
+    action = "ROLL" if side == "BUY" else "ROLL SHORT"
+    return (f"🔄 {action} suggestion: Close {side} {opt_type} ${strike:.0f} exp now → "
+            f"Open {side} {opt_type} ${roll_strike:.0f} exp ~{roll_exp} ({reason})")
+
 # ---------------------------------------------------------------------------
 # MARKET SNAPSHOTS TABLE
 # ---------------------------------------------------------------------------
@@ -1233,6 +1310,21 @@ def advanced_oi_analysis(df, ticker, spot, td_now, td_prev):
 # ===================================================================
 # ──  SIDEBAR
 # ===================================================================
+_PAGE_HELP = {
+    "🌍 Market Overview":        "Big-picture market snapshot. VIX, sector rotation, Fear & Greed, macro correlations, and top OI movers. Start here every morning.",
+    "🔬 OI Comparison Charts":   "Deep-dive OI analysis per ticker and expiry. Compare Open Interest changes between two dates to spot institutional positioning, gamma walls, and money flow direction.",
+    "🔥 OI Analytics & Prediction": "AI-style OI signal engine. Runs 5-factor composite scoring (OI bias, PCR, volume, flow pattern, GEX) to generate BULLISH/BEARISH/NEUTRAL signals with next-day backtest.",
+    "🎯 Prop Trading Screen":    "Prop-desk style trade ideas. Scans for high-conviction setups using OI, PCR, and momentum filters — shows entry/exit levels and risk:reward.",
+    "💼 Portfolio & Suggestions": "Your open and closed positions. Track unrealized P&L, Greeks, IV rank, earnings alerts, and get per-leg roll suggestions. Add/close/edit trades here.",
+    "📊 Backtest Lab":           "Test OI-based trading signals against historical data. See what win rate and P&L your strategy would have produced over the selected date range.",
+    "🔮 Live Position Predictor": "Monte Carlo simulation for a single position. Models 10,000 price paths to estimate tomorrow's expected P&L, probability of profit, and VaR.",
+    "📈 Insider / Congress / Whales": "Track institutional money flows — SEC insider filings, congress trades, and dark pool / block order signals for the stocks you follow.",
+    "📰 News & Calendar":        "Economic calendar (FOMC, CPI, NFP, earnings) and live news feed. Know what events could move your positions before they happen.",
+    "⚡ Trade Risk Calculator":  "Pre-trade risk sizing tool. Enter entry price, stop loss, and account size to compute the correct number of contracts so you risk no more than 2% of capital.",
+    "🎯 Next-Day Exit Planner":  "Pre-market daily brief. Fetches live option mid-prices and tells you which positions to take profit, cut loss, or hold. Run every morning before market open.",
+    "🚀 Live Momentum Scanner":  "Intraday momentum scanner. Screens for tickers with unusual volume, OI spikes, or RSI extremes in real time — find the next big mover.",
+}
+
 with st.sidebar:
     st.markdown("## 📊 RUDRARJUN")
     st.markdown("##### *Options Intelligence Terminal*")
@@ -1250,17 +1342,34 @@ with st.sidebar:
         "📰 News & Calendar",
         "⚡ Trade Risk Calculator",
         "🎯 Next-Day Exit Planner",
+        "🚀 Live Momentum Scanner",
     ], label_visibility="collapsed")
 
+    st.markdown("---")
+    # Mini help for current page
+    if page in _PAGE_HELP:
+        st.info(f"**{page}**\n\n{_PAGE_HELP[page]}")
     st.markdown("---")
     st.caption(f"Data: Yahoo Finance + Local DB")
     st.caption(f"DB: US_data.db")
 
 
+# ── Page header helper ──────────────────────────────────────────────
+def _page_header(title: str, help_text: str = ""):
+    """Render a styled page header with optional help pill."""
+    h1, h2 = st.columns([5, 1])
+    with h1:
+        st.markdown(f"<h2 style='margin-bottom:2px'>{title}</h2>", unsafe_allow_html=True)
+    if help_text:
+        with h2:
+            with st.popover("ℹ️ Help"):
+                st.markdown(help_text)
+
 # ===================================================================
 # ──  PAGE 1: MARKET OVERVIEW
 # ===================================================================
 if page == "🌍 Market Overview":
+    _page_header("🌍 Market Overview", _PAGE_HELP["🌍 Market Overview"])
     # ── Controls row ──
     _ov_c1, _ov_c2, _ov_c3 = st.columns([3, 1, 1])
     with _ov_c1:
@@ -2172,6 +2281,8 @@ elif page == "🔥 OI Analytics & Prediction":
     with _hdr2:
         if st.button("🔄 Refresh", key="refresh_oi_analytics"):
             st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
 
     dates = available_trade_dates()
     if not dates:
@@ -2696,6 +2807,8 @@ elif page == "🎯 Prop Trading Screen":
     with _hdr2:
         if st.button("🔄 Refresh", key="refresh_prop"):
             st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
     st.markdown("*Institutional-grade opportunity scanner with risk assessment*")
 
     dates = available_trade_dates()
@@ -3038,7 +3151,7 @@ elif page == "🎯 Prop Trading Screen":
 # ──  PAGE 4: PORTFOLIO & SUGGESTIONS
 # ===================================================================
 elif page == "💼 Portfolio & Suggestions":
-    st.markdown("<h2>💼 Portfolio & Suggestions</h2>", unsafe_allow_html=True)
+    _page_header("💼 Portfolio & Suggestions", _PAGE_HELP["💼 Portfolio & Suggestions"])
 
     try:
         _conn = get_conn()
@@ -3163,26 +3276,59 @@ elif page == "💼 Portfolio & Suggestions":
             _nt=sum(r["Theta"] for r in updated_rows)
             _ws=sum(1 for r in updated_rows if r["PnL"]>0)
             _tpc=(_tp/_tc*100) if _tc>0 else 0
+            _ng=sum(r["Gamma"] for r in updated_rows)
+            _nv=sum(r["Vega"]  for r in updated_rows)
+            _max_tk_cost=max((sum(abs(l["Entry"])*abs(l["Qty"])*100 for l in v) for v in _tg.values()),default=0)
+            _conc_pct=(_max_tk_cost/_tc*100) if _tc>0 else 0
+            _conc_tk=max(_tg,key=lambda k:sum(abs(l["Entry"])*abs(l["Qty"])*100 for l in _tg[k]),default="")
             m1,m2,m3,m4,m5=st.columns(5)
             m1.metric("Unrealized P&L",f"${_tp:,.2f}",f"{_tpc:+.1f}%")
             m2.metric("Legs / Tickers",f"{len(updated_rows)} / {len(_tg)}")
             m3.metric("Winners",f"{_ws}/{len(updated_rows)}")
             m4.metric("Net Delta",f"{_nd:+.2f}")
             m5.metric("Net Theta/day",f"${_nt*100:+.2f}")
+            n1,n2,n3,n4,n5=st.columns(5)
+            n1.metric("Net Gamma",f"{_ng:.4f}")
+            n2.metric("Net Vega",f"{_nv:.3f}")
+            n3.metric("Cost Basis",f"${_tc:,.0f}")
+            _conc_flag="⚠️ " if _conc_pct>50 else ""
+            n4.metric(f"{_conc_flag}Largest Position",f"{_conc_tk} {_conc_pct:.0f}%",delta="Concentrated" if _conc_pct>50 else "Diversified",delta_color="inverse" if _conc_pct>50 else "normal")
+            # Earnings alerts across all tickers
+            _earn_alerts=[f"{tk} ⚠️{_days_to_earnings(tk)}d" for tk in _tg if (_days_to_earnings(tk) or 99)<14]
+            n5.metric("Earnings <14d",", ".join(_earn_alerts) if _earn_alerts else "None","Check before expiry" if _earn_alerts else "All clear")
 
             _grp_rows=[]
             for _stk,_legs in sorted(_tg.items()):
                 _gp=sum(l["PnL"] for l in _legs)
                 _gc=sum(abs(l["Entry"])*abs(l["Qty"])*100 for l in _legs)
                 _gpc=(_gp/_gc*100) if _gc>0 else 0
+                _iv_r,_iv_p,_iv_cur=_iv_rank_pct(_stk)
+                _dte_earn=_days_to_earnings(_stk)
+                _earn_warn="⚠️ "+str(_dte_earn)+"d" if _dte_earn is not None and _dte_earn<14 else (""+str(_dte_earn)+"d" if _dte_earn else "—")
+                _iv_str=f"{_iv_r:.0f}%" if _iv_r is not None else "—"
+                _iv_note=("🔥HIGH" if (_iv_r or 0)>75 else ("💤LOW" if (_iv_r or 100)<25 else "MID"))
+                _conc2=round(_gc/_tc*100,0) if _tc>0 else 0
                 _grp_rows.append({
                     "Ticker":_stk,"Stock $":round(_legs[0]["Stock_Px"],2),
                     "Strategy":_detect_strategy(_legs),"Legs":len(_legs),
                     "Group P&L $":round(_gp,2),"Group P&L %":round(_gpc,1),
                     "Net Delta":round(sum(l["Delta"] for l in _legs),3),
                     "Net Theta/d":round(sum(l["Theta"] for l in _legs)*100,2),
+                    "IV Rank":f"{_iv_str} {_iv_note}",
+                    "Earnings":_earn_warn,
+                    "Conc%":f"{_conc2:.0f}%",
                 })
             _gdf=pd.DataFrame(_grp_rows)
+            if _grp_rows:
+                _tot_row={
+                    "Ticker":"📊 TOTAL","Stock $":"","Strategy":f"{len(_grp_rows)} ticker(s)","Legs":sum(r["Legs"] for r in _grp_rows),
+                    "Group P&L $":round(sum(r["Group P&L $"] for r in _grp_rows),2),
+                    "Group P&L %":round(_tpc,1),
+                    "Net Delta":round(sum(r["Net Delta"] for r in _grp_rows),3),
+                    "Net Theta/d":round(sum(r["Net Theta/d"] for r in _grp_rows),2),
+                    "IV Rank":"","Earnings":"","Conc%":"100%",
+                }
+                _gdf=pd.concat([_gdf,pd.DataFrame([_tot_row])],ignore_index=True)
             st.markdown("#### Ticker Group Summary")
             try: st.dataframe(_gdf.style.applymap(_color_pnl,subset=["Group P&L $","Group P&L %"]),hide_index=True,use_container_width=True)
             except: st.dataframe(_gdf,hide_index=True,use_container_width=True)
@@ -3206,6 +3352,22 @@ elif page == "💼 Portfolio & Suggestions":
                     gc3.metric("Net Theta/d",f"${_ngt*100:+.2f}")
                     gc4.metric("Net Gamma",f"{_ngg:.4f}")
                     gc5.metric("Net Vega",f"{_ngv:.3f}")
+                    # IV rank + Earnings warning banner
+                    _iv_rk,_iv_pk,_iv_ck=_iv_rank_pct(_stk)
+                    _dte_e=_days_to_earnings(_stk)
+                    _info_parts=[]
+                    if _iv_rk is not None:
+                        _iv_label="🔥 HIGH IV" if _iv_rk>75 else ("💤 LOW IV" if _iv_rk<25 else "🟡 MID IV")
+                        _iv_action=("Sell premium / spreads are expensive — favour credit strategies" if _iv_rk>75
+                                    else "Buy premium is cheap — favour debit spreads or long options" if _iv_rk<25
+                                    else "IV is average — standard positioning applies")
+                        _info_parts.append(f"**IV Rank: {_iv_rk:.0f}% ({_iv_label}) | HV: {_iv_ck:.0f}%** — {_iv_action}")
+                    if _dte_e is not None and _dte_e < 30:
+                        _earn_color="#ff1744" if _dte_e<7 else ("#ff9800" if _dte_e<14 else "#1565C0")
+                        _info_parts.append(f"⚠️ EARNINGS IN {_dte_e} DAYS — IV typically spikes before earnings then collapses (IV crush). If holding long options through earnings, check if premium is worth the risk. Consider closing before or buying a cheaper spread.")
+                    if _info_parts:
+                        st.markdown("<br>".join(_info_parts),unsafe_allow_html=True)
+                        st.markdown("")
 
                     _ks=[l["Strike"] for l in _legs]
                     _sr=np.linspace(min(_ks)*0.80,max(_ks)*1.20,200)
@@ -3235,14 +3397,17 @@ elif page == "💼 Portfolio & Suggestions":
                     for _li,pos in enumerate(_legs):
                         _lc=_LC[_li%len(_LC)]; _sl="BUY" if pos["Qty"]>0 else "SELL"
                         _li2="🟢" if pos["PnL"]>=0 else "🔴"
+                        _roll_hint=_roll_suggestion(pos, _spv)
+                        _bg="#fff8e1" if pos["DTE"]<=5 else ("#ffebee" if pos["PnL%"]<-30 else "#fafafa")
                         st.markdown(
                             f"<div style='border-left:4px solid {_lc};padding:6px 12px;"
-                            f"margin:4px 0;border-radius:4px;background:#fafafa;'>"
+                            f"margin:4px 0;border-radius:4px;background:{_bg};'>"
                             f"<b>L{_li+1}: {_sl} {pos['Type']} ${pos['Strike']} exp {pos['Expiry']} ×{abs(pos['Qty'])}</b>"
                             f" &nbsp; {_li2} P&L <b>${pos['PnL']:+,.2f}</b> ({pos['PnL%']:+.1f}%)"
                             f" &nbsp; Entry ${pos['Entry']:.2f} → ${pos['Current']:.2f}"
                             f" &nbsp; DTE:{pos['DTE']} Δ:{pos['Delta']:+.3f} Θ:${pos['Theta']*100:.2f}/d"
-                            f"</div>",unsafe_allow_html=True)
+                            + (f"<br>{_roll_hint}" if _roll_hint else "")
+                            + f"</div>",unsafe_allow_html=True)
                         with st.expander(f"  ↳ Close/Edit L{_li+1}: {_sl} {pos['Type']} ${pos['Strike']}"):
                             _et1, _et2 = st.tabs(["✅ Close", "✏️ Edit"])
                             with _et1:
@@ -3343,16 +3508,46 @@ elif page == "💼 Portfolio & Suggestions":
             closed["pnl_f"]    =pd.to_numeric(closed.get("pnl",0),    errors="coerce").fillna(0)
             closed["pnl_pct_f"]=pd.to_numeric(closed.get("pnl_pct",0),errors="coerce").fillna(0)
             closed["exit_dt"]  =pd.to_datetime(closed.get("exit_date",""),errors="coerce")
+            closed["days_held_n"]=pd.to_numeric(closed.get("days_held",0),errors="coerce").fillna(0)
+            _wins=closed[closed["pnl_f"]>0]; _losses=closed[closed["pnl_f"]<=0]
+            _win_rate=(len(_wins)/len(closed)*100) if len(closed) else 0
+            _avg_win=_wins["pnl_f"].mean() if len(_wins) else 0
+            _avg_loss=_losses["pnl_f"].mean() if len(_losses) else 0
+            _rr=abs(_avg_win/_avg_loss) if _avg_loss!=0 else 0
+            _expect=(_win_rate/100*_avg_win + (1-_win_rate/100)*_avg_loss) if len(closed) else 0
             c1,c2,c3,c4=st.columns(4)
             c1.metric("Realized P&L",f"${closed['pnl_f'].sum():,.2f}")
-            c2.metric("Win Rate",f"{(closed['pnl_f']>0).sum()/len(closed)*100:.0f}%" if len(closed) else "N/A")
+            c2.metric("Win Rate",f"{_win_rate:.0f}%",f"{len(_wins)}W/{len(_losses)}L")
             c3.metric("Total Closed",len(closed))
             c4.metric("Avg P&L",f"${closed['pnl_f'].mean():,.2f}")
+            c5,c6,c7,c8=st.columns(4)
+            c5.metric("Avg Win",f"${_avg_win:,.2f}")
+            c6.metric("Avg Loss",f"${_avg_loss:,.2f}")
+            c7.metric("Risk:Reward",f"{_rr:.2f}:1",delta="Good" if _rr>=2 else "Poor",delta_color="normal" if _rr>=2 else "inverse")
+            c8.metric("Expectancy/Trade",f"${_expect:,.2f}",delta="Positive edge" if _expect>0 else "Negative edge",delta_color="normal" if _expect>0 else "inverse")
+            # Best / Worst trade
+            if len(closed)>0:
+                _best=closed.loc[closed["pnl_f"].idxmax()]
+                _worst=closed.loc[closed["pnl_f"].idxmin()]
+                bw1,bw2=st.columns(2)
+                bw1.success(f"🏆 Best: **{_best.get('ticker','')} {_best.get('option_type','').upper()} ${_best.get('strike','')}** — ${_best['pnl_f']:+,.2f} ({_best['pnl_pct_f']:+.0f}%) held {int(_best['days_held_n'])}d")
+                bw2.error(f"💀 Worst: **{_worst.get('ticker','')} {_worst.get('option_type','').upper()} ${_worst.get('strike','')}** — ${_worst['pnl_f']:+,.2f} ({_worst['pnl_pct_f']:+.0f}%) held {int(_worst['days_held_n'])}d")
+            st.markdown("#### Avg Hold Time by Outcome")
+            _hold_stats=closed.groupby(closed["pnl_f"]>0).agg(avg_days=("days_held_n","mean"),count=("pnl_f","count")).reset_index()
+            _hold_stats["Outcome"]=_hold_stats["pnl_f"].map({True:"Winners",False:"Losers"})
+            if not _hold_stats.empty:
+                st.dataframe(_hold_stats[["Outcome","avg_days","count"]].rename(columns={"avg_days":"Avg Days Held","count":"Count"}),hide_index=True,use_container_width=True)
 
             st.markdown("#### By Ticker")
             _tkc=(closed.groupby("ticker").agg(trades=("pnl_f","count"),total_pnl=("pnl_f","sum"),avg_pnl=("pnl_f","mean"),
                   win_rate=("pnl_f",lambda x:f"{(x>0).sum()/len(x)*100:.0f}%")).reset_index().sort_values("total_pnl",ascending=False))
             _tkc.columns=["Ticker","Trades","Total P&L","Avg P&L","Win%"]
+            _tkc_tot=pd.DataFrame([{
+                "Ticker":"📊 TOTAL","Trades":int(closed["pnl_f"].count()),
+                "Total P&L":closed["pnl_f"].sum(),"Avg P&L":closed["pnl_f"].mean(),
+                "Win%":f"{(closed['pnl_f']>0).sum()/len(closed)*100:.0f}%",
+            }])
+            _tkc=pd.concat([_tkc,_tkc_tot],ignore_index=True)
             try: st.dataframe(_tkc.style.applymap(_color_pnl,subset=["Total P&L","Avg P&L"]),hide_index=True,use_container_width=True)
             except: st.dataframe(_tkc,hide_index=True,use_container_width=True)
 
@@ -3422,11 +3617,15 @@ elif page == "💼 Portfolio & Suggestions":
                 elif _gpc2<-40:          _gr,_gcol="🔴 CUT LOSS","#ff1744"; _gd2=f"Group down {_gpc2:.1f}%. Manage risk."
                 elif abs(_nd2)<0.05:     _gr,_gcol="🟢 DELTA-NEUTRAL","#00c853"; _gd2="Well-hedged. Monitor theta decay."
                 else:                    _gr,_gcol="🟢 HOLD","#00c853"; _gd2=f"No action. Net Δ={_nd2:+.3f}, OI={_ob}."
+                _iv_rk2,_iv_pk2,_iv_ck2=_iv_rank_pct(_stk2)
+                _dte_e2=_days_to_earnings(_stk2)
+                _iv_badge=f" | IV Rank:{_iv_rk2:.0f}%({'🔥HIGH' if (_iv_rk2 or 0)>75 else '💤LOW' if (_iv_rk2 or 100)<25 else 'MID'})" if _iv_rk2 is not None else ""
+                _earn_badge=(f" | ⚠️ EARNINGS {_dte_e2}d" if _dte_e2 is not None and _dte_e2<14 else "")
                 st.markdown(
                     f"<div>"
                     f"<b>{_stk2}</b> &nbsp;"
-                    f"{_str2} &nbsp; Stock <b>${_spv2:.2f}</b> &nbsp; OI:{_ob} &nbsp; NetΔ:{_nd2:+.3f}<br>"
-                    f"<b>{_gr}</b><br>{_gd2}<br>"
+                    f"{_str2} &nbsp; Stock <b>${_spv2:.2f}</b> &nbsp; OI:{_ob} &nbsp; NetΔ:{_nd2:+.3f}{_iv_badge}{_earn_badge}<br>"
+                    f"<b>{_gr}</b> {_gd2}<br>"
                     f"Group P&L ${_gp2:+,.2f} ({_gpc2:+.1f}%) | {len(_legs2)} leg(s) | Min DTE {_md2}"
                     f"</div>",unsafe_allow_html=True)
                 with st.expander(f"  ↳ {_stk2} leg-by-leg"):
@@ -3506,6 +3705,8 @@ elif page == "📊 Backtest Lab":
     with _hdr2:
         if st.button("🔄 Refresh", key="refresh_backtest"):
             st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
     st.markdown("*Test how well OI signals predicted actual stock moves*")
 
     dates = available_trade_dates()
@@ -3659,6 +3860,8 @@ elif page == "🔮 Live Position Predictor":
     with _hdr2:
         if st.button("🔄 Refresh", key="refresh_predictor"):
             st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
     st.markdown("*Futures + VIX + OI flow → Real-time position recommendations*")
 
     # ── 1) Fetch live market data ──
@@ -4072,6 +4275,8 @@ elif page == "📈 Insider / Congress / Whales":
     with _hdr2:
         if st.button("🔄 Refresh", key="refresh_insider"):
             st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
 
     tab1, tab2, tab3 = st.tabs(["👤 Insider Trades", "🏛️ Congress Trades", "🐋 Whale Holdings"])
 
@@ -4222,6 +4427,8 @@ elif page == "📰 News & Calendar":
     with _hdr2:
         if st.button("🔄 Refresh", key="refresh_news"):
             st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
 
     tab1, tab2 = st.tabs(["📰 News", "📅 Economic Calendar"])
 
@@ -4302,6 +4509,8 @@ elif page == "⚡ Trade Risk Calculator":
     with _hdr2:
         if st.button("🔄 Refresh", key="refresh_risk"):
             st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
     st.markdown("*Bloomberg-style scenario analysis before you enter a trade*")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -4604,7 +4813,39 @@ elif page == "🎯 Next-Day Exit Planner":
     with _hdr2:
         if st.button("🔄 Refresh", key="refresh_exit_planner"):
             st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
     st.markdown("*Pre-market intelligence: predict tomorrow's option value, set optimal sell orders, and protect your capital*")
+
+    with st.expander("📘 How to Use This Page — Exit Planner Guide", expanded=False):
+        st.markdown("""
+**Purpose:** This page gives you a pre-market daily brief on every open option position.
+It fetches live market mid-prices (bid+ask)/2 and compares them to what you paid, telling you
+whether to hold, take profit, or cut losses before tomorrow's open.
+
+**What each mode does:**
+| Mode | Best for |
+|---|---|
+| 📋 Individual Position | Deep dive on one specific trade — scenarios, Greeks, Monte Carlo |
+| 🏢 All positions — by Ticker | Full picture on a stock you're watching — payoff chart, OI, news |
+| 🌐 All Open Positions | Morning scan across everything — spot any positions needing action |
+
+**Decision framework (corporate standard):**
+- 🟢 **TAKE PROFIT** (>50% gain): Close at least half. Options decay — realized gains beat paper gains.
+- 🔴 **CUT LOSS** (>30% loss): Exit or roll. The 2:1 rule — if you wouldn't enter this trade today, exit it.
+- ⚠️ **NEAR EXPIRY** (<5 DTE in loss): Theta decay is exponential in the last 5 days. Close or roll immediately.
+- 🟡 **CLOSE SOON** (<5 DTE in profit): Lock in gains — don't let time decay erode a winner.
+- ⚪ **HOLD**: No urgent action. Set a mental stop (typically 25–30% below your entry on any remaining gain).
+
+**Reading the P&L column:**
+- `$7.29→$1.66` = option premium dropped from $7.29 to $1.66 (↓77%) — this is the *option price*, not stock price
+- Each contract controls 100 shares, so a $1 move = $100 P&L per contract
+- For **SELL** positions: you collected premium upfront; profit = entry premium − current mid
+
+**Risk management at a glance:**
+The TOTAL row shows your net unrealized P&L across all positions.
+Positive = portfolio is net profitable. Negative = review which legs to cut first (start with highest loss %).
+        """)
 
     # ── Load from Portfolio ──
     _ep_open_trades = pd.DataFrame()
@@ -4615,6 +4856,429 @@ elif page == "🎯 Next-Day Exit Planner":
     except Exception:
         pass
 
+    # ── Analysis Mode selector ──
+    _ep_mode = st.radio(
+        "Analysis Mode",
+        ["📋 Individual Position", "🏢 All positions — by Ticker", "🌐 All Open Positions"],
+        horizontal=True, key="ep_analysis_mode",
+    )
+
+    # ──────────────────────────────────────────────────────────────
+    # BATCH HELPER: fetch current option mid-price from yfinance
+    # ──────────────────────────────────────────────────────────────
+    def _fetch_option_mid(ticker, expiry_str, strike, opt_type):
+        """Return (mid_price, iv, spot) or (None, None, None) on failure.
+        Finds nearest available expiry when exact date not listed by yfinance."""
+        try:
+            tk = yf.Ticker(ticker)
+            hist = tk.history(period="2d")
+            spot = float(hist["Close"].iloc[-1]) if len(hist) >= 1 else None
+            try:
+                exp_dt = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+            except Exception:
+                return None, None, spot
+            # Find nearest available expiry
+            available = tk.options  # tuple of YYYY-MM-DD strings
+            if not available:
+                return None, None, spot
+            exp_str = expiry_str  # default: try exact
+            if expiry_str not in available:
+                # pick closest available expiry by calendar distance
+                avail_dts = [datetime.strptime(e, "%Y-%m-%d").date() for e in available]
+                nearest = min(avail_dts, key=lambda d: abs((d - exp_dt).days))
+                exp_str = nearest.strftime("%Y-%m-%d")
+            chain = tk.option_chain(exp_str)
+            df_c = chain.calls if opt_type.lower() == "call" else chain.puts
+            row = df_c[abs(df_c["strike"] - strike) < 0.01]
+            if row.empty:
+                row = df_c.iloc[(df_c["strike"] - strike).abs().argsort()[:1]]
+            if row.empty:
+                return None, None, spot
+            bid = float(row["bid"].iloc[0])
+            ask = float(row["ask"].iloc[0])
+            iv  = float(row["impliedVolatility"].iloc[0]) if "impliedVolatility" in row.columns else None
+            mid = (bid + ask) / 2 if bid >= 0 and ask >= 0 else None
+            return mid, iv, spot
+        except Exception:
+            return None, None, None
+
+    def _ep_batch_table(trades_df):
+        """Build batch exit analysis rows for a set of open trades."""
+        rows = []
+        today = datetime.now().date()
+        for _, r in trades_df.iterrows():
+            try:
+                strike = float(r["strike"])
+                entry  = float(r["entry_price"])
+                raw_qty = int(r.get("quantity", 1) or 1)
+                side   = "SELL" if raw_qty < 0 else "BUY"
+                qty    = abs(raw_qty)
+                opt    = str(r["option_type"]).lower()
+                ticker = str(r["ticker"]).upper()
+                try:
+                    exp_dt = datetime.strptime(str(r["expiry"]), "%Y-%m-%d").date()
+                    dte = (exp_dt - today).days
+                except Exception:
+                    dte = None
+                mid, iv, spot = _fetch_option_mid(ticker, str(r["expiry"]), strike, opt)
+                # P&L direction: for SELL, profit when option price goes DOWN
+                if mid is not None:
+                    if side == "BUY":
+                        pnl = round((mid - entry) * qty * 100, 2)
+                        pnl_pct = round((mid - entry) / entry * 100, 1) if entry > 0 else None
+                    else:  # SELL — collected premium, profit = entry - mid
+                        pnl = round((entry - mid) * qty * 100, 2)
+                        pnl_pct = round((entry - mid) / entry * 100, 1) if entry > 0 else None
+                else:
+                    pnl = pnl_pct = None
+                # signal
+                if pnl_pct is None:
+                    sig = "⚪ N/A"
+                elif pnl_pct >= 50:
+                    sig = "🟢 TAKE PROFIT"
+                elif pnl_pct <= -30:
+                    sig = "🔴 CUT LOSS"
+                elif dte is not None and dte <= 5 and pnl_pct < 0:
+                    sig = "🔴 NEAR EXPIRY"
+                elif dte is not None and dte <= 5 and pnl_pct > 0:
+                    sig = "🟡 CLOSE SOON"
+                else:
+                    sig = "⚪ HOLD"
+                price_note = ""
+                if mid is not None:
+                    direction = "↑" if mid > entry else "↓"
+                    price_note = f"${entry:.2f}→${mid:.2f} ({direction}{abs(mid-entry)/entry*100:.0f}% option Δ)"
+                rows.append({
+                    "Side": side,
+                    "Ticker": ticker,
+                    "Type": opt.upper(),
+                    "Strike": f"${strike:.0f}",
+                    "Expiry": str(r["expiry"]),
+                    "DTE": dte,
+                    "Qty": f"{side} ×{qty}",
+                    "Premium paid→now": price_note if mid is not None else "N/A",
+                    "P&L $": f"${pnl:+,.0f}" if pnl is not None else "N/A",
+                    "P&L %": f"{pnl_pct:+.1f}%" if pnl_pct is not None else "N/A",
+                    "IV": f"{iv*100:.0f}%" if iv else "N/A",
+                    "Spot": f"${spot:.2f}" if spot else "N/A",
+                    "Signal": sig,
+                })
+            except Exception:
+                continue
+        return pd.DataFrame(rows)
+
+    def _add_total_row(df):
+        """Append a TOTAL row summing P&L $ to a batch df."""
+        if df.empty:
+            return df
+        pnl_vals = []
+        for v in df["P&L $"]:
+            try:
+                pnl_vals.append(float(str(v).replace("$","").replace(",","").replace("+","")))
+            except Exception:
+                pass
+        tot = sum(pnl_vals)
+        tot_em = "🟢" if tot >= 0 else "🔴"
+        tot_row = {c: "" for c in df.columns}
+        tot_row["Side"] = f"{tot_em} TOTAL"
+        tot_row["Ticker"] = f"{len(df)} leg(s)"
+        tot_row["P&L $"] = f"${tot:+,.0f}"
+        win_n = sum(1 for v in pnl_vals if v > 0)
+        tot_row["Signal"] = f"{win_n}W/{len(pnl_vals)-win_n}L"
+        return pd.concat([df, pd.DataFrame([tot_row])], ignore_index=True)
+
+    if _ep_mode == "🌐 All Open Positions":
+        st.markdown("#### 🌐 All Open Positions — Batch Analysis")
+        if _ep_open_trades.empty:
+            st.info("No open positions in portfolio.")
+        else:
+            with st.spinner(f"Analysing {len(_ep_open_trades)} positions..."):
+                _ep_batch_df = _ep_batch_table(_ep_open_trades)
+            if not _ep_batch_df.empty:
+                # Summary metrics
+                _bm1, _bm2, _bm3, _bm4 = st.columns(4)
+                _tp_n = len(_ep_batch_df[_ep_batch_df["Signal"].str.contains("TAKE PROFIT")])
+                _cl_n = len(_ep_batch_df[_ep_batch_df["Signal"].str.contains("CUT LOSS|NEAR EXPIRY")])
+                _hold_n = len(_ep_batch_df[_ep_batch_df["Signal"] == "⚪ HOLD"])
+                _ep_pnl_vals = [float(str(v).replace("$","").replace(",","").replace("+","")) for v in _ep_batch_df["P&L $"] if v != "N/A"]
+                _ep_total_pnl = sum(_ep_pnl_vals)
+                _bm1.metric("Total Positions", len(_ep_batch_df))
+                _bm2.metric("🟢 Take Profit", _tp_n)
+                _bm3.metric("🔴 Exit Alerts", _cl_n)
+                _bm4.metric("Total P&L", f"${_ep_total_pnl:+,.0f}")
+                with st.expander("ℹ️ How to read this table"):
+                    st.markdown(
+                        "- **Side**: BUY = you bought the option (paid premium), SELL = you sold it (collected premium)\n"
+                        "- **Premium paid→now**: What you paid vs current market mid-price. "
+                          "e.g. `$7.29→$1.66` means option premium fell from $7.29 to $1.66 — an 77% loss on the option *price* (not the stock)\n"
+                        "- **P&L $**: Dollar profit/loss. For BUY: (now − entry) × qty × 100. For SELL: (entry − now) × qty × 100\n"
+                        "- **P&L %**: % change in option premium. A 50% loss means the option halved in value\n"
+                        "- **IV**: Implied Volatility — higher IV = more expensive options\n"
+                        "- **Signal**: TAKE PROFIT (>50% gain), CUT LOSS (>30% loss), NEAR EXPIRY (<5 DTE), HOLD otherwise\n"
+                        "- **TOTAL row**: Last row shows sum of all P&L and win/loss count"
+                    )
+                st.dataframe(_add_total_row(_ep_batch_df), hide_index=True, use_container_width=True)
+                # Highlight alerts
+                _alerts = _ep_batch_df[_ep_batch_df["Signal"].str.contains("TAKE PROFIT|CUT LOSS|NEAR EXPIRY|CLOSE SOON")]
+                if not _alerts.empty:
+                    st.warning("⚠️ **Action Required:**")
+                    for _, _ar in _alerts.iterrows():
+                        st.markdown(f"- **{_ar['Ticker']} {_ar['Type']} {_ar['Strike']}** exp {_ar['Expiry']} — {_ar['Signal']} | P&L: {_ar['P&L $']} ({_ar['P&L %']})")
+        st.stop()
+
+    elif _ep_mode == "🏢 All positions — by Ticker":
+        st.markdown("#### 🏢 All Positions — by Ticker")
+        if _ep_open_trades.empty:
+            st.info("No open positions in portfolio.")
+            st.stop()
+        _ep_tickers = sorted(_ep_open_trades["ticker"].unique())
+        _ep_sel_tk = st.selectbox("Select Ticker", _ep_tickers, key="ep_batch_ticker")
+        _ep_tk_trades = _ep_open_trades[_ep_open_trades["ticker"] == _ep_sel_tk]
+
+        with st.spinner(f"Loading {_ep_sel_tk} data..."):
+            try:
+                _btk_obj   = yf.Ticker(_ep_sel_tk)
+                _btk_hist  = _btk_obj.history(period="60d")
+                _btk_spot  = float(_btk_hist["Close"].iloc[-1]) if len(_btk_hist) >= 1 else 0
+                _btk_prev  = float(_btk_hist["Close"].iloc[-2]) if len(_btk_hist) >= 2 else _btk_spot
+                _btk_chg   = (_btk_spot - _btk_prev) / _btk_prev * 100 if _btk_prev else 0
+            except Exception:
+                _btk_spot, _btk_prev, _btk_chg = 0, 0, 0
+
+        # ── Header metrics ──
+        bh1, bh2, bh3, bh4 = st.columns(4)
+        bh1.metric(f"{_ep_sel_tk} Spot", f"${_btk_spot:.2f}", f"{_btk_chg:+.2f}%")
+        bh2.metric("Open Legs", len(_ep_tk_trades))
+
+        # ── Per-leg table ──
+        st.markdown(f"##### 📋 Legs")
+        with st.spinner("Fetching live prices..."):
+            _ep_tk_batch = _ep_batch_table(_ep_tk_trades)
+        if not _ep_tk_batch.empty:
+            # Total P&L
+            try:
+                _btk_total_pnl = sum(
+                    float(r.replace("$","").replace(",","").replace("+",""))
+                    for r in _ep_tk_batch["P&L $"] if r != "N/A"
+                )
+                bh3.metric("Group P&L", f"${_btk_total_pnl:+,.0f}",
+                           delta_color="normal" if _btk_total_pnl >= 0 else "inverse")
+            except Exception:
+                pass
+            with st.expander("ℹ️ How to read this table"):
+                st.markdown(
+                    "- **Side**: BUY = you paid the premium (long option), SELL = you collected premium (short option)\n"
+                    "- **Premium paid→now**: Option price at entry vs current market mid. "
+                      "e.g. `$7.29→$1.66 (↓77%)` means the option premium dropped 77% — this is the *option price*, not the stock price. "
+                      "A BUY position loses money when option price falls; a SELL position profits when option price falls.\n"
+                    "- **P&L $**: Total dollar P&L = (price change) × contracts × 100\n"
+                    "- **P&L %**: % gain or loss on the option premium paid/received\n"
+                    "- **IV**: Implied Volatility — market's expectation of future move\n"
+                    "- **Signal**: TAKE PROFIT (>50% gain), CUT LOSS (>30% loss), NEAR EXPIRY (<5 DTE)\n"
+                    "- **TOTAL row**: Last row shows sum of all P&L and win/loss count"
+                )
+            st.dataframe(_add_total_row(_ep_tk_batch), hide_index=True, use_container_width=True)
+
+        # ── Payoff chart (combined all legs) ──
+        st.markdown("---")
+        st.markdown(f"##### 📈 Combined Payoff at Expiry")
+        try:
+            from scipy.stats import norm as _norm
+            _r_rate = 0.05
+            _spot_range = np.linspace(_btk_spot * 0.70, _btk_spot * 1.30, 200) if _btk_spot > 0 else np.array([])
+            if len(_spot_range) > 0:
+                _total_payoff = np.zeros(len(_spot_range))
+                _total_entry_cost = 0.0
+                _leg_lines = []
+                for _, _leg in _ep_tk_trades.iterrows():
+                    _lk = float(_leg["strike"])
+                    _lep = float(_leg["entry_price"])
+                    _lqty = int(_leg.get("quantity", 1) or 1)
+                    _lot = str(_leg["option_type"]).lower()
+                    _lpayoff = np.where(
+                        _lot == "call",
+                        np.maximum(_spot_range - _lk, 0),
+                        np.maximum(_lk - _spot_range, 0)
+                    ) * abs(_lqty) * 100
+                    _lpayoff = _lpayoff if _lqty > 0 else -_lpayoff
+                    _lentry_cost = _lep * abs(_lqty) * 100 * (1 if _lqty > 0 else -1)
+                    _lpnl = _lpayoff - _lentry_cost
+                    _total_payoff += _lpnl
+                    _total_entry_cost += _lentry_cost
+                    _side = "BUY" if _lqty > 0 else "SELL"
+                    _leg_lines.append(f"{_side} {_lot.upper()} ${_lk:.0f}")
+
+                _fig_pf = go.Figure()
+                _fig_pf.add_trace(go.Scatter(
+                    x=_spot_range, y=_total_payoff,
+                    mode="lines", name="Combined P&L at expiry",
+                    line=dict(color="#00d4aa", width=2.5),
+                    fill="tozeroy",
+                    fillcolor="rgba(0,212,170,0.15)",
+                ))
+                _fig_pf.add_hline(y=0, line_color="#888", line_width=1)
+                if _btk_spot > 0:
+                    _fig_pf.add_vline(x=_btk_spot, line_color="#e65100", line_dash="dash",
+                                      annotation_text=f"Spot ${_btk_spot:.2f}", annotation_position="top right")
+                # Breakevens
+                _be_pts = []
+                for _i in range(len(_total_payoff)-1):
+                    if (_total_payoff[_i] <= 0 <= _total_payoff[_i+1]) or (_total_payoff[_i] >= 0 >= _total_payoff[_i+1]):
+                        _be = _spot_range[_i] + (_spot_range[_i+1]-_spot_range[_i]) * (0 - _total_payoff[_i]) / (_total_payoff[_i+1] - _total_payoff[_i] + 1e-9)
+                        _be_pts.append(_be)
+                        _fig_pf.add_vline(x=_be, line_color="#ffd600", line_dash="dot",
+                                          annotation_text=f"B/E ${_be:.1f}", annotation_position="bottom right")
+                _fig_pf.update_layout(
+                    template="plotly_white", height=360,
+                    xaxis_title="Stock Price at Expiry",
+                    yaxis_title="P&L ($)",
+                    title=f"{_ep_sel_tk} — Combined payoff: {' | '.join(_leg_lines)}",
+                    margin=dict(l=60, r=30, t=50, b=40),
+                )
+                st.plotly_chart(_fig_pf, use_container_width=True)
+                if _be_pts:
+                    _bec1, _bec2 = st.columns(2)
+                    _bec1.metric("Breakeven(s)", " / ".join([f"${b:.2f}" for b in _be_pts[:3]]))
+                    _max_gain = _total_payoff.max()
+                    _max_loss = _total_payoff.min()
+                    _bec2.metric("Max Profit / Max Loss",
+                                 f"${_max_gain:,.0f} / ${_max_loss:,.0f}")
+        except Exception as _pe:
+            st.caption(f"Payoff chart unavailable: {_pe}")
+
+        # ── OI Context ──
+        st.markdown("---")
+        st.markdown(f"##### 📊 OI Signal for {_ep_sel_tk}")
+        try:
+            _ep_oi_td = available_trade_dates()
+            if _ep_oi_td:
+                _ep_oi_df = load_oi_for_date(_ep_oi_td[0])
+                _ep_oi_tk = _ep_oi_df[_ep_oi_df["ticker"] == _ep_sel_tk]
+                if not _ep_oi_tk.empty:
+                    _ep_cc  = pd.to_numeric(_ep_oi_tk["change_OI_Call"], errors="coerce").sum()
+                    _ep_pc  = pd.to_numeric(_ep_oi_tk["change_OI_Put"],  errors="coerce").sum()
+                    _ep_coi = pd.to_numeric(_ep_oi_tk["openInt_Call_now"], errors="coerce").sum()
+                    _ep_poi = pd.to_numeric(_ep_oi_tk["openInt_Put_now"],  errors="coerce").sum()
+                    _ep_pcr = _ep_poi / _ep_coi if _ep_coi > 0 else 0
+                    _ep_sig, _ep_col = _oi_signal_light(_ep_cc, _ep_pc, _ep_pcr)
+                    oc1, oc2, oc3, oc4 = st.columns(4)
+                    oc1.metric("OI Signal", _ep_sig)
+                    oc2.metric("PCR", f"{_ep_pcr:.2f}")
+                    oc3.metric("Call ΔOI", f"{_ep_cc:+,.0f}")
+                    oc4.metric("Put ΔOI", f"{_ep_pc:+,.0f}")
+                    # Mini OI bar chart by strike (ATM ±5 strikes)
+                    if _btk_spot > 0:
+                        _oi_near = _ep_oi_tk[
+                            (pd.to_numeric(_ep_oi_tk["strike"], errors="coerce") >= _btk_spot * 0.90) &
+                            (pd.to_numeric(_ep_oi_tk["strike"], errors="coerce") <= _btk_spot * 1.10)
+                        ].copy()
+                        _oi_near["strike"] = pd.to_numeric(_oi_near["strike"], errors="coerce")
+                        _oi_near = _oi_near.dropna(subset=["strike"]).sort_values("strike")
+                        if not _oi_near.empty:
+                            _fig_oi = go.Figure()
+                            _fig_oi.add_trace(go.Bar(
+                                x=_oi_near["strike"].astype(str),
+                                y=pd.to_numeric(_oi_near["openInt_Call_now"], errors="coerce"),
+                                name="Call OI", marker_color="#4fc3f7"))
+                            _fig_oi.add_trace(go.Bar(
+                                x=_oi_near["strike"].astype(str),
+                                y=-pd.to_numeric(_oi_near["openInt_Put_now"], errors="coerce"),
+                                name="Put OI", marker_color="#ef5350"))
+                            _fig_oi.add_vline(x=str(round(_btk_spot)), line_dash="dash",
+                                              line_color="#e65100", annotation_text="Spot")
+                            # Mark position strikes
+                            for _, _leg in _ep_tk_trades.iterrows():
+                                _fig_oi.add_vline(x=str(int(_leg["strike"])), line_dash="dot",
+                                                  line_color="#ffd600", annotation_text=f"${int(_leg['strike'])}")
+                            _fig_oi.update_layout(
+                                barmode="overlay", template="plotly_white", height=280,
+                                title=f"{_ep_sel_tk} OI ±10% of spot (yellow=your strikes)",
+                                margin=dict(l=50, r=20, t=40, b=30),
+                            )
+                            st.plotly_chart(_fig_oi, use_container_width=True)
+        except Exception:
+            pass
+
+        # ── News ──
+        st.markdown("---")
+        st.markdown(f"##### 📰 Recent News — {_ep_sel_tk}")
+        try:
+            import feedparser
+            _feed = feedparser.parse(
+                f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={_ep_sel_tk}&region=US&lang=en-US")
+            _news_items = _feed.entries[:6] if _feed.entries else []
+            if _news_items:
+                for _ni in _news_items:
+                    _title = _ni.get("title", "")
+                    _link  = _ni.get("link", "#")
+                    _date  = _ni.get("published", "")[:16]
+                    _bull  = any(w in _title.lower() for w in ["rise","gain","bull","up","beat","rally","surge","record"])
+                    _bear  = any(w in _title.lower() for w in ["fall","drop","loss","bear","down","miss","crash","cut"])
+                    _sent  = "🟢" if _bull else ("🔴" if _bear else "⚪")
+                    st.markdown(f"{_sent} [{_title}]({_link}) <small>{_date}</small>", unsafe_allow_html=True)
+            else:
+                st.caption("No recent news found.")
+        except Exception:
+            st.caption("News unavailable.")
+
+        # ── Strategy Suggestions ──
+        st.markdown("---")
+        st.markdown(f"##### 💡 Suggestions for your {_ep_sel_tk} positions")
+        try:
+            _sugg = []
+            today_dt = datetime.now().date()
+            for _, _leg in _ep_tk_trades.iterrows():
+                _lk   = float(_leg["strike"])
+                _lep  = float(_leg["entry_price"])
+                _lqty = int(_leg.get("quantity", 1) or 1)
+                _lot  = str(_leg["option_type"]).lower()
+                _side = "BUY" if _lqty > 0 else "SELL"
+                try:
+                    _lexp = datetime.strptime(str(_leg["expiry"]), "%Y-%m-%d").date()
+                    _ldte = (_lexp - today_dt).days
+                except Exception:
+                    _ldte = 30
+                # Match leg to batch row for P&L
+                _matching = _ep_tk_batch[
+                    (_ep_tk_batch["Strike"] == f"${_lk:.0f}") &
+                    (_ep_tk_batch["Type"] == _lot.upper())
+                ] if not _ep_tk_batch.empty else pd.DataFrame()
+                _lpnl_pct_str = _matching["P&L %"].iloc[0] if not _matching.empty else "N/A"
+                try:
+                    _lpnl_pct = float(_lpnl_pct_str.replace("%","").replace("+",""))
+                except Exception:
+                    _lpnl_pct = None
+
+                _sig_label = f"{_side} {_lot.upper()} ${_lk:.0f} DTE:{_ldte}"
+                if _ldte <= 5 and _lpnl_pct is not None and _lpnl_pct > 0:
+                    _sugg.append(f"🟡 **{_sig_label}** — DTE≤5 with profit: consider closing to lock gains before theta crush")
+                elif _ldte <= 5 and _lpnl_pct is not None and _lpnl_pct < 0:
+                    _sugg.append(f"🔴 **{_sig_label}** — DTE≤5 with loss: close now to limit further decay damage")
+                elif _lpnl_pct is not None and _lpnl_pct >= 50:
+                    _sugg.append(f"🟢 **{_sig_label}** — +{_lpnl_pct:.0f}% profit: consider closing half or move stop to breakeven")
+                elif _lpnl_pct is not None and _lpnl_pct <= -40:
+                    _sugg.append(f"🔴 **{_sig_label}** — {_lpnl_pct:.0f}% loss: evaluate roll or close to prevent further damage")
+                elif _lot == "call" and _lqty > 0 and _btk_spot < _lk * 0.95:
+                    _sugg.append(f"⚠️ **{_sig_label}** — call is deep OTM (stock ${_btk_spot:.2f} vs strike ${_lk:.0f}): consider rolling down or out")
+                elif _lot == "put" and _lqty > 0 and _btk_spot > _lk * 1.05:
+                    _sugg.append(f"⚠️ **{_sig_label}** — put is deep OTM (stock ${_btk_spot:.2f} vs strike ${_lk:.0f}): consider rolling up or out")
+                else:
+                    _sugg.append(f"⚪ **{_sig_label}** — no urgent action, monitor OI flow and news")
+
+            # OI-based overlay suggestion
+            if _ep_sig in ("BULLISH", "BULL+HEDGE"):
+                _sugg.append(f"📊 **OI says {_ep_sig}** — OI flow supports upside. Long calls or call spreads favored.")
+            elif _ep_sig in ("BEARISH", "HEDGE"):
+                _sugg.append(f"📊 **OI says {_ep_sig}** — Put accumulation dominant. Consider hedging longs or taking bearish positions.")
+
+            for _s in _sugg:
+                st.markdown(f"- {_s}")
+        except Exception as _se:
+            st.caption(f"Suggestions unavailable: {_se}")
+
+        st.stop()
+
+    # ── Individual mode: existing load-from-portfolio ──
     if not _ep_open_trades.empty:
         st.markdown("#### 📂 Load from Open Positions")
         _ep_leg_labels = ["— Manual Entry —"]
@@ -5687,6 +6351,8 @@ if page == "🔬 OI Comparison Charts":
     with _hdr2:
         if st.button("🔄 Refresh", key="refresh_oi_charts"):
             st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
     st.markdown("*NYSE-Telegram style OI vs Price vs Volume — full expiry chain with backtesting*")
 
     dates = available_trade_dates()
@@ -6084,6 +6750,51 @@ if page == "🔬 OI Comparison Charts":
         st.info(f"Could not generate recommendation: {_e}")
     st.markdown("---")
 
+    # ── Management overview ──
+    with st.expander("📘 How to Use This Page — OI Comparison Guide", expanded=False):
+        st.markdown("""
+**What you're looking at:** Open Interest (OI) shows how many option contracts are outstanding at each strike price.
+When OI *increases*, new money is entering. When it *decreases*, positions are closing. The comparison (prev vs now)
+reveals where smart money is building or liquidating positions.
+
+**As a trader, you want to know:**
+- 🟢 **Where are institutions buying calls?** → Likely support / upside target
+- 🔴 **Where are they buying puts?** → Likely resistance / downside hedge
+- 🔵 **Deep OTM put buildup?** → Institutional hedge (not directional — market-makers are long)
+- 📊 **PCR > 1.3** → Fear in the market (contrarian bullish signal)
+- 📊 **PCR < 0.7** → Complacency (contrarian bearish signal)
+
+**Intent color system** (bottom-left chart):
+| Color | Signal | What It Means |
+|---|---|---|
+| 🟢 Dark Green | BULLISH | Calls accumulating ATM — buyers stepping in |
+| 🌲 Forest Green | HEDGED BULL | Deep puts + call accumulation — institutions hedging longs |
+| 🟣 Purple | STRADDLE | Both calls + puts rising ATM — event/vol play |
+| 🔴 Dark Red | BEARISH | Puts building at ATM — directional short pressure |
+| 🟠 Orange-Red | NEAR_BEARISH | Puts building just below spot — near-term downside hedge |
+| 🔵 Dark Blue | HEDGE | Deep OTM puts growing — institutional tail risk protection |
+| 💙 Light Blue | HEDGE_UNWIND | Deep puts being closed — fear subsiding |
+| 🟢 Medium Green | BULLISH_BREAK | OTM calls building — expecting breakout higher |
+| 🟡 Amber | COVERED_CALL | Far OTM calls written against long stock — capped upside |
+| ⚫ Gray | NEUTRAL / UNWIND | No strong conviction or position closing |
+
+**Money Flow interpretation:**
+- Large green bars at ATM = bullish positioning → expect support at that strike
+- Large red bars below spot = put hedging → spot acts as resistance / floor depending on size
+- Rising bars far OTM in calls = momentum traders buying upside — often leads spot
+- Gamma wall (huge OI spike) = market-makers will defend that level aggressively
+        """)
+
+    # ── Load current open trades for this ticker (for per-chart overlay) ──
+    _oi_open_trades = pd.DataFrame()
+    try:
+        _oi_conn = get_conn()
+        _oi_open_trades = pd.read_sql(
+            "SELECT * FROM trades WHERE status='OPEN' AND ticker=?", _oi_conn, params=(sel_ticker,))
+        _oi_conn.close()
+    except Exception:
+        pass
+
     # ── Build charts per expiry ──
     for expiry in sel_expiries:
         edf = comp_df[comp_df["expiry_date"] == expiry].copy()
@@ -6112,16 +6823,37 @@ if page == "🔬 OI Comparison Charts":
             is_future = True
             dte = 0
 
-        # ── Chart: OI + Price side by side ──
+        # ── Intent classification (hedge-aware coloring) ──
+        _edf_intent = edf.rename(columns={
+            "change_OI_Call": "call_oi_change",
+            "change_OI_Put": "put_oi_change",
+        }).copy()
+        try:
+            _edf_intent, _isig, _isig_col, _isig_desc, _idet = _oi_intent_algo(_edf_intent, spot) if spot else (None, "N/A", "#455A64", "No spot", {})
+            if _edf_intent is not None:
+                edf["intent"] = _edf_intent["intent"].values
+                edf["bar_col"] = _edf_intent["bar_col"].values
+            else:
+                edf["intent"] = "NEUTRAL"; edf["bar_col"] = "#90A4AE"
+        except Exception:
+            _isig, _isig_col, _isig_desc, _idet = "N/A", "#455A64", "Error", {}
+            edf["intent"] = "NEUTRAL"; edf["bar_col"] = "#90A4AE"
+
+        # ── Chart: 2 rows — OI/Price (top) + Intent Delta (bottom) ──
         fig = make_subplots(
-            rows=1, cols=2,
+            rows=2, cols=2,
+            row_heights=[0.62, 0.38],
             column_widths=[0.55, 0.45],
             horizontal_spacing=0.06,
+            vertical_spacing=0.12,
             subplot_titles=[
                 f"{exp_tag} — OI (prev▓ vs now□)",
                 f"{exp_tag} — Price & Volume",
+                f"OI Change by Intent  [{_isig}]",
+                "",
             ],
-            specs=[[{"secondary_y": True}, {"secondary_y": True}]],
+            specs=[[{"secondary_y": True}, {"secondary_y": True}],
+                   [{"secondary_y": False}, {"secondary_y": False}]],
         )
 
         # ── LEFT: OI comparison ──
@@ -6236,6 +6968,57 @@ if page == "🔬 OI Comparison Charts":
             showlegend=False,
         ), row=1, col=2, secondary_y=True)
 
+        # ── Row 2: Intent-colored OI Delta bars ──
+        _call_chg = pd.to_numeric(edf["change_OI_Call"], errors="coerce").fillna(0)
+        _put_chg  = pd.to_numeric(edf["change_OI_Put"],  errors="coerce").fillna(0)
+        _bar_cols = list(edf["bar_col"])
+        _intents  = list(edf["intent"])
+
+        # Call delta (positive = up)
+        fig.add_trace(go.Bar(
+            x=x_pos, y=_call_chg,
+            name="Call ΔOI", marker_color=_bar_cols,
+            width=0.45, showlegend=False,
+            text=[f"<b>{v}</b>" if v != "NEUTRAL" else "" for v in _intents],
+            textposition="outside", textfont=dict(size=6),
+        ), row=2, col=1)
+        # Put delta (mirrored negative)
+        _put_bar_cols = ["rgba(200,50,50,0.55)" if c == "#90A4AE" else c for c in _bar_cols]
+        fig.add_trace(go.Bar(
+            x=x_pos, y=-_put_chg,
+            name="Put ΔOI", marker_color=_put_bar_cols,
+            width=0.45, showlegend=False, opacity=0.75,
+        ), row=2, col=1)
+        fig.add_hline(y=0, line_color="#212121", line_width=0.8, row=2, col=1)
+
+        # Signal badge in delta panel
+        fig.add_annotation(
+            xref="x3 domain", yref="y3 domain", x=0.99, y=0.97,
+            text=f"<b>{_isig}</b><br>{_isig_desc}",
+            showarrow=False, font=dict(size=10, color="white"),
+            bgcolor=_isig_col, bordercolor="white", borderwidth=1,
+            align="right", xanchor="right", yanchor="top",
+        )
+
+        # Intent color legend (row 2 col 2)
+        _legend_items = [
+            ("BULLISH", "#2E7D32"), ("HEDGED BULL", "#1B5E20"), ("STRADDLE", "#6A1B9A"),
+            ("NEAR_BEARISH", "#BF360C"), ("BEARISH", "#C62828"),
+            ("HEDGE", "#1565C0"), ("HEDGE_UNWIND", "#42A5F5"),
+            ("BULLISH_BREAK", "#388E3C"), ("COVERED_CALL", "#F57F17"),
+            ("UNWIND", "#757575"), ("NEUTRAL", "#90A4AE"),
+        ]
+        _present = set(_intents)
+        for _li, (_lbl, _lcol) in enumerate(_legend_items):
+            if _lbl in _present:
+                fig.add_annotation(
+                    xref="x4 domain", yref="y4 domain",
+                    x=0.05, y=1.0 - _li * 0.092,
+                    text=f"<b>█</b> {_lbl}",
+                    showarrow=False, font=dict(size=9, color="#1a2332"),
+                    xanchor="left", yanchor="top",
+                )
+
         # Axis ranges
         max_oi = max(
             edf["openInt_Call_now"].max(), edf["openInt_Call_prev"].max(),
@@ -6246,13 +7029,18 @@ if page == "🔬 OI Comparison Charts":
             edf["put_close_now"].max(), edf["put_close_prev"].max(), 1,
         )
         max_vol_k = max(edf["vol_Call_now"].max(), edf["vol_Put_now"].max(), 1) / 1000
+        max_delta = max(abs(_call_chg).max(), abs(_put_chg).max(), 1)
 
-        for col in [1, 2]:
-            fig.update_xaxes(tickmode="array", tickvals=x_pos, ticktext=tick_labels, row=1, col=col)
+        for _rc in [1, 2]:
+            fig.update_xaxes(tickmode="array", tickvals=x_pos, ticktext=tick_labels, row=1, col=_rc)
+            fig.update_xaxes(tickmode="array", tickvals=x_pos, ticktext=tick_labels, row=2, col=_rc)
         fig.update_yaxes(range=[-max_oi * 1.3, max_oi * 1.3], title_text="OI", row=1, col=1, secondary_y=False)
         fig.update_yaxes(title_text="Price Δ ($)", row=1, col=1, secondary_y=True)
         fig.update_yaxes(range=[-max_px * 2, max_px * 2], title_text="Price", row=1, col=2, secondary_y=False)
         fig.update_yaxes(range=[-max_vol_k * 1.3, max_vol_k * 1.3], title_text="Vol (k)", row=1, col=2, secondary_y=True)
+        fig.update_yaxes(range=[-max_delta * 1.4, max_delta * 1.4], title_text="ΔOI", row=2, col=1)
+        fig.update_xaxes(showticklabels=False, row=2, col=2)
+        fig.update_yaxes(showticklabels=False, showgrid=False, zeroline=False, row=2, col=2)
 
         # PCR badge
         total_c = edf["openInt_Call_now"].sum()
@@ -6261,7 +7049,7 @@ if page == "🔬 OI Comparison Charts":
         bias = "Bullish" if pcr_val < 0.7 else "Bearish" if pcr_val > 1.3 else "Neutral"
         bias_color = "#00e676" if bias == "Bullish" else "#ef5350" if bias == "Bearish" else "#ffd600"
         fig.add_annotation(
-            xref="paper", yref="paper", x=0.98, y=0.98,
+            xref="paper", yref="paper", x=0.98, y=0.99,
             text=f"<b>PCR {pcr_val:.2f} ({bias})</b>",
             showarrow=False, font=dict(size=11, color=bias_color),
             bgcolor="rgba(255,255,255,0.9)", bordercolor=bias_color, borderwidth=1,
@@ -6269,21 +7057,157 @@ if page == "🔬 OI Comparison Charts":
 
         fig.update_layout(
             template="plotly_white",
-            height=430,
+            height=640,
             barmode="overlay",
             bargap=0.02,
             paper_bgcolor="#ffffff",
             plot_bgcolor="#f8fafb",
-            legend=dict(orientation="h", y=1.14, x=0.5, xanchor="center",
+            legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center",
                        font=dict(size=9, color="#1a2332"),
                        bgcolor="rgba(255,255,255,0.9)"),
-            margin=dict(l=60, r=30, t=85, b=40),
+            margin=dict(l=60, r=30, t=95, b=40),
             font=dict(color="#1a2332"),
         )
-        # Enable zoom on both axes (Plotly default enables it, just ensure no fixedrange)
         fig.update_xaxes(fixedrange=False)
         fig.update_yaxes(fixedrange=False)
         st.plotly_chart(fig, config={'scrollZoom': True})
+
+        # ── Analysis panel: color legend + trade overlay + outlook ──
+        _an1, _an2 = st.columns([1, 1])
+
+        with _an1:
+            st.markdown("##### 🎨 Intent Color Guide")
+            _INTENT_META = [
+                ("BULLISH",       "#2E7D32", "ATM call buildup — fresh buyers entering"),
+                ("HEDGED BULL",   "#1B5E20", "Deep puts + ATM calls — institutions hedging longs"),
+                ("MILD BULL",     "#558B2F", "Slight call bias — watch for follow-through"),
+                ("STRADDLE",      "#6A1B9A", "Both sides at ATM — event/volatility play"),
+                ("BEARISH",       "#B71C1C", "ATM put buildup — directional shorts"),
+                ("NEAR_BEARISH",  "#BF360C", "Puts below spot — near-term downside hedge"),
+                ("MILD BEAR",     "#BF360C", "Slight put bias — monitor for acceleration"),
+                ("HEDGE",         "#1565C0", "Deep OTM puts — institutional tail risk protection"),
+                ("HEDGE_UNWIND",  "#42A5F5", "Deep puts closing — fear subsiding, bullish tilt"),
+                ("BULLISH_BREAK", "#388E3C", "OTM calls building — breakout buyers positioning"),
+                ("COVERED_CALL",  "#F57F17", "Far OTM calls written — capped upside, range play"),
+                ("UNWIND",        "#757575", "Both sides falling — position liquidation"),
+                ("NEUTRAL",       "#90A4AE", "Balanced / low conviction — no actionable edge"),
+            ]
+            _present_intents = set(edf.get("intent", pd.Series([])).unique()) | {_isig.split()[0]}
+            _html_legend = "<div>"
+            for _il, (_iname, _icol, _iexpl) in enumerate(_INTENT_META):
+                _dim = "opacity:0.45;" if _iname not in _present_intents else ""
+                _html_legend += (
+                    f"<div>"
+                    f"{_iname}"
+                    f" {_iexpl}</div>"
+                )
+            _html_legend += "</div>"
+            st.markdown(_html_legend, unsafe_allow_html=True)
+
+        with _an2:
+            st.markdown("##### 🧠 Money Flow & Trade Outlook")
+
+            # ── Key levels ──
+            _gamma_wall_threshold = edf[["openInt_Call_now","openInt_Put_now"]].sum(axis=1).mean() * 2
+            _gamma_walls = edf[edf[["openInt_Call_now","openInt_Put_now"]].sum(axis=1) >= _gamma_wall_threshold]["strike"].tolist()
+            _max_pain_candidates = edf.copy()
+            _mp_best, _mp_pain = None, float("inf")
+            for _mps in edf["strike"]:
+                _pain = (edf[edf["strike"] > _mps]["openInt_Call_now"] * (edf[edf["strike"] > _mps]["strike"] - _mps)).sum() + \
+                        (edf[edf["strike"] < _mps]["openInt_Put_now"] * (_mps - edf[edf["strike"] < _mps]["strike"])).sum()
+                if _pain < _mp_pain:
+                    _mp_pain, _mp_best = _pain, _mps
+
+            _net_call_chg = edf["change_OI_Call"].sum()
+            _net_put_chg  = edf["change_OI_Put"].sum()
+            _flow_dir = "📈 Call-heavy" if _net_call_chg > _net_put_chg * 1.2 else ("📉 Put-heavy" if _net_put_chg > _net_call_chg * 1.2 else "↔️ Balanced")
+
+            _sig_color_map = {
+                "BULLISH":"#2E7D32","HEDGED BULL":"#1B5E20","MILD BULL":"#558B2F",
+                "BEARISH":"#B71C1C","NEAR_BEARISH":"#BF360C","MILD BEAR":"#BF360C",
+                "STRADDLE":"#6A1B9A","HEDGE":"#1565C0","NEUTRAL":"#455A64","QUIET":"#455A64",
+            }
+            _sig_hex = _sig_color_map.get(_isig, "#455A64")
+
+            _outlook_lines = []
+            _outlook_lines.append(f"**Signal:** {_isig} — {_isig_desc}")
+            _outlook_lines.append(f"**Money Flow:** {_flow_dir} | Net Call ΔOI: {_net_call_chg:+,.0f} | Net Put ΔOI: {_net_put_chg:+,.0f}")
+            if _mp_best:
+                _mp_dist = (_mp_best - spot) / spot * 100 if spot else 0
+                _mp_dir = "above" if _mp_best > spot else "below"
+                _outlook_lines.append(f"**Max Pain:** ${_mp_best:.0f} ({abs(_mp_dist):.1f}% {_mp_dir} spot) — options expire worthless here for most buyers")
+            if _gamma_walls:
+                _outlook_lines.append(f"**Gamma Walls:** ${', $'.join(f'{g:.0f}' for g in _gamma_walls[:4])} — market-makers defend these levels aggressively")
+
+            # ── What to expect ──
+            _expect = []
+            if "BULLISH" in _isig or "BULL" in _isig:
+                _expect.append("🟢 Expect upward pressure — call writers (dealers) will buy stock to delta-hedge, amplifying moves up")
+                if _gamma_walls:
+                    _expect.append(f"🟢 If spot clears ${max(_gamma_walls):.0f} gamma wall, move could accelerate (gamma squeeze)")
+            elif "BEARISH" in _isig or "BEAR" in _isig:
+                _expect.append("🔴 Expect downward pressure — put buyers are positioning for a drop; dealers selling stock to hedge")
+                if _mp_best and spot and _mp_best < spot:
+                    _expect.append(f"🔴 Max pain ${_mp_best:.0f} is below spot — gravity pulls toward max pain into expiry")
+            elif "HEDGE" == _isig:
+                _expect.append("🔵 Institutions are buying protective puts — they expect volatility but are still long the stock")
+                _expect.append("🔵 Large hedge positions reduce dealer gamma → expect wider bid/ask and choppier moves")
+            elif "STRADDLE" in _isig:
+                _expect.append("🟣 Both sides active at ATM — expect a big move but direction unclear (earnings, Fed, event?)")
+            else:
+                _expect.append("⚪ No strong institutional conviction at this expiry — follow price action and volume")
+
+            # ── Current trades overlay ──
+            _trades_this_exp = pd.DataFrame()
+            if not _oi_open_trades.empty:
+                try:
+                    _exp_ymd = pd.to_datetime(expiry, format="%m-%d-%Y").strftime("%Y-%m-%d")
+                except Exception:
+                    _exp_ymd = expiry
+                _trades_this_exp = _oi_open_trades[_oi_open_trades["expiry"] == _exp_ymd]
+
+            if not _trades_this_exp.empty:
+                _outlook_lines.append("---")
+                _outlook_lines.append("**📂 Your Positions at This Expiry:**")
+                for _, _tr in _trades_this_exp.iterrows():
+                    _tr_k = float(_tr.get("strike", 0))
+                    _tr_ot = str(_tr.get("option_type","")).upper()
+                    _tr_ep = float(_tr.get("entry_price", 0))
+                    _tr_qty = int(_tr.get("quantity", 1) or 1)
+                    _tr_side = "BUY" if _tr_qty > 0 else "SELL"
+                    # Find nearest strike row in edf
+                    try:
+                        _nearest = edf.iloc[(edf["strike"] - _tr_k).abs().argsort()[:1]]
+                        _at_intent = _nearest["intent"].iloc[0] if "intent" in _nearest.columns else "N/A"
+                        _at_call_chg = int(_nearest["change_OI_Call"].iloc[0])
+                        _at_put_chg  = int(_nearest["change_OI_Put"].iloc[0])
+                        _oi_context  = f"ΔCall OI: {_at_call_chg:+,} | ΔPut OI: {_at_put_chg:+,} | Zone: {_at_intent}"
+                    except Exception:
+                        _oi_context = ""
+                    # Trade-specific outlook
+                    _tr_pnl_hint = ""
+                    if _tr_side == "BUY" and _tr_ot == "CALL":
+                        _tr_pnl_hint = "✅ Benefits if market moves up past your strike" if "BULL" in _isig else "⚠️ OI signal working against your long call"
+                    elif _tr_side == "BUY" and _tr_ot == "PUT":
+                        _tr_pnl_hint = "✅ Benefits if market moves down" if "BEAR" in _isig else "⚠️ OI signal working against your long put"
+                    elif _tr_side == "SELL" and _tr_ot == "CALL":
+                        _tr_pnl_hint = "✅ Covered call / short call benefits from BULLISH OI → stay in range" if "NEUTRAL" in _isig else "⚠️ Watch for breakout above strike"
+                    elif _tr_side == "SELL" and _tr_ot == "PUT":
+                        _tr_pnl_hint = "✅ Short put benefits from bullish/neutral OI" if "BULL" in _isig or "NEUTRAL" in _isig else "⚠️ OI pressure at puts — monitor closely"
+                    _outlook_lines.append(f"  • **{_tr_side} {_tr_ot} ${_tr_k:.0f}** ×{abs(_tr_qty)} entry ${_tr_ep:.2f} — {_oi_context}")
+                    if _tr_pnl_hint:
+                        _outlook_lines.append(f"    {_tr_pnl_hint}")
+
+            if not _trades_this_exp.empty:
+                _expect_prefix = "**What to expect given your positions:**"
+            else:
+                _expect_prefix = "**What to expect:**"
+            _outlook_lines.append("---")
+            _outlook_lines.append(_expect_prefix)
+            for _el in _expect:
+                _outlook_lines.append(f"  {_el}")
+
+            st.markdown("<br>".join(_outlook_lines), unsafe_allow_html=True)
 
         # ── Detail table ──
         tbl = edf[["strike", "openInt_Call_prev", "openInt_Call_now", "change_OI_Call",
@@ -6454,3 +7378,333 @@ if page == "🔬 OI Comparison Charts":
                 )
     else:
         st.info("Not enough data for advanced analysis.")
+
+
+
+
+# ===================================================================
+# ──  PAGE: LIVE MOMENTUM SCANNER
+# ===================================================================
+if page == "🚀 Live Momentum Scanner":
+
+    SCAN_UNIVERSE_DASH = [
+        "AAPL","MSFT","NVDA","AMZN","GOOGL","META","AVGO","ORCL",
+        "AMD","MRVL","MU","QCOM","INTC","ARM","SMCI","ON","TXN","AMAT","LRCX","KLAC",
+        "PLTR","SNOW","NET","CRWD","ZS","DDOG","PANW","NOW","OKTA","FTNT",
+        "JPM","GS","MS","BAC","V","MA","PYPL","COIN","HOOD",
+        "TSLA","RIVN","LCID","ENPH","FSLR","NEE",
+        "LLY","ABBV","MRNA","BIIB","PFE","GILD",
+        "COST","WMT","TGT","NKE",
+        "MSTR","RKLB","SOFI","IBIT","SQQQ","TQQQ",
+        "SPY","QQQ","IWM","XLK","XLE","GLD","SLV","USO",
+    ]
+
+    @st.cache_data(ttl=300)
+    def _run_scanner_dash(universe):
+        import warnings; warnings.filterwarnings("ignore")
+        try:
+            raw = yf.download(
+                tickers=" ".join(universe),
+                period="60d", interval="1d",
+                group_by="ticker", auto_adjust=True,
+                progress=False, threads=True,
+            )
+        except Exception:
+            return []
+        results = []
+        for tk in universe:
+            try:
+                h = raw[tk] if tk in raw.columns.get_level_values(0) else pd.DataFrame()
+                if h.empty or len(h) < 10:
+                    continue
+                h = h.dropna(subset=["Close"])
+                if len(h) < 10:
+                    continue
+                close   = float(h["Close"].iloc[-1])
+                vol_now = float(h["Volume"].iloc[-1])
+                vol_20d = float(h["Volume"].iloc[-21:-1].mean()) if len(h) > 21 else vol_now
+                ret_5d  = (close / float(h["Close"].iloc[-6])  - 1) * 100 if len(h) > 5  else 0
+                ret_10d = (close / float(h["Close"].iloc[-11]) - 1) * 100 if len(h) > 10 else 0
+                ret_20d = (close / float(h["Close"].iloc[-21]) - 1) * 100 if len(h) > 20 else 0
+                vol_rat = vol_now / max(vol_20d, 1)
+                closes  = h["Close"].values
+                consec_up = consec_dn = 0
+                for i in range(len(closes) - 1, 0, -1):
+                    if closes[i] > closes[i - 1]: consec_up += 1
+                    else: break
+                for i in range(len(closes) - 1, 0, -1):
+                    if closes[i] < closes[i - 1]: consec_dn += 1
+                    else: break
+                high_20d = float(h["High"].iloc[-20:].max())
+                low_20d  = float(h["Low"].iloc[-20:].min())
+                atr      = float((h["High"] - h["Low"]).rolling(14).mean().iloc[-1])
+                momentum  = ret_5d * 3 + ret_10d * 2 + ret_20d
+                vol_bonus = 20 if vol_rat >= 2.5 else (12 if vol_rat >= 2.0 else (5 if vol_rat >= 1.5 else 0))
+                if momentum > 0: momentum += vol_bonus
+                elif momentum < 0: momentum -= vol_bonus
+
+                # PCR from DB
+                pcr = 1.0
+                try:
+                    _pd = q("SELECT pcr_oi FROM stock_daily WHERE ticker=? ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1", (tk,))
+                    if _pd and _pd[0][0]:
+                        pcr = float(_pd[0][0])
+                except Exception:
+                    pass
+
+                results.append(dict(
+                    Ticker=tk, Price=round(close, 2),
+                    Ret5d=round(ret_5d, 1), Ret10d=round(ret_10d, 1), Ret20d=round(ret_20d, 1),
+                    VolRatio=round(vol_rat, 1), ConsecUp=consec_up, ConsecDn=consec_dn,
+                    Momentum=round(momentum, 1), ATR=round(atr, 2),
+                    High20d=round(high_20d, 2), Low20d=round(low_20d, 2), PCR=round(pcr, 2),
+                    Stop_Bull=round(max(close - atr * 1.8, low_20d * 0.99), 2),
+                    T1_Bull=round(close + atr * 2.0, 2),
+                    T2_Bull=round(close + atr * 4.5, 2),
+                    Stop_Bear=round(min(close + atr * 1.8, high_20d * 1.01), 2),
+                    T1_Bear=round(close - atr * 2.0, 2),
+                    T2_Bear=round(close - atr * 4.5, 2),
+                ))
+            except Exception:
+                continue
+        return results
+
+    st.title("🚀 Live Momentum Scanner")
+    st.caption("Scans 60+ tickers for unstoppable runners and breakdown stocks. Cached 5 min.")
+
+    col_r, col_s = st.columns([3, 1])
+    with col_s:
+        if st.button("🔄 Refresh Now", type="primary"):
+            st.cache_data.clear()
+
+    with st.spinner("Scanning universe (~20s first load, cached after)..."):
+        scan_results = _run_scanner_dash(tuple(SCAN_UNIVERSE_DASH))
+
+    if not scan_results:
+        st.error("Scanner failed to fetch data. Check internet connection.")
+        st.stop()
+
+    df_scan = pd.DataFrame(scan_results).sort_values("Momentum", ascending=False)
+    bulls = df_scan[df_scan["Momentum"] > 15].copy()
+    bears = df_scan[df_scan["Momentum"] < -15].copy().iloc[::-1]
+    neutral = df_scan[(df_scan["Momentum"] >= -15) & (df_scan["Momentum"] <= 15)].copy()
+
+    # ── Summary metrics ──────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🟢 Bull Signals", len(bulls))
+    m2.metric("🔴 Bear Signals", len(bears))
+    m3.metric("⚪ Neutral", len(neutral))
+    m4.metric("📊 Universe", len(df_scan))
+
+    st.markdown("---")
+
+    # ── Bull signals ─────────────────────────────────────────────
+    tab_bull, tab_bear, tab_all = st.tabs(["🟢 Bull Runners", "🔴 Falling / Breakdown", "📊 Full Universe"])
+
+    with tab_bull:
+        if bulls.empty:
+            st.info("No strong bull momentum detected right now. Markets may be choppy.")
+        else:
+            st.subheader(f"🟢 {len(bulls)} Bull Runner{'s' if len(bulls) != 1 else ''}")
+
+            for _, row in bulls.head(8).iterrows():
+                tk    = row["Ticker"]
+                close = row["Price"]
+                r5    = row["Ret5d"]
+                r20   = row["Ret20d"]
+                vr    = row["VolRatio"]
+                cons  = row["ConsecUp"]
+                pcr   = row["PCR"]
+                stop  = row["Stop_Bull"]
+                t1    = row["T1_Bull"]
+                t2    = row["T2_Bull"]
+                atr   = row["ATR"]
+                l20   = row["Low20d"]
+                h20   = row["High20d"]
+                tag   = "🚀 UNSTOPPABLE" if r5 > 15 else ("📈 BULL RUNNER" if r5 > 7 else "↗️ BUILDING")
+                rr    = (t1 - close) / max(close - stop, 0.01)
+                ph    = round(close * 0.97, 0)
+                pl    = round(stop  * 0.97, 0)
+
+                with st.expander(f"{tag}  {tk}  ${close:.2f}  |  5d {r5:+.1f}%  20d {r20:+.1f}%  Vol {vr:.1f}×", expanded=r5 > 15):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Price", f"${close:.2f}")
+                    c2.metric("5d Return", f"{r5:+.1f}%", delta=f"{r5:+.1f}%")
+                    c3.metric("20d Return", f"{r20:+.1f}%", delta=f"{r20:+.1f}%")
+
+                    c4, c5, c6 = st.columns(3)
+                    c4.metric("Vol Surge", f"{vr:.1f}×")
+                    c5.metric("Consec Days Up", cons)
+                    c6.metric("PCR", f"{pcr:.2f}", delta="Bullish" if pcr < 0.7 else ("Bearish" if pcr > 1.3 else "Neutral"))
+
+                    st.markdown("**📥 Trade Setup**")
+                    t_c1, t_c2, t_c3, t_c4 = st.columns(4)
+                    t_c1.metric("Entry Zone", f"${close - atr*0.3:.1f}–${close + atr*0.2:.1f}")
+                    t_c2.metric("🛑 Stop Loss", f"${stop:.2f}", delta=f"{(stop/close-1)*100:.1f}%")
+                    t_c3.metric("🎯 Target 1", f"${t1:.2f}", delta=f"{(t1/close-1)*100:+.1f}%")
+                    t_c4.metric("🎯 Target 2", f"${t2:.2f}", delta=f"{(t2/close-1)*100:+.1f}%")
+
+                    st.markdown(f"""
+**📐 R:R Ratio:** 1 : {rr:.1f} &nbsp;&nbsp; **20d Range:** ${l20:.1f} – ${h20:.1f}
+
+**🛡 Hedge:** Buy **${ph:.0f}p** / Sell **${pl:.0f}p** put spread (≥21 DTE)
+
+**⚠️ Safety Rules:**
+- Position size ≤ 2% of NAV
+- Trail stop to breakeven after Target 1 hit
+- Reduce size or exit if VIX > 25
+- Avoid adding near option expiry dates
+""")
+
+                    # Mini price chart
+                    try:
+                        _h = _cached_history(tk, period="30d", interval="1d")
+                        if not _h.empty:
+                            fig_mini = go.Figure()
+                            fig_mini.add_trace(go.Candlestick(
+                                x=_h.index, open=_h["Open"], high=_h["High"],
+                                low=_h["Low"], close=_h["Close"], name=tk,
+                                increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+                            ))
+                            fig_mini.add_hline(y=stop, line_color="red", line_dash="dash",
+                                               annotation_text=f"Stop ${stop:.1f}")
+                            fig_mini.add_hline(y=t1, line_color="green", line_dash="dot",
+                                               annotation_text=f"T1 ${t1:.1f}")
+                            fig_mini.update_layout(height=280, margin=dict(l=0, r=0, t=20, b=0),
+                                                   xaxis_rangeslider_visible=False,
+                                                   paper_bgcolor="rgba(0,0,0,0)",
+                                                   plot_bgcolor="rgba(20,20,20,0.8)")
+                            st.plotly_chart(fig_mini, use_container_width=True)
+                    except Exception:
+                        pass
+
+    with tab_bear:
+        if bears.empty:
+            st.info("No strong breakdown signals right now.")
+        else:
+            st.subheader(f"🔴 {len(bears)} Falling Stock{'s' if len(bears) != 1 else ''}")
+
+            for _, row in bears.head(8).iterrows():
+                tk    = row["Ticker"]
+                close = row["Price"]
+                r5    = row["Ret5d"]
+                r20   = row["Ret20d"]
+                vr    = row["VolRatio"]
+                cons  = row["ConsecDn"]
+                pcr   = row["PCR"]
+                stop  = row["Stop_Bear"]
+                t1    = row["T1_Bear"]
+                t2    = row["T2_Bear"]
+                atr   = row["ATR"]
+                l20   = row["Low20d"]
+                h20   = row["High20d"]
+                tag   = "🔥 FALLING KNIFE" if r5 < -15 else ("📉 BREAKDOWN" if r5 < -7 else "↘️ WEAKENING")
+                rr    = (close - t1) / max(stop - close, 0.01)
+                ch    = round(close * 1.03, 0)
+                cl_   = round(stop  * 1.01, 0)
+
+                with st.expander(f"{tag}  {tk}  ${close:.2f}  |  5d {r5:+.1f}%  20d {r20:+.1f}%  Vol {vr:.1f}×", expanded=r5 < -15):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Price", f"${close:.2f}")
+                    c2.metric("5d Return", f"{r5:+.1f}%", delta=f"{r5:+.1f}%")
+                    c3.metric("20d Return", f"{r20:+.1f}%", delta=f"{r20:+.1f}%")
+
+                    c4, c5, c6 = st.columns(3)
+                    c4.metric("Vol Surge", f"{vr:.1f}×")
+                    c5.metric("Consec Days Dn", cons)
+                    c6.metric("PCR", f"{pcr:.2f}", delta="Bearish" if pcr > 1.3 else ("Bullish" if pcr < 0.7 else "Neutral"))
+
+                    st.markdown("**📥 Trade Setup (Short via Puts)**")
+                    t_c1, t_c2, t_c3, t_c4 = st.columns(4)
+                    t_c1.metric("Short Entry", f"${close - atr*0.2:.1f}–${close + atr*0.3:.1f}")
+                    t_c2.metric("🛑 Stop Loss", f"${stop:.2f}", delta=f"{(stop/close-1)*100:+.1f}%")
+                    t_c3.metric("🎯 Target 1", f"${t1:.2f}", delta=f"{(t1/close-1)*100:+.1f}%")
+                    t_c4.metric("🎯 Target 2", f"${t2:.2f}", delta=f"{(t2/close-1)*100:+.1f}%")
+
+                    st.markdown(f"""
+**📐 R:R Ratio:** 1 : {rr:.1f} &nbsp;&nbsp; **20d Range:** ${l20:.1f} – ${h20:.1f}
+
+**🛡 Hedge:** Buy **${ch:.0f}c** / Sell **${cl_:.0f}c** call spread (≥21 DTE)
+
+**⚠️ Safety Rules:**
+- Use puts with ≥ 21 DTE — avoid expiry-day gamma risk
+- Cover/exit on a sharp gap-down open (avoid chasing)
+- PCR > 1.5 may signal put exhaustion — tighten stop
+- Do NOT short into known support / gamma walls
+""")
+
+                    try:
+                        _h = _cached_history(tk, period="30d", interval="1d")
+                        if not _h.empty:
+                            fig_mini = go.Figure()
+                            fig_mini.add_trace(go.Candlestick(
+                                x=_h.index, open=_h["Open"], high=_h["High"],
+                                low=_h["Low"], close=_h["Close"], name=tk,
+                                increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+                            ))
+                            fig_mini.add_hline(y=stop, line_color="red", line_dash="dash",
+                                               annotation_text=f"Stop ${stop:.1f}")
+                            fig_mini.add_hline(y=t1, line_color="#00bcd4", line_dash="dot",
+                                               annotation_text=f"T1 ${t1:.1f}")
+                            fig_mini.update_layout(height=280, margin=dict(l=0, r=0, t=20, b=0),
+                                                   xaxis_rangeslider_visible=False,
+                                                   paper_bgcolor="rgba(0,0,0,0)",
+                                                   plot_bgcolor="rgba(20,20,20,0.8)")
+                            st.plotly_chart(fig_mini, use_container_width=True)
+                    except Exception:
+                        pass
+
+    with tab_all:
+        st.subheader("📊 Full Universe Ranking")
+
+        def _color_momentum(val):
+            if val > 30:    return "background-color: #1b5e20; color: white"
+            if val > 15:    return "background-color: #2e7d32; color: white"
+            if val > 0:     return "background-color: #388e3c; color: white"
+            if val > -15:   return "background-color: #bf360c; color: white"
+            return "background-color: #b71c1c; color: white"
+
+        def _color_ret(val):
+            if val > 10:    return "color: #69f0ae"
+            if val > 3:     return "color: #a5d6a7"
+            if val < -10:   return "color: #ff5252"
+            if val < -3:    return "color: #ef9a9a"
+            return ""
+
+        display_cols = ["Ticker", "Price", "Ret5d", "Ret10d", "Ret20d",
+                        "VolRatio", "ConsecUp", "ConsecDn", "PCR", "Momentum"]
+        df_disp = df_scan[display_cols].rename(columns={
+            "Ret5d": "5d%", "Ret10d": "10d%", "Ret20d": "20d%",
+            "VolRatio": "Vol×", "ConsecUp": "↑Days", "ConsecDn": "↓Days",
+        })
+        styled = (df_disp.style
+                  .map(_color_momentum, subset=["Momentum"])
+                  .map(_color_ret, subset=["5d%", "10d%", "20d%"])
+                  .format({"Price": "${:.2f}", "5d%": "{:+.1f}%", "10d%": "{:+.1f}%",
+                           "20d%": "{:+.1f}%", "Vol×": "{:.1f}×", "Momentum": "{:.0f}"}))
+        st.dataframe(styled, use_container_width=True, height=600)
+
+        # Scatter plot: 5d% vs 20d% bubble chart
+        st.subheader("📡 Momentum Map (5d vs 20d Return)")
+        fig_scatter = go.Figure()
+        for _, row in df_scan.iterrows():
+            color = "#2e7d32" if row["Momentum"] > 15 else ("#b71c1c" if row["Momentum"] < -15 else "#546e7a")
+            fig_scatter.add_trace(go.Scatter(
+                x=[row["Ret20d"]], y=[row["Ret5d"]],
+                mode="markers+text",
+                text=[row["Ticker"]], textposition="top center",
+                marker=dict(size=max(8, min(30, abs(row["Momentum"]) / 3)),
+                            color=color, opacity=0.8, line=dict(width=1, color="white")),
+                name=row["Ticker"], showlegend=False,
+                hovertemplate=f"<b>{row['Ticker']}</b><br>5d: {row['Ret5d']:+.1f}%<br>20d: {row['Ret20d']:+.1f}%<br>Vol: {row['VolRatio']:.1f}×<extra></extra>",
+            ))
+        fig_scatter.add_hline(y=0, line_color="gray", line_width=1)
+        fig_scatter.add_vline(x=0, line_color="gray", line_width=1)
+        fig_scatter.update_layout(
+            height=550, xaxis_title="20d Return %", yaxis_title="5d Return %",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(20,20,20,0.8)",
+            font=dict(color="white"),
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
+
+    st.caption("⚠️ All signals are algorithmic based on price momentum and volume. Always verify with OI data, news, and your own analysis before trading. Past momentum does not guarantee future returns.")
