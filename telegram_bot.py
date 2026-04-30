@@ -10207,7 +10207,10 @@ async def aftermarket_predict(query, ticker: str = None):
             side_s    = "LONG" if qty > 0 else "SHORT"
             ot_s      = ot.upper()[:4]
 
-            val_now   = bs_price(spot_reg, strk, T_now,  r_rate, iv_pos, opt=opt_lc)
+            # Option price at EOD spot and at AH spot — both shown
+            val_eod   = bs_price(spot_reg, strk, T_now,  r_rate, iv_pos, opt=opt_lc)
+            val_ah    = bs_price(spot_ext, strk, T_now,  r_rate, iv_pos, opt=opt_lc)
+            val_now   = val_ah if is_ext else val_eod   # "now" = AH-adjusted if available
             val_tmrw  = bs_price(spot_ext, strk, T_tmrw, r_rate, iv_pos, opt=opt_lc)
             val_post  = bs_price(spot_ext, strk, T_tmrw, r_rate, iv_pos * 0.70, opt=opt_lc) \
                         if ev["has_event"] and (ev["event_days"] or 99) <= 1 else None
@@ -10215,6 +10218,7 @@ async def aftermarket_predict(query, ticker: str = None):
             pnl_vs_entry = (val_now  - entry) * 100 * contracts * pos_sign
             pnl_tmrw_dol = (val_tmrw - entry) * 100 * contracts * pos_sign
             pnl_chg_pct  = (val_tmrw - val_now) / val_now * 100 * pos_sign if val_now > 0 else 0
+            pnl_eod_dol  = (val_eod  - entry) * 100 * contracts * pos_sign  # EOD-based P&L for reference
 
             tk_pnl_now   += pnl_vs_entry
             tk_pnl_tmrw  += pnl_tmrw_dol
@@ -10234,24 +10238,25 @@ async def aftermarket_predict(query, ticker: str = None):
             elif pnl_pct <= -40 or pnl_chg_pct <= -10:
                 action = "STOP LOSS"
                 limit  = round(max(val_tmrw * 1.05, entry * 0.55), 2)
-                reason = f"Down {pnl_pct:.0f}%" if pnl_pct <= -40 else f"AH-predicted -{abs(pnl_chg_pct):.0f}%"
+                reason = f"Down {pnl_pct:.0f}%" if pnl_pct <= -40 else f"AH-{abs(pnl_chg_pct):.0f}%dn"
             elif pnl_chg_pct >= 8:
                 action = "HOLD"
                 limit  = None
-                reason = f"Predicted +{pnl_chg_pct:.0f}% tmrw"
+                reason = f"+{pnl_chg_pct:.0f}% tmrw"
             else:
                 action = "WATCH"
                 limit  = None
-                reason = "Neutral overnight"
+                reason = "Neutral"
 
             crush_sfx = ""
             if val_post is not None:
                 pnl_post = (val_post - entry) * 100 * contracts * pos_sign
-                crush_sfx = f" | crush→${val_post:.2f} P&L${pnl_post:+,.0f}"
+                crush_sfx = f"crush→${val_post:.2f} P&L${pnl_post:+,.0f}"
 
             leg_lines.append((
                 side_s, ot_s, strk, dte, entry,
-                val_now, pnl_vs_entry, pnl_pct,
+                val_eod, val_ah, is_ext,
+                pnl_eod_dol, pnl_vs_entry, pnl_pct,
                 val_tmrw, pnl_chg_pct, action, limit, reason, crush_sfx
             ))
             all_orders.append({"tk": tk, "ot_s": ot_s, "strk": strk, "action": action,
@@ -10269,31 +10274,38 @@ async def aftermarket_predict(query, ticker: str = None):
             + ev_line
         )
 
-        # Flat <pre> leg table
-        _C = [5, 5, 6, 4, 6, 6, 6, 5, 5]
-        _H = ("Side","Type","Strk","DTE","Entry","Now","P&L%","Tmrw","Act")
+        # ── Flat <pre> leg table — EOD + AH prices side by side ─────
+        # Cols: Side Type Strk DTE Entry  EOD-val  AH-val  P&L%  Tmrw  Act
+        _C = [5, 4, 6, 3, 6, 6, 6, 5, 6, 5]
+        _H = ("Side","Type","Strk","DTE","Entry","EOD$","AH$","P&L%","Tmrw$","Act")
         _sep = "─" * (sum(_C) + len(_C) - 1)
         _rows = [
             "  ".join(str(h).ljust(w) for h, w in zip(_H, _C)),
             _sep,
         ]
-        for (sd, ot2, st2, dt2, en2, vn, pnl_d, pnl_p, vt, pct_t, act, lim, rsn, csfx) in leg_lines:
+        for (sd, ot2, st2, dt2, en2, v_eod, v_ah, _is_ext,
+             pnl_eod, pnl_d, pnl_p, vt, pct_t, act, lim, rsn, csfx) in leg_lines:
             act_s = act[:5] if act else "WATCH"
+            # highlight AH col with * when extended hours
+            ah_s = f"${v_ah:.2f}" + ("*" if _is_ext else " ")
             _rows.append("  ".join([
                 str(sd)[:_C[0]].ljust(_C[0]),
                 str(ot2)[:_C[1]].ljust(_C[1]),
                 f"${st2:.0f}".rjust(_C[2]),
                 f"{dt2}d".rjust(_C[3]),
                 f"${en2:.2f}".rjust(_C[4]),
-                f"${vn:.2f}".rjust(_C[5]),
-                f"{pnl_p:+.0f}%".rjust(_C[6]),
-                f"${vt:.2f}".rjust(_C[7]),
-                str(act_s).ljust(_C[8]),
+                f"${v_eod:.2f}".rjust(_C[5]),
+                ah_s.rjust(_C[6]),
+                f"{pnl_p:+.0f}%".rjust(_C[7]),
+                f"${vt:.2f}".rjust(_C[8]),
+                str(act_s).ljust(_C[9]),
             ]))
             if csfx:
                 _rows.append(f"  🔥 {csfx}")
         _rows.append(_sep)
-        for (sd, ot2, st2, dt2, en2, vn, pnl_d, pnl_p, vt, pct_t, act, lim, rsn, csfx) in leg_lines:
+        _rows.append("* = AH/PM price used for premium calc")
+        for (sd, ot2, st2, dt2, en2, v_eod, v_ah, _is_ext,
+             pnl_eod, pnl_d, pnl_p, vt, pct_t, act, lim, rsn, csfx) in leg_lines:
             if lim:
                 _rows.append(f"  -> {act}: limit ${lim:.2f}  ({rsn})")
 

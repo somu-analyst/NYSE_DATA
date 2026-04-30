@@ -186,6 +186,61 @@ def _cached_price(ticker: str) -> float:
     except Exception:
         return 0.0
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _get_ah_price(ticker: str) -> dict:
+    """Fetch after-hours / pre-market price via yfinance fast_info. Returns dict with
+    spot_reg, spot_ah, ah_chg_pct, is_extended, label ('AH'/'PM'/'EOD')."""
+    result = {"spot_reg": 0.0, "spot_ah": 0.0, "ah_chg_pct": 0.0, "is_extended": False, "label": "EOD"}
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        reg = float(getattr(fi, "regular_market_previous_close", 0) or 0)
+        if reg <= 0:
+            h = _cached_history(ticker, period="2d")
+            reg = float(h["Close"].iloc[-1]) if len(h) >= 1 else 0.0
+        result["spot_reg"] = reg
+
+        post = float(getattr(fi, "post_market_price", 0) or 0)
+        pre  = float(getattr(fi, "pre_market_price", 0) or 0)
+        last = float(getattr(fi, "last_price", 0) or 0)
+
+        if post > 0:
+            result["spot_ah"]      = post
+            result["is_extended"]  = True
+            result["label"]        = "AH"
+        elif pre > 0:
+            result["spot_ah"]      = pre
+            result["is_extended"]  = True
+            result["label"]        = "PM"
+        elif last > 0:
+            result["spot_ah"]      = last
+            result["label"]        = "Live"
+        else:
+            result["spot_ah"]      = reg
+
+        if reg > 0:
+            result["ah_chg_pct"] = (result["spot_ah"] - reg) / reg * 100
+    except Exception:
+        result["spot_ah"] = result["spot_reg"]
+    return result
+
+def _spot(ticker: str) -> float:
+    """Return AH price when toggle is on, else EOD close. Use this everywhere instead of _cached_price()."""
+    if st.session_state.get("use_ah", False):
+        d = _get_ah_price(ticker)
+        return d["spot_ah"] if d["spot_ah"] > 0 else d["spot_reg"]
+    return _cached_price(ticker)
+
+def _spot_label(ticker: str) -> str:
+    """Short label showing EOD and AH price, e.g. 'EOD $248.50 → AH $251.20 (+1.1%)'."""
+    d = _get_ah_price(ticker)
+    reg = d["spot_reg"]
+    ah  = d["spot_ah"]
+    chg = d["ah_chg_pct"]
+    lbl = d["label"]
+    if d["is_extended"]:
+        return f"EOD ${reg:.2f}  →  {lbl} <b>${ah:.2f}</b> ({chg:+.1f}%)"
+    return f"EOD ${reg:.2f}"
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_trades(status: str = None):
     """Load trades from DB — cached 30 s."""
@@ -1350,16 +1405,27 @@ with st.sidebar:
     if page in _PAGE_HELP:
         st.info(f"**{page}**\n\n{_PAGE_HELP[page]}")
     st.markdown("---")
+
+    st.markdown("---")
     st.caption(f"Data: Yahoo Finance + Local DB")
     st.caption(f"DB: US_data.db")
 
 
 # ── Page header helper ──────────────────────────────────────────────
 def _page_header(title: str, help_text: str = ""):
-    """Render a styled page header with optional help pill."""
-    h1, h2 = st.columns([5, 1])
+    """Render a styled page header with AH toggle top-right and optional help pill."""
+    h1, h_ah, h2 = st.columns([4, 2, 1])
     with h1:
         st.markdown(f"<h2>{title}</h2>", unsafe_allow_html=True)
+    with h_ah:
+        st.toggle(
+            "🌙 AH Prices",
+            value=st.session_state.get("use_ah", False),
+            key="use_ah",
+            help="Use After-Hours / Pre-Market price for all spot, premium & P&L calculations across every page.",
+        )
+        _mode_lbl = "🌙 After-Hours mode" if st.session_state.get("use_ah") else "☀️ EOD close mode"
+        st.caption(_mode_lbl)
     if help_text:
         with h2:
             with st.popover("ℹ️ Help"):
@@ -2447,9 +2513,15 @@ elif page == "🔥 OI Analytics & Prediction":
     _conviction = "HIGH" if max(_bull_ct, _bear_ct) >= 3 else ("MEDIUM" if max(_bull_ct, _bear_ct) == 2 else "LOW")
     _direction  = "BULLISH" if _bull_ct > _bear_ct else ("BEARISH" if _bear_ct > _bull_ct else "NEUTRAL")
 
-    # Live price
+    # Live price — AH-aware
     try:
-        _live_px = _cached_price(sel_ticker)
+        _live_px_eod = _cached_price(sel_ticker)
+        _live_ah_d   = _get_ah_price(sel_ticker)
+        _live_px = (_live_ah_d["spot_ah"] if _live_ah_d["spot_ah"] > 0 else _live_px_eod) \
+                   if st.session_state.get("use_ah") else _live_px_eod
+        if _live_ah_d["is_extended"]:
+            st.info(f"🌙 **{sel_ticker}** — EOD ${_live_px_eod:.2f}  →  {_live_ah_d['label']} **${_live_ah_d['spot_ah']:.2f}** "
+                    f"({_live_ah_d['ah_chg_pct']:+.1f}%)  {'*(used for calcs)*' if st.session_state.get('use_ah') else '*(toggle AH mode to use)*'}")
     except Exception:
         _live_px = 0
 
@@ -3191,7 +3263,7 @@ elif page == "💼 Portfolio & Suggestions":
             _acct= str(_t.get("account_type","Taxable"))
             _nts = str(_t.get("notes","") or "")
             if _tk not in _spot_cache:
-                try: _spot_cache[_tk] = _cached_price(_tk)
+                try: _spot_cache[_tk] = _spot(_tk)
                 except: _spot_cache[_tk] = 0.0
             _spot = _spot_cache[_tk]
             try:
@@ -3308,8 +3380,14 @@ elif page == "💼 Portfolio & Suggestions":
                 _iv_str=f"{_iv_r:.0f}%" if _iv_r is not None else "—"
                 _iv_note=("🔥HIGH" if (_iv_r or 0)>75 else ("💤LOW" if (_iv_r or 100)<25 else "MID"))
                 _conc2=round(_gc/_tc*100,0) if _tc>0 else 0
+                _grp_ah = _get_ah_price(_stk)
+                _grp_eod = _grp_ah["spot_reg"] if _grp_ah["spot_reg"] > 0 else _legs[0]["Stock_Px"]
+                _grp_ahe = _grp_ah["spot_ah"]  if _grp_ah["spot_ah"]  > 0 else _grp_eod
+                _grp_has_ah = abs(_grp_ahe - _grp_eod) > 0.05
+                _grp_spot_str = (f"${_grp_ahe:.2f}🌙 (EOD ${_grp_eod:.2f})" if _grp_has_ah
+                                 else f"${_grp_eod:.2f}")
                 _grp_rows.append({
-                    "Ticker":_stk,"Stock $":round(_legs[0]["Stock_Px"],2),
+                    "Ticker":_stk,"Stock $":_grp_spot_str,
                     "Strategy":_detect_strategy(_legs),"Legs":len(_legs),
                     "Group P&L $":round(_gp,2),"Group P&L %":round(_gpc,1),
                     "Net Delta":round(sum(l["Delta"] for l in _legs),3),
@@ -3340,13 +3418,29 @@ elif page == "💼 Portfolio & Suggestions":
                 _gc=sum(abs(l["Entry"])*abs(l["Qty"])*100 for l in _legs)
                 _gpc=(_gp/_gc*100) if _gc>0 else 0
                 _strat=_detect_strategy(_legs)
-                _spv=_legs[0]["Stock_Px"]
+                _spv_ah  = _get_ah_price(_stk)
+                _spv_eod = _spv_ah["spot_reg"] if _spv_ah["spot_reg"] > 0 else _legs[0]["Stock_Px"]
+                _spv_ext = _spv_ah["spot_ah"]  if _spv_ah["spot_ah"]  > 0 else _spv_eod
+                _spv_is_ext = _spv_ah["is_extended"]
+                _spv_has_ah = abs(_spv_ext - _spv_eod) > 0.05   # any AH data at all
+                _spv     = _spv_ext if st.session_state.get("use_ah") else _spv_eod
+                _spv_lbl = (f"EOD ${_spv_eod:.2f} → {_spv_ah['label']} **${_spv_ext:.2f}** ({_spv_ah['ah_chg_pct']:+.1f}%)"
+                            if _spv_has_ah else f"${_spv_eod:.2f}")
                 _ico="🟢" if _gp>=0 else "🔴"
-                _lbl=f"{_ico} **{_stk}** — {_strat} ({len(_legs)} leg{'s' if len(_legs)>1 else ''})  |  Stock ${_spv:.2f}  |  Group P&L **${_gp:+,.2f}** ({_gpc:+.1f}%)"
+                _lbl=f"{_ico} **{_stk}** — {_strat} ({len(_legs)} leg{'s' if len(_legs)>1 else ''})  |  Stock {_spv_lbl}  |  Group P&L **${_gp:+,.2f}** ({_gpc:+.1f}%)"
                 with st.expander(_lbl,expanded=(len(_tg)==1)):
                     _ngd=sum(l["Delta"] for l in _legs); _ngt=sum(l["Theta"] for l in _legs)
                     _ngg=sum(l["Gamma"] for l in _legs); _ngv=sum(l["Vega"]  for l in _legs)
-                    gc1,gc2,gc3,gc4,gc5=st.columns(5)
+                    gc0,gc1,gc2,gc3,gc4,gc5=st.columns(6)
+                    # Stock price metric — always show AH when available
+                    if _spv_has_ah:
+                        gc0.metric(
+                            f"Stock EOD→{_spv_ah['label']}",
+                            f"${_spv_ext:.2f}",
+                            f"{_spv_ah['ah_chg_pct']:+.2f}%  (EOD ${_spv_eod:.2f})",
+                        )
+                    else:
+                        gc0.metric("Stock (EOD)", f"${_spv_eod:.2f}")
                     gc1.metric("Group P&L",f"${_gp:+,.2f}",f"{_gpc:+.1f}%")
                     gc2.metric("Net Delta",f"{_ngd:+.3f}")
                     gc3.metric("Net Theta/d",f"${_ngt*100:+.2f}")
@@ -3381,8 +3475,12 @@ elif page == "💼 Portfolio & Suggestions":
                     fig_g.add_trace(go.Scatter(x=_sr,y=_comb,mode="lines",name="Combined",
                         fill="tozeroy",line=dict(color="#00d4aa",width=3),fillcolor="rgba(0,212,170,0.10)"))
                     fig_g.add_hline(y=0,line_dash="dash",line_color="#aaa")
-                    fig_g.add_vline(x=_spv,line_dash="dot",line_color="#e65100",
-                                   annotation_text=f"${_spv:.0f}",annotation_position="top right")
+                    fig_g.add_vline(x=_spv_eod,line_dash="dot",line_color="#e65100",
+                                   annotation_text=f"EOD ${_spv_eod:.0f}",annotation_position="top right")
+                    if _spv_has_ah and abs(_spv_ext - _spv_eod) > 0.10:
+                        fig_g.add_vline(x=_spv_ext,line_dash="dot",line_color="#7b1fa2",
+                                       annotation_text=f"{_spv_ah['label']} ${_spv_ext:.0f} ({_spv_ah['ah_chg_pct']:+.1f}%)",
+                                       annotation_position="top left")
                     for _i in np.where(np.diff(np.sign(_comb)))[0]:
                         _be=(_sr[_i]+_sr[_i+1])/2
                         fig_g.add_vline(x=_be,line_dash="longdash",line_color="#ffa000",
@@ -3396,18 +3494,67 @@ elif page == "💼 Portfolio & Suggestions":
                     st.markdown("**Individual Legs:**")
                     for _li,pos in enumerate(_legs):
                         _lc=_LC[_li%len(_LC)]; _sl="BUY" if pos["Qty"]>0 else "SELL"
-                        _li2="🟢" if pos["PnL"]>=0 else "🔴"
+                        _pnl_color="#1b5e20" if pos["PnL"]>=0 else "#b71c1c"
                         _roll_hint=_roll_suggestion(pos, _spv)
                         _bg="#fff8e1" if pos["DTE"]<=5 else ("#ffebee" if pos["PnL%"]<-30 else "#fafafa")
+
+                        # AH option premium via BS at AH spot
+                        _ah_opt, _ah_pnl = None, None
+                        if _spv_has_ah and pos["DTE"] > 0:
+                            try:
+                                _ah_T   = max(pos["DTE"], 0.5) / 365.0
+                                _ah_opt = bs_greeks(_spv_ext, pos["Strike"], _ah_T, 0.045, 0.30,
+                                                    pos["Type"].lower())["price"]
+                                _ah_pnl = (_ah_opt - pos["Entry"]) * pos["Qty"] * 100
+                            except Exception:
+                                pass
+
+                        # ── Leg header ──────────────────────────────────────────
+                        _dte_warn = "⚠️ " if pos["DTE"] <= 5 else ""
                         st.markdown(
-                            f"<div style='border-left:4px solid {_lc};padding:6px 12px;"
-                            f"margin:4px 0;border-radius:4px;background:{_bg};'>"
-                            f"<b>L{_li+1}: {_sl} {pos['Type']} ${pos['Strike']} exp {pos['Expiry']} ×{abs(pos['Qty'])}</b>"
-                            f" &nbsp; {_li2} P&L <b>${pos['PnL']:+,.2f}</b> ({pos['PnL%']:+.1f}%)"
-                            f" &nbsp; Entry ${pos['Entry']:.2f} → ${pos['Current']:.2f}"
-                            f" &nbsp; DTE:{pos['DTE']} Δ:{pos['Delta']:+.3f} Θ:${pos['Theta']*100:.2f}/d"
-                            + (f"<br>{_roll_hint}" if _roll_hint else "")
-                            + f"</div>",unsafe_allow_html=True)
+                            f"<div style='border-left:5px solid {_lc};padding:4px 12px 0 12px;"
+                            f"margin-top:10px;background:{_bg};border-radius:4px 4px 0 0;'>"
+                            f"<b>L{_li+1}: {_sl} {pos['Type']} &nbsp; K${pos['Strike']:.0f} &nbsp; "
+                            f"exp {pos['Expiry']} &nbsp; ×{abs(pos['Qty'])}</b>"
+                            f" &nbsp;&nbsp; {_dte_warn}DTE <b>{pos['DTE']}</b> &nbsp; "
+                            f"Δ <b>{pos['Delta']:+.3f}</b> &nbsp; Θ <b>${pos['Theta']*100:.2f}/d</b>"
+                            f"</div>", unsafe_allow_html=True)
+
+                        # ── Metric row ───────────────────────────────────────────
+                        _ncols = 6 if _spv_has_ah else 5
+                        _mc = st.columns(_ncols)
+                        _mc[0].metric("Entry Premium", f"${pos['Entry']:.2f}",
+                                      help="Option premium you paid (long) or received (short) per share")
+                        _mc[1].metric("☀️ EOD Premium", f"${pos['Current']:.2f}",
+                                      delta=f"{pos['Current']-pos['Entry']:+.2f} vs entry",
+                                      delta_color="normal" if pos["Qty"]>0 else "inverse",
+                                      help="Current option premium based on EOD stock close (Black-Scholes)")
+                        if _spv_has_ah and _ah_opt is not None:
+                            _mc[2].metric(f"🌙 {_spv_ah['label']} Premium", f"${_ah_opt:.2f}",
+                                          delta=f"{_ah_opt-pos['Current']:+.2f} vs EOD",
+                                          delta_color="normal" if pos["Qty"]>0 else "inverse",
+                                          help=f"Option premium recalculated at AH stock price ${_spv_ext:.2f}")
+                            _mc[3].metric("P&L (EOD)", f"${pos['PnL']:+,.0f}",
+                                          f"{pos['PnL%']:+.1f}%",
+                                          delta_color="normal" if pos["PnL"]>=0 else "inverse")
+                            _mc[4].metric(f"P&L ({_spv_ah['label']})", f"${_ah_pnl:+,.0f}",
+                                          f"{(_ah_pnl/(pos['Entry']*abs(pos['Qty'])*100)*100) if pos['Entry']>0 else 0:+.1f}%",
+                                          delta_color="normal" if _ah_pnl>=0 else "inverse")
+                            _mc[5].metric("Stock", f"${_spv_ext:.2f}",
+                                          f"{_spv_ah['ah_chg_pct']:+.1f}% AH  (EOD ${_spv_eod:.2f})")
+                        else:
+                            _mc[2].metric("P&L $", f"${pos['PnL']:+,.0f}",
+                                          delta_color="normal" if pos["PnL"]>=0 else "inverse")
+                            _mc[3].metric("P&L %", f"{pos['PnL%']:+.1f}%",
+                                          delta_color="normal" if pos["PnL"]>=0 else "inverse")
+                            _mc[4].metric("Stock (EOD)", f"${_spv_eod:.2f}")
+
+                        if _roll_hint:
+                            st.markdown(
+                                f"<div style='border-left:5px solid {_lc};padding:4px 12px;"
+                                f"margin-bottom:4px;background:{_bg};border-radius:0 0 4px 4px;"
+                                f"font-size:0.85em;color:#555;'>{_roll_hint}</div>",
+                                unsafe_allow_html=True)
                         with st.expander(f"  ↳ Close/Edit L{_li+1}: {_sl} {pos['Type']} ${pos['Strike']}"):
                             _et1, _et2 = st.tabs(["✅ Close", "✏️ Edit"])
                             with _et1:
@@ -4002,18 +4149,19 @@ elif page == "🔮 Live Position Predictor":
             vol_pcr = p_vol / c_vol if c_vol > 0 else 0
             net_bias = c_chg - p_chg
 
-            # Spot price
+            # Spot price — EOD from DB, AH from yfinance if toggle on
             sd = load_stock_daily(tk)
-            spot = None
+            spot_eod = None
             if not sd.empty:
                 row_sd = sd[sd["trade_date"] == latest_date]
                 if not row_sd.empty:
-                    spot = float(row_sd["close"].iloc[0])
-            if spot is None:
-                try:
-                    spot = _cached_price(tk)
-                except Exception:
-                    spot = 0
+                    spot_eod = float(row_sd["close"].iloc[0])
+            if spot_eod is None:
+                try: spot_eod = _cached_price(tk)
+                except Exception: spot_eod = 0
+            _ah_d  = _get_ah_price(tk)
+            spot_ah = _ah_d["spot_ah"] if _ah_d["spot_ah"] > 0 else spot_eod
+            spot = spot_ah if st.session_state.get("use_ah") else spot_eod
 
             # Composite signal
             oi_signal = 1 if net_bias > 0 else -1
@@ -4046,9 +4194,15 @@ elif page == "🔮 Live Position Predictor":
                 action = "HOLD / SELL PREMIUM"
 
             # Display ticker card
-            with st.expander(f"{'🟢' if composite > 0 else '🔴' if composite < 0 else '🟡'} **{tk}** — {pred} (Score: {composite:+d}) | Spot: ${spot:.2f}", expanded=(tk in open_tickers)):
+            _ah_chg = _ah_d["ah_chg_pct"]; _ah_lbl = _ah_d["label"]
+            _ext_tag = f"  🌙{_ah_lbl} ${spot_ah:.2f} ({_ah_chg:+.1f}%)" if _ah_d["is_extended"] else ""
+            with st.expander(f"{'🟢' if composite > 0 else '🔴' if composite < 0 else '🟡'} **{tk}** — {pred} (Score: {composite:+d}) | EOD ${spot_eod:.2f}{_ext_tag}", expanded=(tk in open_tickers)):
                 pc1, pc2, pc3, pc4, pc5, pc6 = st.columns(6)
-                pc1.metric("Spot", f"${spot:.2f}" if spot else "N/A")
+                if _ah_d["is_extended"]:
+                    pc1.metric(f"EOD → {_ah_lbl}", f"${spot_ah:.2f}", delta=f"{_ah_chg:+.1f}%",
+                               help=f"EOD close: ${spot_eod:.2f}")
+                else:
+                    pc1.metric("Spot (EOD)", f"${spot_eod:.2f}" if spot_eod else "N/A")
                 pc2.metric("PCR (OI)", f"{pcr:.2f}")
                 pc3.metric("Net OI Bias", f"{net_bias:+,.0f}")
                 pc4.metric("Call Vol", f"{c_vol:,.0f}")
@@ -4124,7 +4278,10 @@ elif page == "🔮 Live Position Predictor":
                 _wl_low = round(spot * 0.80, 2) if spot else 80.0
                 _wl_high = round(spot * 1.20, 2) if spot else 120.0
 
-                st.caption(f"IV: {_wl_iv:.1%} ({_wl_iv_src}) | Spot: ${spot:.2f}" if spot else f"IV: {_wl_iv:.1%}")
+                _wl_ah_d = _get_ah_price(tk)
+                _wl_spot_lbl = (f"EOD ${spot_eod:.2f} → {_wl_ah_d['label']} ${_wl_ah_d['spot_ah']:.2f} ({_wl_ah_d['ah_chg_pct']:+.1f}%)"
+                                if _wl_ah_d["is_extended"] else f"EOD ${spot_eod:.2f}")
+                st.caption(f"IV: {_wl_iv:.1%} ({_wl_iv_src}) | {_wl_spot_lbl}" if spot else f"IV: {_wl_iv:.1%}")
 
                 _wl_sl_px = st.slider("📈 Future Stock Price ($)",
                     min_value=_wl_low, max_value=_wl_high,
@@ -4624,13 +4781,18 @@ elif page == "⚡ Trade Risk Calculator":
     sim_buy_date = sim_c7.date_input("Buy Date", value=datetime.now().date(), key="sim_buy_dt",
                                       help="When you bought / plan to buy")
 
-    # Auto-fetch IV + spot
+    # Auto-fetch IV + spot (AH-aware)
     _sim_iv = 0.30
     _sim_iv_src = "Default (30%)"
     _sim_spot = 580.0
     try:
         _sim_tk_obj = yf.Ticker(sim_ticker)
-        _sim_spot = float(_sim_tk_obj.history(period="1d")["Close"].iloc[-1])
+        _sim_eod = float(_sim_tk_obj.history(period="1d")["Close"].iloc[-1])
+        _sim_ah_d = _get_ah_price(sim_ticker)
+        _sim_spot = (_sim_ah_d["spot_ah"] if _sim_ah_d["spot_ah"] > 0 else _sim_eod) \
+                    if st.session_state.get("use_ah") else _sim_eod
+        if _sim_ah_d["is_extended"]:
+            st.caption(f"🌙 AH price: **${_sim_ah_d['spot_ah']:.2f}** ({_sim_ah_d['ah_chg_pct']:+.1f}%)  EOD: ${_sim_eod:.2f}")
         try:
             _sim_chain = _sim_tk_obj.option_chain(sim_expiry.strftime("%Y-%m-%d"))
             _sim_oc = _sim_chain.calls if sim_opt_type == "call" else _sim_chain.puts
@@ -4659,7 +4821,8 @@ elif page == "⚡ Trade Risk Calculator":
             _sim_iv = _sim_iv_ovr
             _sim_iv_src = f"Manual ({_sim_iv:.1%})"
 
-    st.caption(f"📊 Spot: ${_sim_spot:.2f} | IV: {_sim_iv:.1%} ({_sim_iv_src})")
+    _sim_mode = "🌙 AH" if st.session_state.get("use_ah") else "☀️ EOD"
+    st.caption(f"📊 {_sim_mode} Spot: ${_sim_spot:.2f} | IV: {_sim_iv:.1%} ({_sim_iv_src})")
 
     # ── Sliders ──
     sim_exp_dt = datetime.combine(sim_expiry, datetime.min.time())
@@ -5039,15 +5202,28 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             try:
                 _btk_obj   = yf.Ticker(_ep_sel_tk)
                 _btk_hist  = _btk_obj.history(period="60d")
-                _btk_spot  = float(_btk_hist["Close"].iloc[-1]) if len(_btk_hist) >= 1 else 0
-                _btk_prev  = float(_btk_hist["Close"].iloc[-2]) if len(_btk_hist) >= 2 else _btk_spot
-                _btk_chg   = (_btk_spot - _btk_prev) / _btk_prev * 100 if _btk_prev else 0
+                _btk_eod   = float(_btk_hist["Close"].iloc[-1]) if len(_btk_hist) >= 1 else 0
+                _btk_prev  = float(_btk_hist["Close"].iloc[-2]) if len(_btk_hist) >= 2 else _btk_eod
+                _btk_chg   = (_btk_eod - _btk_prev) / _btk_prev * 100 if _btk_prev else 0
             except Exception:
-                _btk_spot, _btk_prev, _btk_chg = 0, 0, 0
+                _btk_eod, _btk_prev, _btk_chg = 0, 0, 0
+            _btk_ah_d  = _get_ah_price(_ep_sel_tk)
+            _btk_ah    = _btk_ah_d["spot_ah"] if _btk_ah_d["spot_ah"] > 0 else _btk_eod
+            _btk_spot  = _btk_ah if st.session_state.get("use_ah") else _btk_eod
+            _btk_is_ext = _btk_ah_d["is_extended"]
+            _btk_ah_chg = _btk_ah_d["ah_chg_pct"]
+            _btk_ah_lbl = _btk_ah_d["label"]
 
         # ── Header metrics ──
         bh1, bh2, bh3, bh4 = st.columns(4)
-        bh1.metric(f"{_ep_sel_tk} Spot", f"${_btk_spot:.2f}", f"{_btk_chg:+.2f}%")
+        if _btk_is_ext:
+            bh1.metric(
+                f"{_ep_sel_tk} EOD → {_btk_ah_lbl}",
+                f"${_btk_ah:.2f}",
+                f"{_btk_ah_chg:+.2f}% AH  (EOD ${_btk_eod:.2f}  {_btk_chg:+.1f}%)",
+            )
+        else:
+            bh1.metric(f"{_ep_sel_tk} Spot", f"${_btk_eod:.2f}", f"{_btk_chg:+.2f}%")
         bh2.metric("Open Legs", len(_ep_tk_trades))
 
         # ── Per-leg table ──
@@ -5085,7 +5261,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         try:
             from scipy.stats import norm as _norm
             _r_rate = 0.05
-            _spot_range = np.linspace(_btk_spot * 0.70, _btk_spot * 1.30, 200) if _btk_spot > 0 else np.array([])
+            _spot_range = np.linspace(_btk_eod * 0.70, _btk_eod * 1.30, 200) if _btk_eod > 0 else np.array([])
             if len(_spot_range) > 0:
                 _total_payoff = np.zeros(len(_spot_range))
                 _total_entry_cost = 0.0
@@ -5445,9 +5621,10 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 except Exception:
                     pass
 
-        # Use AH price as the live reference if available, otherwise spot is already the best
-        _ep_live_price = _ep_ah_price if _ep_ah_price else _ep_spot
-        _ep_live_src = _ep_ah_source if _ep_ah_price else _ep_spot_src
+        # Use AH price as live reference — always when toggle is on, else only if available
+        _use_ah_now = st.session_state.get("use_ah", False)
+        _ep_live_price = (_ep_ah_price if _ep_ah_price else _ep_spot) if (_use_ah_now or _ep_ah_price) else _ep_spot
+        _ep_live_src = (_ep_ah_source if _ep_ah_price else _ep_spot_src) if (_use_ah_now or _ep_ah_price) else _ep_spot_src
         _ep_day_chg_pct = (_ep_spot - _ep_prev_close) / _ep_prev_close * 100 if _ep_prev_close > 0 else 0
 
         # ── Auto-fetch IV ──
