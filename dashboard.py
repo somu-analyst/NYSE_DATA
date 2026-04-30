@@ -1359,7 +1359,7 @@ def _page_header(title: str, help_text: str = ""):
     """Render a styled page header with optional help pill."""
     h1, h2 = st.columns([5, 1])
     with h1:
-        st.markdown(f"<h2 style='margin-bottom:2px'>{title}</h2>", unsafe_allow_html=True)
+        st.markdown(f"<h2>{title}</h2>", unsafe_allow_html=True)
     if help_text:
         with h2:
             with st.popover("ℹ️ Help"):
@@ -6839,7 +6839,13 @@ reveals where smart money is building or liquidating positions.
             _isig, _isig_col, _isig_desc, _idet = "N/A", "#455A64", "Error", {}
             edf["intent"] = "NEUTRAL"; edf["bar_col"] = "#90A4AE"
 
-        # ── Chart: 2 rows — OI/Price (top) + Intent Delta (bottom) ──
+        # ── Chart: 2 rows × 2 cols — OI (top-left) | Price+Vol (top-right) | Intent (bottom) ──
+        _first = (expiry == sel_expiries[0])
+        _lbl_prev_c = f"Call EOD {td_prev}"
+        _lbl_prev_p = f"Put EOD {td_prev}"
+        _lbl_now_c  = "Call LIVE"
+        _lbl_now_p  = "Put LIVE"
+
         fig = make_subplots(
             rows=2, cols=2,
             row_heights=[0.62, 0.38],
@@ -6859,25 +6865,25 @@ reveals where smart money is building or liquidating positions.
         # ── LEFT: OI comparison ──
         fig.add_trace(go.Bar(
             x=x_pos, y=edf["openInt_Call_prev"],
-            name="Call OI prev", marker_color="rgba(30,120,200,0.7)",
-            showlegend=(expiry == sel_expiries[0]),
+            name=_lbl_prev_c, marker_color="rgba(144,238,144,0.65)",
+            showlegend=_first,
         ), row=1, col=1)
         fig.add_trace(go.Bar(
             x=x_pos, y=-edf["openInt_Put_prev"] * 1.1,
-            name="Put OI prev", marker_color="rgba(200,50,50,0.7)",
-            showlegend=(expiry == sel_expiries[0]),
+            name=_lbl_prev_p, marker_color="rgba(255,160,160,0.65)",
+            showlegend=_first,
         ), row=1, col=1)
         fig.add_trace(go.Bar(
             x=x_pos, y=edf["openInt_Call_now"],
-            name="Call OI now", marker_color="rgba(0,0,0,0)",
-            marker_line_color="#4fc3f7", marker_line_width=1.8,
-            width=0.4, showlegend=(expiry == sel_expiries[0]),
+            name=_lbl_now_c, marker_color="rgba(0,0,0,0)",
+            marker_line_color="#00c853", marker_line_width=2.0,
+            width=0.4, showlegend=_first,
         ), row=1, col=1)
         fig.add_trace(go.Bar(
             x=x_pos, y=-edf["openInt_Put_now"] * 1.1,
-            name="Put OI now", marker_color="rgba(0,0,0,0)",
-            marker_line_color="#ef5350", marker_line_width=1.8,
-            width=0.4, showlegend=(expiry == sel_expiries[0]),
+            name=_lbl_now_p, marker_color="rgba(0,0,0,0)",
+            marker_line_color="#d50000", marker_line_width=2.0,
+            width=0.4, showlegend=_first,
         ), row=1, col=1)
 
         # Price diff lines on OI chart (secondary y)
@@ -6914,7 +6920,7 @@ reveals where smart money is building or liquidating positions.
                     font=dict(size=7, color="#ff9100"), yshift=-10, row=1, col=1,
                 )
 
-        # Spot vertical line
+        # Spot vertical line + ATM ±3% shaded region
         if spot > 0:
             fig.add_vline(x=spot_x, line_dash="dash", line_color="#e65100", line_width=2, row=1, col=1)
             fig.add_vline(x=spot_x, line_dash="dash", line_color="#e65100", line_width=2, row=1, col=2)
@@ -6923,6 +6929,53 @@ reveals where smart money is building or liquidating positions.
                 showarrow=False, font=dict(size=8, color="#e65100"),
                 yshift=5, row=1, col=1,
             )
+            # ATM ±3% shaded band
+            _atm_lo = spot * 0.97
+            _atm_hi = spot * 1.03
+            _atm_lo_x = max(spot_x - (_atm_hi - _atm_lo) / (edf["strike"].iloc[1] - edf["strike"].iloc[0] if len(edf) > 1 else 5) * 1, 0) if len(edf) > 1 else 0
+            try:
+                _sk_step = float(edf["strike"].iloc[1] - edf["strike"].iloc[0]) if len(edf) > 1 else 5.0
+                _atm_lo_x = spot_x - (_atm_hi - _atm_lo) / _sk_step / 2
+                _atm_hi_x = spot_x + (_atm_hi - _atm_lo) / _sk_step / 2
+                fig.add_vrect(x0=_atm_lo_x, x1=_atm_hi_x, fillcolor="rgba(255,214,0,0.10)",
+                              line_width=0, row=1, col=1)
+                fig.add_vrect(x0=_atm_lo_x, x1=_atm_hi_x, fillcolor="rgba(255,214,0,0.10)",
+                              line_width=0, row=2, col=1)
+            except Exception:
+                pass
+
+        # OI changes annotation box (top-left of OI chart)
+        _c_chg_total = pd.to_numeric(edf["change_OI_Call"], errors="coerce").sum()
+        _p_chg_total = pd.to_numeric(edf["change_OI_Put"],  errors="coerce").sum()
+        _c_oi_prev   = pd.to_numeric(edf["openInt_Call_prev"], errors="coerce").sum()
+        _p_oi_prev   = pd.to_numeric(edf["openInt_Put_prev"],  errors="coerce").sum()
+        _pcr_prev    = _p_oi_prev / _c_oi_prev if _c_oi_prev > 0 else 0
+        _c_oi_now    = pd.to_numeric(edf["openInt_Call_now"], errors="coerce").sum()
+        _p_oi_now    = pd.to_numeric(edf["openInt_Put_now"],  errors="coerce").sum()
+        _pcr_now     = _p_oi_now  / _c_oi_now  if _c_oi_now  > 0 else 0
+        _c_pct = _c_chg_total / _c_oi_prev * 100 if _c_oi_prev > 0 else 0
+        _p_pct = _p_chg_total / _p_oi_prev * 100 if _p_oi_prev > 0 else 0
+        # Hedge%: deep OTM puts / total puts
+        _deep_puts = pd.to_numeric(
+            edf.loc[pd.to_numeric(edf["strike"], errors="coerce") < spot * 0.90, "openInt_Put_now"],
+            errors="coerce"
+        ).sum() if spot > 0 else 0
+        _hedge_pct = int(_deep_puts / _p_oi_now * 100) if _p_oi_now > 0 else 0
+        _oi_box = (
+            f"OI CHANGES<br>"
+            f"Call: {_c_chg_total:+,.0f} ({_c_pct:+.1f}%)<br>"
+            f"Put: {_p_chg_total:+,.0f} ({_p_pct:+.1f}%)<br>"
+            f"PCR: {_pcr_prev:.2f} → {_pcr_now:.2f}<br>"
+            f"Hedge %: {_hedge_pct}%"
+        )
+        fig.add_annotation(
+            xref="x1 domain", yref="y1 domain", x=0.01, y=0.02,
+            text=_oi_box, showarrow=False,
+            font=dict(size=8, color="#1a2332"),
+            bgcolor="rgba(255,245,180,0.92)", bordercolor="#aaa", borderwidth=1,
+            align="left", xanchor="left", yanchor="bottom",
+            row=1, col=1,
+        )
 
         # ── RIGHT: Price + Volume ──
         fig.add_trace(go.Bar(
