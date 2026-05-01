@@ -177,14 +177,105 @@ def _cached_history(ticker: str, period: str = "5d", interval: str = "1d"):
     except Exception:
         return pd.DataFrame()
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _db_spot(ticker: str) -> float:
+    """Confirmed EOD close from stock_daily DB (MM-DD-YYYY sorted). Primary source for portfolio calcs."""
+    try:
+        with get_conn() as _c:
+            row = pd.read_sql(
+                "SELECT close FROM stock_daily WHERE ticker=? "
+                "ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                _c, params=[ticker]
+            )
+        if not row.empty:
+            return float(row["close"].iloc[0])
+    except Exception:
+        pass
+    return 0.0
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_price(ticker: str) -> float:
-    """Latest close price, cached 60 s."""
+    """Latest confirmed close — DB first (stock_daily), then yfinance history fallback."""
+    db = _db_spot(ticker)
+    if db > 0:
+        return db
     try:
-        h = _cached_history(ticker, period="2d")
+        h = _cached_history(ticker, period="5d")
+        # Exclude today's bar (might be partial/pre-market): use last entry whose date < today
+        import datetime as _dt
+        today = _dt.date.today()
+        for i in range(len(h) - 1, -1, -1):
+            bar_date = h.index[i].date() if hasattr(h.index[i], 'date') else h.index[i]
+            if bar_date < today:
+                return float(h["Close"].iloc[i])
         return float(h["Close"].iloc[-1]) if len(h) >= 1 else 0.0
     except Exception:
         return 0.0
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _historical_vol(ticker: str, window: int = 30) -> float:
+    """Annualised 30-day realised volatility from daily log-returns. Fallback 0.30."""
+    try:
+        h = _cached_history(ticker, period="90d")
+        if len(h) < 10:
+            return 0.30
+        lr = np.log(h["Close"] / h["Close"].shift(1)).dropna()
+        hv = float(lr.tail(window).std() * np.sqrt(252))
+        return max(0.05, min(4.0, hv))
+    except Exception:
+        return 0.30
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_option_mid(ticker: str, expiry_str: str, strike: float, opt_type: str
+                      ) -> tuple:
+    """Fetch real option mid-price and IV from yfinance options chain.
+    Returns (mid_price, implied_vol) — both None when unavailable (market closed
+    or expiry not listed)."""
+    try:
+        chain = yf.Ticker(ticker).option_chain(expiry_str)
+        df = chain.calls if opt_type.upper() == "CALL" else chain.puts
+        row = df[df["strike"] == float(strike)]
+        if row.empty:
+            near = df.iloc[(df["strike"] - strike).abs().argsort().iloc[:1]]
+            if abs(float(near["strike"].iloc[0]) - strike) <= 2.5:
+                row = near
+        if row.empty:
+            return None, None
+        r = row.iloc[0]
+        bid  = float(r.get("bid", 0) or 0)
+        ask  = float(r.get("ask", 0) or 0)
+        iv   = float(r.get("impliedVolatility", 0) or 0)
+        # Only use real prices when market is live (bid+ask both non-zero)
+        # Stale lastPrice during closed hours can be badly wrong
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2
+        else:
+            mid = None   # market closed → caller uses HV-based BS
+        return mid, (iv if iv > 0.02 else None)
+    except Exception:
+        return None, None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _db_option_price(ticker: str, expiry_iso: str, strike: float, opt_type: str) -> float | None:
+    """EOD option last-price from options_change DB (most recent trade_date_now).
+    Converts expiry from YYYY-MM-DD to MM-DD-YYYY for DB lookup.
+    Returns float price or None if not found."""
+    try:
+        parts = expiry_iso.split("-")
+        db_exp = f"{parts[1]}-{parts[2]}-{parts[0]}"
+        col = "lastPrice_Call_now" if opt_type.upper() == "CALL" else "lastPrice_Put_now"
+        with get_conn() as _c:
+            row = pd.read_sql(
+                f"SELECT {col} AS price, trade_date_now FROM options_change "
+                "WHERE ticker=? AND strike=? AND expiry_date=? "
+                "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+                _c, params=[ticker, float(strike), db_exp]
+            )
+        if not row.empty and row["price"].iloc[0] is not None:
+            return float(row["price"].iloc[0])
+    except Exception:
+        pass
+    return None
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _get_ah_price(ticker: str) -> dict:
@@ -193,10 +284,10 @@ def _get_ah_price(ticker: str) -> dict:
     result = {"spot_reg": 0.0, "spot_ah": 0.0, "ah_chg_pct": 0.0, "is_extended": False, "label": "EOD"}
     try:
         fi = yf.Ticker(ticker).fast_info
-        reg = float(getattr(fi, "regular_market_previous_close", 0) or 0)
+        # Use DB stock_daily as primary for spot_reg (confirmed EOD close, no pre-market contamination)
+        reg = _db_spot(ticker)
         if reg <= 0:
-            h = _cached_history(ticker, period="2d")
-            reg = float(h["Close"].iloc[-1]) if len(h) >= 1 else 0.0
+            reg = float(getattr(fi, "regular_market_previous_close", 0) or 0)
         result["spot_reg"] = reg
 
         post = float(getattr(fi, "post_market_price", 0) or 0)
@@ -288,6 +379,48 @@ def _days_to_earnings(ticker: str):
     except Exception:
         pass
     return None
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def _get_short_data_dash(ticker: str) -> dict:
+    """Fetch short interest & float from yfinance info. Cached 4h."""
+    empty = {"float_shares": None, "shares_short": None, "short_pct_float": None,
+             "short_ratio": None, "shares_short_prior": None,
+             "shares_outstanding": None, "squeeze_score": 0, "squeeze_label": "N/A"}
+    try:
+        info = yf.Ticker(ticker).info
+        float_s  = info.get("floatShares")
+        ss       = info.get("sharesShort")
+        spf      = info.get("shortPercentOfFloat")
+        sr       = info.get("shortRatio")
+        ss_prior = info.get("sharesShortPriorMonth")
+        sout     = info.get("sharesOutstanding")
+        if spf and spf < 1:
+            spf = spf * 100
+        if spf is None and float_s and ss:
+            spf = ss / float_s * 100
+        score = 0
+        if spf:
+            if spf >= 30: score += 4
+            elif spf >= 20: score += 3
+            elif spf >= 10: score += 2
+            elif spf >= 5: score += 1
+        if sr:
+            if sr >= 10: score += 3
+            elif sr >= 5: score += 2
+            elif sr >= 3: score += 1
+        if ss and ss_prior and ss > ss_prior * 1.10: score += 2
+        elif ss and ss_prior and ss < ss_prior * 0.90: score -= 1
+        score = max(0, min(10, score))
+        return {
+            "float_shares": float_s, "shares_short": ss,
+            "short_pct_float": spf, "short_ratio": sr,
+            "shares_short_prior": ss_prior, "shares_outstanding": sout,
+            "squeeze_score": score,
+            "squeeze_label": "HIGH SQUEEZE RISK" if score >= 7 else ("MODERATE" if score >= 4 else "LOW"),
+        }
+    except Exception:
+        return empty
+
 
 def _roll_suggestion(leg: dict, spot: float) -> str:
     """Generate a specific roll recommendation for a losing/expiring leg."""
@@ -505,6 +638,47 @@ def bs_greeks(S, K, T, r, sigma, opt="call"):
     gamma = pdf_d1 / (S * sigma * np.sqrt(T))
     vega = S * pdf_d1 * np.sqrt(T) / 100
     return dict(delta=delta, gamma=gamma, theta=theta, vega=vega, rho=rho, price=price)
+
+
+def _implied_vol(market_price: float, S: float, K: float, T: float, r: float, opt: str,
+                 fallback: float = 0.30) -> float:
+    """Back-solve implied volatility via bisection. Falls back to `fallback` if price is zero or T<=0."""
+    if market_price <= 1e-6 or T <= 0 or S <= 0 or K <= 0:
+        return fallback
+    intrinsic = max(0, S - K) if opt == "call" else max(0, K - S)
+    if market_price <= intrinsic + 1e-6:
+        return fallback
+    lo, hi = 0.01, 6.0
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        try:
+            p = bs_greeks(S, K, T, r, mid, opt)["price"]
+        except Exception:
+            return fallback
+        if abs(p - market_price) < 0.0005:
+            return mid
+        if p < market_price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def _live_iv(eod_iv: float, spot_eod: float, spot_live: float, opt_type: str) -> float:
+    """Adjust implied volatility for a spot-price move using simplified skew model.
+    Puts: negative spot-vol correlation (stock down → IV up).
+    Calls: mild positive correlation.
+    """
+    if spot_eod <= 0:
+        return eod_iv
+    move = (spot_live - spot_eod) / spot_eod   # e.g. -0.02 for -2% drop
+    if opt_type == "put":
+        # Roughly: each 1% drop adds ~1.5% to IV (put skew)
+        adj = eod_iv * (1.0 - 1.5 * move)
+    else:
+        # Calls: each 1% rise adds ~0.5% to IV
+        adj = eod_iv * (1.0 + 0.5 * move)
+    return max(0.05, min(5.0, adj))
 
 
 # ===================================================================
@@ -834,6 +1008,127 @@ def oi_prediction_analysis(ticker, dates_back=5):
         accuracy = None
 
     return pred_df, accuracy
+
+
+# ===================================================================
+# ──  MULTI-DAY OI ACCUMULATION  (cumulative build + conviction)
+# ===================================================================
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_oi_multi_day(ticker, n_days=7):
+    """Load OI data for last n_days trade dates for a ticker.
+    Returns (DataFrame with trade_date column, list of dates newest-first).
+    """
+    conn = get_conn()
+    raw_dates = pd.read_sql(
+        "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?",
+        conn, params=[ticker])["trade_date_now"].tolist()
+    conn.close()
+    all_dates = _sort_dates_chrono(raw_dates, descending=True)
+    dates_use = all_dates[:n_days]
+    if not dates_use:
+        return pd.DataFrame(), []
+    frames = []
+    for td in dates_use:
+        df = q(
+            "SELECT strike, expiry_date, change_OI_Call, change_OI_Put, "
+            "openInt_Call_now, openInt_Put_now, vol_Call_now, vol_Put_now "
+            "FROM options_change WHERE ticker=? AND trade_date_now=?",
+            [ticker, td])
+        if not df.empty:
+            df["trade_date"] = td
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame(), dates_use
+    return pd.concat(frames, ignore_index=True), dates_use
+
+
+def _compute_oi_conviction(multi_df, dates_newest_first, live_px=0):
+    """Per-strike conviction score based on N-day OI accumulation consistency.
+
+    Returns DataFrame sorted by conviction descending.
+    Columns: strike, direction, conviction, streak, streak_dir, cum_net,
+             cum_call, cum_put, consistency, bull_days, bear_days, n_days
+    """
+    if multi_df.empty:
+        return pd.DataFrame()
+
+    # Aggregate across expiries to get per (strike, date) net
+    day_agg = multi_df.groupby(["strike", "trade_date"]).agg(
+        call_chg=("change_OI_Call", "sum"),
+        put_chg=("change_OI_Put", "sum"),
+        call_vol=("vol_Call_now", "sum"),
+        put_vol=("vol_Put_now", "sum"),
+    ).reset_index()
+    day_agg["net_chg"] = day_agg["call_chg"] - day_agg["put_chg"]
+
+    # Cumulative totals per strike across all N days
+    strike_agg = day_agg.groupby("strike").agg(
+        cum_call=("call_chg", "sum"),
+        cum_put=("put_chg", "sum"),
+        cum_net=("net_chg", "sum"),
+        avg_call_vol=("call_vol", "mean"),
+        avg_put_vol=("put_vol", "mean"),
+        n_days=("trade_date", "count"),
+        bull_days=("net_chg", lambda x: (x > 0).sum()),
+        bear_days=("net_chg", lambda x: (x < 0).sum()),
+    ).reset_index()
+
+    # Current streak: consecutive matching direction from most recent day back
+    date_rank = {d: i for i, d in enumerate(dates_newest_first)}  # 0 = newest
+    streaks = []
+    for strike in strike_agg["strike"].unique():
+        sk = day_agg[day_agg["strike"] == strike].copy()
+        sk["rank"] = sk["trade_date"].map(date_rank)
+        sk = sk.sort_values("rank")  # newest first (rank 0 = newest)
+        streak, streak_dir = 0, "FLAT"
+        for _, row in sk.iterrows():
+            d = row["net_chg"]
+            cur_dir = "BULL" if d > 0 else ("BEAR" if d < 0 else "FLAT")
+            if streak == 0:
+                streak_dir = cur_dir
+                streak = 1 if cur_dir != "FLAT" else 0
+            elif cur_dir == streak_dir and cur_dir != "FLAT":
+                streak += 1
+            else:
+                break
+        streaks.append({"strike": strike, "streak": streak, "streak_dir": streak_dir})
+
+    streak_df = pd.DataFrame(streaks)
+    strike_agg = strike_agg.merge(streak_df, on="strike", how="left")
+
+    # Directional consistency (fraction of days in winning direction)
+    strike_agg["consistency"] = strike_agg.apply(
+        lambda r: r["bull_days"] / r["n_days"] if r["cum_net"] >= 0
+                  else r["bear_days"] / r["n_days"], axis=1)
+
+    # Conviction score 0-10
+    max_cum = strike_agg["cum_net"].abs().max()
+    strike_agg["mag_score"] = (
+        (strike_agg["cum_net"].abs() / max_cum * 4).clip(0, 4)
+        if max_cum > 0 else 0.0
+    )
+    strike_agg["consistency_score"] = (strike_agg["consistency"] * 3).clip(0, 3)
+    strike_agg["streak_score"] = strike_agg["streak"].clip(0, 2).astype(float)
+
+    # ATM proximity bonus (+1 within 5% of spot)
+    if live_px > 0:
+        strike_agg["dist_pct"] = (strike_agg["strike"] - live_px).abs() / live_px * 100
+        strike_agg["atm_bonus"] = np.where(strike_agg["dist_pct"] <= 5, 1.0, 0.0)
+    else:
+        strike_agg["dist_pct"] = 0.0
+        strike_agg["atm_bonus"] = 0.0
+
+    strike_agg["conviction"] = (
+        strike_agg["mag_score"] + strike_agg["consistency_score"]
+        + strike_agg["streak_score"] + strike_agg["atm_bonus"]
+    ).clip(0, 10).round(1)
+
+    strike_agg["direction"] = np.where(
+        strike_agg["cum_net"] > 0, "BULL",
+        np.where(strike_agg["cum_net"] < 0, "BEAR", "FLAT"))
+
+    return strike_agg.sort_values("conviction", ascending=False).reset_index(drop=True)
 
 
 # ===================================================================
@@ -1461,7 +1756,7 @@ if page == "🌍 Market Overview":
             ("📈 Indices",    ["S&P 500", "Nasdaq", "Dow Jones", "Russell 2000", "VIX"]),
             ("⚡ Futures",    ["S&P 500 Futures", "Nasdaq 100 Futures", "Dow Jones Futures"]),
             ("🛢️ Commodities", ["Gold", "WTI Oil", "Brent", "Silver", "Nat Gas", "Copper"]),
-            ("💱 FX / Crypto", ["EUR/USD", "USD/JPY", "GBP/USD", "Dollar Index", "Bitcoin", "Ethereum"]),
+            ("💱 FX / Crypto", ["EUR/USD", "USD/JPY", "GBP/USD", "Dollar Index", "USD/INR", "Bitcoin", "Ethereum"]),
             ("📋 Bonds",      ["10Y Yield", "30Y Yield"]),
         ]
 
@@ -1469,9 +1764,10 @@ if page == "🌍 Market Overview":
             return "🟢" if pct > 0.5 else ("🔴" if pct < -0.5 else "🟡")
 
         def _px_fmt(name, px):
-            if "Yield" in name: return f"{px:.3f}%"
-            if px > 999:        return f"{px:,.0f}"
-            if px < 10:         return f"{px:.4f}"
+            if "Yield" in name:   return f"{px:.3f}%"
+            if "USD/INR" in name: return f"₹{px:,.2f}"
+            if px > 999:          return f"{px:,.0f}"
+            if px < 10:           return f"{px:.4f}"
             return f"{px:,.2f}"
 
         for _sec_label, _sec_names in _SECTIONS:
@@ -2103,6 +2399,83 @@ if page == "🌍 Market Overview":
                             if _ret_rows:
                                 st.dataframe(pd.DataFrame(_ret_rows), hide_index=True)
 
+                        # ── Short Interest & Float ──
+                        with st.expander("📉 Short Interest & Float"):
+                            try:
+                                _si_ticker = _inst_sym.replace("^", "")
+                                _si_info = yf.Ticker(_si_ticker).info
+                                _si_float  = _si_info.get("floatShares")
+                                _si_ss     = _si_info.get("sharesShort")
+                                _si_spf    = _si_info.get("shortPercentOfFloat")
+                                _si_sr     = _si_info.get("shortRatio")
+                                _si_ssp    = _si_info.get("sharesShortPriorMonth")
+                                _si_out    = _si_info.get("sharesOutstanding")
+                                if _si_spf and _si_spf < 1:
+                                    _si_spf = _si_spf * 100
+
+                                def _si_fmt(n):
+                                    if n is None: return "N/A"
+                                    if n >= 1e9: return f"{n/1e9:.2f}B"
+                                    if n >= 1e6: return f"{n/1e6:.1f}M"
+                                    return f"{n:,.0f}"
+
+                                _si_chg = None
+                                if _si_ss and _si_ssp:
+                                    _si_chg = (_si_ss - _si_ssp) / _si_ssp * 100
+
+                                # Squeeze score
+                                _sq = 0
+                                if _si_spf:
+                                    if _si_spf >= 30: _sq += 4
+                                    elif _si_spf >= 20: _sq += 3
+                                    elif _si_spf >= 10: _sq += 2
+                                    elif _si_spf >= 5: _sq += 1
+                                if _si_sr:
+                                    if _si_sr >= 10: _sq += 3
+                                    elif _si_sr >= 5: _sq += 2
+                                    elif _si_sr >= 3: _sq += 1
+                                if _si_chg and _si_chg > 10: _sq += 2
+                                elif _si_chg and _si_chg < -10: _sq -= 1
+                                _sq = max(0, min(10, _sq))
+                                _sq_label = "HIGH SQUEEZE RISK" if _sq >= 7 else ("MODERATE" if _sq >= 4 else "LOW")
+
+                                _si_cols = st.columns(3)
+                                _si_cols[0].metric("Float Shares", _si_fmt(_si_float))
+                                _si_cols[1].metric("Shares Short", _si_fmt(_si_ss),
+                                    delta=f"{_si_chg:+.1f}% vs prev mo" if _si_chg else None)
+                                _si_cols[2].metric("Short % Float",
+                                    f"{_si_spf:.1f}%" if _si_spf else "N/A")
+
+                                _si_cols2 = st.columns(3)
+                                _si_cols2[0].metric("Days to Cover",
+                                    f"{_si_sr:.1f}d" if _si_sr else "N/A")
+                                _si_cols2[1].metric("Shares Outstanding", _si_fmt(_si_out))
+                                _si_cols2[2].metric(f"Squeeze Score  [{_sq_label}]",
+                                    f"{_sq}/10")
+
+                                # Squeeze signal
+                                if _sq >= 7:
+                                    st.error(f"🔴 **HIGH SHORT SQUEEZE RISK** — {_si_spf:.1f}% shorted, {_si_sr:.1f}d to cover. "
+                                             f"Any bullish catalyst could trigger rapid covering rally.")
+                                elif _sq >= 4:
+                                    st.warning(f"🟡 **MODERATE SHORT INTEREST** — watch for short covering rallies on positive news.")
+                                else:
+                                    st.success(f"🟢 **LOW SHORT INTEREST** — minimal squeeze risk.")
+
+                                # Next-day predictor context
+                                st.markdown("**Next-Day Short Impact:**")
+                                if _si_spf and _si_spf >= 20 and _si_sr and _si_sr >= 5:
+                                    st.markdown(f"- High short ratio ({_si_sr:.1f}d to cover) + heavy short load ({_si_spf:.1f}%) → **squeeze amplifier** on any gap-up")
+                                if _si_chg and _si_chg > 15:
+                                    st.markdown(f"- Short interest rising fast (+{_si_chg:.1f}% MoM) → **bearish sentiment building**, watch for continuation down or violent reversal")
+                                elif _si_chg and _si_chg < -15:
+                                    st.markdown(f"- Short interest declining ({_si_chg:.1f}% MoM) → **shorts covering**, reduces downside pressure")
+                                if _si_sr and _si_sr >= 10:
+                                    st.markdown(f"- DTC={_si_sr:.1f}d → if stock gaps up 3%+, covering pressure could add another 2-5% intraday")
+
+                            except Exception as _si_err:
+                                st.info(f"Short interest data unavailable: {_si_err}")
+
                     else:
                         st.warning(f"No historical data available for {sel_instrument}.")
                 except Exception as e:
@@ -2431,6 +2804,138 @@ elif page == "🔥 OI Analytics & Prediction":
                       height=400, margin=dict(t=30, b=40))
     st.plotly_chart(fig)
 
+    # ── Multi-Day OI Accumulation & Conviction ──
+    st.markdown("<div>📈 Multi-Day OI Accumulation & Strike Conviction</div>", unsafe_allow_html=True)
+    _oi_days = st.slider("Lookback (trade days)", 3, 15, 7, key="oi_conv_days")
+
+    with st.spinner(f"Loading {_oi_days}-day OI trend…"):
+        _mdf, _mdates = _load_oi_multi_day(sel_ticker, _oi_days)
+
+    if not _mdf.empty:
+        # Spot price for ATM reference line
+        _spot = 0.0
+        try:
+            _spot = _cached_price(sel_ticker)
+        except Exception:
+            pass
+
+        # Cumulative OI build per strike (sum across all dates)
+        _cum_agg = _mdf.groupby("strike").agg(
+            cum_call=("change_OI_Call", "sum"),
+            cum_put=("change_OI_Put", "sum"),
+        ).reset_index()
+        _cum_agg["cum_net"] = _cum_agg["cum_call"] - _cum_agg["cum_put"]
+        _cum_agg = _cum_agg[
+            (_cum_agg["cum_call"].abs() + _cum_agg["cum_put"].abs()) > 0
+        ].sort_values("strike")
+
+        _fig_trend = go.Figure()
+        _fig_trend.add_trace(go.Bar(
+            x=_cum_agg["strike"], y=_cum_agg["cum_call"],
+            name=f"Cum Call OI Δ ({_oi_days}d)", marker_color="#00c853"))
+        _fig_trend.add_trace(go.Bar(
+            x=_cum_agg["strike"], y=_cum_agg["cum_put"],
+            name=f"Cum Put OI Δ ({_oi_days}d)", marker_color="#ff1744"))
+        _fig_trend.add_trace(go.Scatter(
+            x=_cum_agg["strike"], y=_cum_agg["cum_net"],
+            name="Net Bias (Call−Put)", mode="lines+markers",
+            line=dict(color="#ffd600", width=2), marker=dict(size=5)))
+        if _spot > 0:
+            _fig_trend.add_vline(
+                x=_spot, line_dash="dash", line_color="#aaaaaa",
+                annotation_text=f"Spot ${_spot:.1f}", annotation_position="top right")
+        _fig_trend.update_layout(
+            barmode="group", template="plotly_dark",
+            title=f"{sel_ticker} — {_oi_days}-Day Cumulative OI Build",
+            xaxis_title="Strike", yaxis_title="Cumulative OI Change",
+            height=430, margin=dict(t=55, b=40),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+        st.plotly_chart(_fig_trend, use_container_width=True)
+
+        # Conviction scoring
+        _conv_df = _compute_oi_conviction(_mdf, _mdates, _spot)
+
+        if not _conv_df.empty:
+            _cv1, _cv2 = st.columns([3, 2])
+            with _cv1:
+                st.markdown(f"**🎯 Strike Conviction Table ({_oi_days}d build)**")
+                _dc = _conv_df.head(15)[
+                    ["strike", "direction", "conviction", "streak", "streak_dir",
+                     "cum_net", "consistency", "n_days"]
+                ].copy()
+                _dc.columns = ["Strike", "Dir", "Score/10", "Streak", "Streak Dir",
+                               "Cum Net OI Δ", "Consistency", "Days"]
+                _dc["Cum Net OI Δ"] = _dc["Cum Net OI Δ"].apply(lambda x: f"{x:+,.0f}")
+                _dc["Consistency"] = _dc["Consistency"].apply(lambda x: f"{x:.0%}")
+                st.dataframe(_dc, hide_index=True)
+
+            with _cv2:
+                st.markdown("**📊 Market Bias Summary**")
+                _bull_hi = len(_conv_df[(_conv_df["direction"] == "BULL") & (_conv_df["conviction"] >= 7)])
+                _bear_hi = len(_conv_df[(_conv_df["direction"] == "BEAR") & (_conv_df["conviction"] >= 7)])
+                _bias_lbl = ("🟢 BULLISH" if _bull_hi > _bear_hi
+                             else "🔴 BEARISH" if _bear_hi > _bull_hi else "⚪ NEUTRAL")
+                st.metric("High-Conv BULL strikes (≥7)", _bull_hi)
+                st.metric("High-Conv BEAR strikes (≥7)", _bear_hi)
+                st.markdown(f"**Overall: {_bias_lbl}**")
+                if _spot > 0:
+                    _atm_row = _conv_df[
+                        (_conv_df["strike"] - _spot).abs() / _spot <= 0.05
+                    ].head(1)
+                    if not _atm_row.empty:
+                        _ar = _atm_row.iloc[0]
+                        _atm_icon = "🟢" if _ar["direction"] == "BULL" else "🔴" if _ar["direction"] == "BEAR" else "⚪"
+                        st.markdown(f"**ATM zone bias:** {_atm_icon} {_ar['direction']} "
+                                    f"({_ar['streak']}d streak, {_ar['conviction']:.0f}/10)")
+
+            # High-conviction trade setup cards
+            _hc = _conv_df[_conv_df["conviction"] >= 6].head(5)
+            if not _hc.empty:
+                st.markdown("### 🚀 High-Conviction Trade Ideas")
+                st.caption(
+                    f"Strikes where OI has been consistently building for {_oi_days} days. "
+                    "Score ≥6/10. Not financial advice — confirm with price action.")
+
+                for _, _r in _hc.iterrows():
+                    _sk = float(_r["strike"])
+                    _dir = str(_r["direction"])
+                    _conv_val = float(_r["conviction"])
+                    _stk = int(_r["streak"])
+                    _consist = float(_r["consistency"])
+                    _cum = float(_r["cum_net"])
+                    _dist_pct = abs(_sk - _spot) / _spot * 100 if _spot > 0 else 0
+                    _sk_type = "ATM" if _dist_pct < 3 else ("NTM" if _dist_pct < 8 else "OTM")
+                    _icon = "🟢" if _dir == "BULL" else "🔴" if _dir == "BEAR" else "⚪"
+
+                    if _dir == "BULL":
+                        _setup = (f"Long ${_sk:.0f} Call" if _sk_type in ("ATM", "NTM")
+                                  else f"Long ${_sk:.0f} Call (OTM — gamma if breaks out)")
+                        _why = (
+                            f"Call OI added for **{_stk} consecutive days** — smart money accumulating longs. "
+                            f"Net +{_cum:,.0f} contracts over {_oi_days}d. "
+                            f"Direction consistent **{_consist:.0%}** of sessions. "
+                            f"{'ATM — high delta, maximum P&L sensitivity.' if _sk_type == 'ATM' else 'NTM — favorable risk/reward for directional bet.' if _sk_type == 'NTM' else 'OTM — lottery ticket; size small, wins big if breaks.'}"
+                        )
+                    elif _dir == "BEAR":
+                        _setup = (f"Long ${_sk:.0f} Put" if _sk_type in ("ATM", "NTM")
+                                  else f"${_sk:.0f} Resistance / Gamma Wall — sell calls above")
+                        _why = (
+                            f"Put OI building for **{_stk} consecutive days** — hedging or directional shorts loading. "
+                            f"Net {_cum:,.0f} contracts over {_oi_days}d. "
+                            f"Direction consistent **{_consist:.0%}** of sessions. "
+                            f"{'ATM puts — high delta hedge or outright short.' if _sk_type == 'ATM' else 'NTM — downside protection, good risk/reward.' if _sk_type == 'NTM' else 'OTM put wall — gamma wall acts as magnet; stock could be pinned here.'}"
+                        )
+                    else:
+                        continue
+
+                    with st.container(border=True):
+                        _tc1, _tc2, _tc3 = st.columns([3, 5, 1])
+                        _tc1.markdown(f"{_icon} **{_setup}**  \n`{_sk_type}` · {_dist_pct:.1f}% from spot")
+                        _tc2.markdown(_why)
+                        _tc3.metric("Score", f"{_conv_val:.0f}/10")
+    else:
+        st.info(f"Not enough multi-day OI data for {sel_ticker} — need at least 3 trade dates.")
+
     # ── Expiry Breakdown ──
     st.markdown("<div>📅 Expiry Breakdown</div>", unsafe_allow_html=True)
     exp_agg = tk_df.groupby("expiry_date").agg(
@@ -2478,6 +2983,57 @@ elif page == "🔥 OI Analytics & Prediction":
         st.dataframe(pred_df[show_cols].head(10), hide_index=True)
     else:
         st.info("Not enough data for prediction analysis.")
+
+    # ── Short Interest — Next-Day Context ──
+    st.markdown("<div>📉 Short Interest & Next-Day Squeeze Probability</div>", unsafe_allow_html=True)
+    try:
+        _si = _get_short_data_dash(sel_ticker)
+        _si_spf = _si.get("short_pct_float")
+        _si_sr  = _si.get("short_ratio")
+        _si_ss  = _si.get("shares_short")
+        _si_flt = _si.get("float_shares")
+        _si_ssp = _si.get("shares_short_prior")
+        _si_sc  = _si.get("squeeze_score", 0)
+        _si_lbl = _si.get("squeeze_label", "N/A")
+
+        def _si_fmt2(n):
+            if n is None: return "N/A"
+            if n >= 1e9: return f"{n/1e9:.2f}B"
+            if n >= 1e6: return f"{n/1e6:.1f}M"
+            return f"{n:,.0f}"
+
+        _si_mo_chg = (_si_ss - _si_ssp) / _si_ssp * 100 if _si_ss and _si_ssp else None
+        _si_c1, _si_c2, _si_c3, _si_c4 = st.columns(4)
+        _si_c1.metric("Short % Float", f"{_si_spf:.1f}%" if _si_spf else "N/A",
+            delta=f"{_si_mo_chg:+.1f}% MoM" if _si_mo_chg else None)
+        _si_c2.metric("Days to Cover", f"{_si_sr:.1f}d" if _si_sr else "N/A")
+        _si_c3.metric("Shares Short",  _si_fmt2(_si_ss))
+        _si_c4.metric("Squeeze Score", f"{_si_sc}/10  [{_si_lbl}]")
+
+        # Next-day implications
+        _si_insights = []
+        if _si_spf and _si_spf >= 20:
+            _si_insights.append(f"🔴 **Heavy short load ({_si_spf:.1f}%)** — upside gap could trigger cascade covering")
+        if _si_sr and _si_sr >= 5:
+            _si_insights.append(f"⏱️ **{_si_sr:.1f} days to cover** — prolonged covering = extended rally if squeeze starts")
+        if _si_mo_chg and _si_mo_chg > 15:
+            _si_insights.append(f"📈 Short interest rising +{_si_mo_chg:.1f}% MoM → bearish consensus building; contrarian squeeze potential")
+        elif _si_mo_chg and _si_mo_chg < -15:
+            _si_insights.append(f"📉 Short interest falling {_si_mo_chg:.1f}% MoM → shorts already covering; less downside pressure")
+        if _si_sc >= 7:
+            _si_insights.append("🚀 **SQUEEZE SETUP** — combine with OI bullish signal above for high-conviction long entry")
+        if pred_df is not None and not pred_df.empty:
+            _pred = pred_df.iloc[0].get("prediction", "NEUTRAL")
+            if _pred == "BULLISH" and _si_sc >= 5:
+                _si_insights.append(f"✅ **OI signal BULLISH + squeeze score {_si_sc}/10** → strong next-day long setup")
+            elif _pred == "BEARISH" and _si_sc >= 7:
+                _si_insights.append(f"⚠️ OI signal BEARISH but extreme squeeze risk — short could backfire; use caution")
+        for _ins in _si_insights:
+            st.markdown(_ins)
+        if not _si_insights:
+            st.markdown(f"🟢 Short interest normal — no unusual squeeze risk for {sel_ticker}")
+    except Exception as _si_ex:
+        st.info(f"Short interest data unavailable: {_si_ex}")
 
     # ═══════════════════════════════════════════════════════════════
     # ── OI ADVISOR — Position-aware writeup + LLM-style Q&A ───────
@@ -2927,10 +3483,19 @@ elif page == "🎯 Prop Trading Screen":
 
     with st.spinner(f"Analyzing {opp['Ticker']} ${opp['Strike']:.0f}..."):
         try:
-            stock_info = yf.Ticker(opp["Ticker"])
-            current_px = float(stock_info.history(period="1d")["Close"].iloc[-1])
+            _prop_ah = _get_ah_price(opp["Ticker"])
+            _prop_eod = _prop_ah["spot_reg"] or 0
+            _prop_ext = _prop_ah["spot_ah"] if _prop_ah["spot_ah"] > 0 else _prop_eod
+            current_px = _prop_ext if st.session_state.get("use_ah") else _prop_eod
+            if current_px <= 0:
+                current_px = float(yf.Ticker(opp["Ticker"]).history(period="1d")["Close"].iloc[-1])
+            _prop_src = (_prop_ah["label"] if _prop_ah["is_extended"] and st.session_state.get("use_ah")
+                         else "EOD")
+            _prop_icon = "🌙" if "AH" in _prop_src or "PM" in _prop_src else ("☀️" if _prop_src == "EOD" else "📈")
         except Exception:
             current_px = 0
+            _prop_src = "EOD"
+            _prop_icon = "☀️"
 
         # ── Determine strategy based on Net_View ──
         net_view = str(opp["Net_View"])
@@ -3038,7 +3603,7 @@ elif page == "🎯 Prop Trading Screen":
         st.markdown(f"""
         <div>
             <h3>{ticker} — ${strike:.0f} ({opp['Expiry']})</h3>
-            <b>Stock Price:</b> ${current_px:.2f} &nbsp;|&nbsp;
+            <b>Stock:</b> {_prop_icon} {_prop_src} ${current_px:.2f} &nbsp;|&nbsp;
             <b>Signal:</b> {net_view} &nbsp;|&nbsp;
             <b>Z-Score:</b> {opp['Z_Score']} &nbsp;|&nbsp;
             <b>PCR:</b> {pcr_val:.2f} &nbsp;|&nbsp;
@@ -3263,26 +3828,40 @@ elif page == "💼 Portfolio & Suggestions":
             _acct= str(_t.get("account_type","Taxable"))
             _nts = str(_t.get("notes","") or "")
             if _tk not in _spot_cache:
-                try: _spot_cache[_tk] = _spot(_tk)
-                except: _spot_cache[_tk] = 0.0
-            _spot = _spot_cache[_tk]
+                # DB stock_daily is primary — confirmed EOD close, no pre-market contamination
+                _db_s = _db_spot(_tk)
+                _spot_cache[_tk] = _db_s if _db_s > 0 else (_cached_price(_tk) or 0.0)
+            _spot_eod = _spot_cache[_tk]
             try:
                 _edt = datetime.strptime(_exp,"%Y-%m-%d")
-                _dte = max((_edt-datetime.now()).days,0)
+                _dte = max((_edt.date()-datetime.now().date()).days,0)
                 _T   = _dte/365.0
-                _g   = bs_greeks(_spot,_k,_T,0.045,0.30,_opt.lower())
-                _cp  = _g["price"]
+                _hv   = _historical_vol(_tk)
+                # Priority 1: live market mid (bid/ask, market open)
+                _real_mid, _chain_iv = _fetch_option_mid(_tk, _exp, _k, _opt)
+                if _real_mid is not None and _T > 0:
+                    _cp      = _real_mid
+                    _iv_used = (_chain_iv if _chain_iv else
+                                _implied_vol(_real_mid, _spot_eod, _k, _T, 0.045, _opt.lower(),
+                                             fallback=_hv))
+                    _g = bs_greeks(_spot_eod, _k, _T, 0.045, _iv_used, _opt.lower())
+                else:
+                    # Market closed → BS with historical vol at confirmed DB EOD spot
+                    _iv_used = _hv
+                    _g   = bs_greeks(_spot_eod, _k, _T, 0.045, _iv_used, _opt.lower())
+                    _cp  = _g["price"]
                 _d   = _g["delta"]*_qty; _gm=_g["gamma"]*abs(_qty)
                 _th  = _g["theta"]*abs(_qty); _ve=_g["vega"]*abs(_qty)
             except:
-                _cp=_ep; _d=_gm=_th=_ve=0.0; _dte=0
+                _cp=_ep; _d=_gm=_th=_ve=0.0; _dte=0; _iv_used=0.30
             _pnl  = (_cp-_ep)*_qty*100
             _cost = _ep*abs(_qty)*100
             _pp   = (_pnl/_cost*100) if _cost>0 else 0
             updated_rows.append({
                 "ID":int(_t.get("trade_id",0)), "Ticker":_tk, "Type":_opt,
                 "Strike":_k, "Expiry":_exp, "Qty":_qty,
-                "Entry":_ep, "Current":_cp, "Stock_Px":_spot,
+                "Entry":_ep, "Current":_cp, "Stock_Px":_spot_eod,
+                "IV": round(_iv_used, 4),
                 "PnL":round(_pnl,2), "PnL%":round(_pp,1), "DTE":_dte,
                 "Delta":_d, "Gamma":_gm, "Theta":_th, "Vega":_ve,
                 "Account":_acct, "Notes":_nts,
@@ -3497,14 +4076,28 @@ elif page == "💼 Portfolio & Suggestions":
                         _pnl_color="#1b5e20" if pos["PnL"]>=0 else "#b71c1c"
                         _roll_hint=_roll_suggestion(pos, _spv)
                         _bg="#fff8e1" if pos["DTE"]<=5 else ("#ffebee" if pos["PnL%"]<-30 else "#fafafa")
+                        # Option type colour + emoji for instant visual scan
+                        _is_call = pos["Type"].upper() == "CALL"
+                        _is_long = pos["Qty"] > 0
+                        _type_emoji = "📈" if _is_call else "📉"
+                        _type_badge_bg  = ("#e8f5e9" if _is_call else "#fce4ec")
+                        _type_badge_txt = ("#2e7d32" if _is_call else "#880e4f")
+                        _dir_tag = ("Long" if _is_long else "Short")
+                        _dir_tag_bg  = ("#e3f2fd" if _is_long else "#fff3e0")
+                        _dir_tag_txt = ("#0d47a1" if _is_long else "#e65100")
 
-                        # AH option premium via BS at AH spot
+                        # ── Live/AH premium: use stored IV + skew adjustment ────
                         _ah_opt, _ah_pnl = None, None
-                        if _spv_has_ah and pos["DTE"] > 0:
+                        _lv_lbl = _spv_ah["label"]   # "Live" / "AH" / "PM" / "EOD"
+                        _pos_iv = pos.get("IV", 0.30) or 0.30
+                        if pos["DTE"] >= 0:  # include DTE=0 (expiry-day intrinsic estimate)
                             try:
-                                _ah_T   = max(pos["DTE"], 0.5) / 365.0
-                                _ah_opt = bs_greeks(_spv_ext, pos["Strike"], _ah_T, 0.045, 0.30,
-                                                    pos["Type"].lower())["price"]
+                                _opt_T  = max(pos["DTE"], 0.5) / 365.0
+                                # Skew-adjust IV for spot move (neg spot-vol for puts)
+                                _lv_iv  = _live_iv(_pos_iv, _spv_eod, _spv_ext, pos["Type"].lower())
+                                # Price at live spot with adjusted IV
+                                _ah_opt = bs_greeks(_spv_ext, pos["Strike"], _opt_T,
+                                                    0.045, _lv_iv, pos["Type"].lower())["price"]
                                 _ah_pnl = (_ah_opt - pos["Entry"]) * pos["Qty"] * 100
                             except Exception:
                                 pass
@@ -3512,36 +4105,46 @@ elif page == "💼 Portfolio & Suggestions":
                         # ── Leg header ──────────────────────────────────────────
                         _dte_warn = "⚠️ " if pos["DTE"] <= 5 else ""
                         st.markdown(
-                            f"<div style='border-left:5px solid {_lc};padding:4px 12px 0 12px;"
+                            f"<div style='border-left:5px solid {_lc};padding:6px 12px 0 12px;"
                             f"margin-top:10px;background:{_bg};border-radius:4px 4px 0 0;'>"
-                            f"<b>L{_li+1}: {_sl} {pos['Type']} &nbsp; K${pos['Strike']:.0f} &nbsp; "
-                            f"exp {pos['Expiry']} &nbsp; ×{abs(pos['Qty'])}</b>"
+                            f"<b>L{_li+1}:</b> &nbsp;"
+                            f""
+                            f"{_dir_tag} &nbsp;"
+                            f""
+                            f"{_type_emoji} {pos['Type']} &nbsp;"
+                            f"<b>Strike ${pos['Strike']:.0f}</b> &nbsp; "
+                            f"exp {pos['Expiry']} &nbsp; ×{abs(pos['Qty'])}"
                             f" &nbsp;&nbsp; {_dte_warn}DTE <b>{pos['DTE']}</b> &nbsp; "
                             f"Δ <b>{pos['Delta']:+.3f}</b> &nbsp; Θ <b>${pos['Theta']*100:.2f}/d</b>"
                             f"</div>", unsafe_allow_html=True)
 
                         # ── Metric row ───────────────────────────────────────────
-                        _ncols = 6 if _spv_has_ah else 5
+                        _show_live = _ah_opt is not None
+                        _ncols = 6 if _show_live else 5
                         _mc = st.columns(_ncols)
                         _mc[0].metric("Entry Premium", f"${pos['Entry']:.2f}",
                                       help="Option premium you paid (long) or received (short) per share")
+                        _iv_src = "market mid" if pos.get("IV",0) != _historical_vol(pos["Ticker"]) else f"HV {_pos_iv:.0%}"
                         _mc[1].metric("☀️ EOD Premium", f"${pos['Current']:.2f}",
                                       delta=f"{pos['Current']-pos['Entry']:+.2f} vs entry",
                                       delta_color="normal" if pos["Qty"]>0 else "inverse",
-                                      help="Current option premium based on EOD stock close (Black-Scholes)")
-                        if _spv_has_ah and _ah_opt is not None:
-                            _mc[2].metric(f"🌙 {_spv_ah['label']} Premium", f"${_ah_opt:.2f}",
+                                      help=f"BS @ EOD ${pos['Stock_Px']:.2f}, IV={_pos_iv:.0%} ({_iv_src})")
+                        if _show_live:
+                            _lv_help = (f"BS price at {_lv_lbl} spot ${_spv_ext:.2f} "
+                                        f"({_spv_ah['ah_chg_pct']:+.1f}% vs EOD), "
+                                        f"IV skew-adjusted for spot move")
+                            _mc[2].metric(f"🌙 {_lv_lbl} Premium", f"${_ah_opt:.2f}",
                                           delta=f"{_ah_opt-pos['Current']:+.2f} vs EOD",
                                           delta_color="normal" if pos["Qty"]>0 else "inverse",
-                                          help=f"Option premium recalculated at AH stock price ${_spv_ext:.2f}")
+                                          help=_lv_help)
                             _mc[3].metric("P&L (EOD)", f"${pos['PnL']:+,.0f}",
                                           f"{pos['PnL%']:+.1f}%",
                                           delta_color="normal" if pos["PnL"]>=0 else "inverse")
-                            _mc[4].metric(f"P&L ({_spv_ah['label']})", f"${_ah_pnl:+,.0f}",
+                            _mc[4].metric(f"P&L ({_lv_lbl})", f"${_ah_pnl:+,.0f}",
                                           f"{(_ah_pnl/(pos['Entry']*abs(pos['Qty'])*100)*100) if pos['Entry']>0 else 0:+.1f}%",
                                           delta_color="normal" if _ah_pnl>=0 else "inverse")
                             _mc[5].metric("Stock", f"${_spv_ext:.2f}",
-                                          f"{_spv_ah['ah_chg_pct']:+.1f}% AH  (EOD ${_spv_eod:.2f})")
+                                          f"{_spv_ah['ah_chg_pct']:+.1f}% {_lv_lbl}  (EOD ${_spv_eod:.2f})")
                         else:
                             _mc[2].metric("P&L $", f"${pos['PnL']:+,.0f}",
                                           delta_color="normal" if pos["PnL"]>=0 else "inverse")
@@ -4210,15 +4813,22 @@ elif page == "🔮 Live Position Predictor":
                 pc6.metric("Vol PCR", f"{vol_pcr:.2f}")
 
                 # Signal breakdown
+                _sig_bg = "#e8f5e9" if composite > 0 else "#ffebee" if composite < 0 else "#fffde7"
+                _sig_border = "#2e7d32" if composite > 0 else "#c62828" if composite < 0 else "#f9a825"
+                _spot_src_lbl = (f"🌙 {_ah_lbl} ${spot_ah:.2f} ({_ah_chg:+.1f}%)"
+                                 if _ah_d["is_extended"] and spot_ah != spot_eod
+                                 else f"☀️ EOD ${spot_eod:.2f}")
                 st.markdown(
-                    f"<divbullish' if composite > 0 else 'bearish' if composite < 0 else ''}}'>"
+                    f"<div style='background:{_sig_bg};border-left:4px solid {_sig_border};"
+                    f"padding:8px 12px;border-radius:4px;margin:4px 0'>"
                     f"<b>Prediction:</b> {pred} &nbsp; "
-                    f"<b>Action:</b> {action} <br>"
+                    f"<b>Action:</b> {action}<br>"
                     f"OI: {'▲' if oi_signal > 0 else '▼'} | "
                     f"PCR: {'Bull' if pcr_signal > 0 else 'Bear' if pcr_signal < 0 else 'Neut'} | "
                     f"Vol: {'Bull' if vol_signal > 0 else 'Bear' if vol_signal < 0 else 'Neut'} | "
                     f"Futures: {'▲' if futures_signal > 0 else '▼' if futures_signal < 0 else '—'} | "
-                    f"VIX: {'Low' if vix_signal > 0 else 'High' if vix_signal < 0 else 'Norm'}"
+                    f"VIX: {'Low' if vix_signal > 0 else 'High' if vix_signal < 0 else 'Norm'}<br>"
+                    f"<small style='color:#666'>Price: {_spot_src_lbl}</small>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
@@ -4232,9 +4842,29 @@ elif page == "🔮 Live Position Predictor":
                         strike_t = tr.get("strike", 0)
                         entry_px = tr.get("entry_price", 0)
                         expiry_t = tr.get("expiry_date", "")
+                        _hold = ((composite > 0 and opt_type.upper() == "CALL") or
+                                 (composite < 0 and opt_type.upper() == "PUT"))
+                        _rec = "✅ HOLD" if _hold else "⚠️ REVIEW / HEDGE"
+                        # Live option price estimate at current spot
+                        _live_opt_str = ""
+                        if spot > 0 and entry_px > 0:
+                            try:
+                                _dte_tr = max((datetime.strptime(expiry_t, "%Y-%m-%d").date()
+                                               - datetime.now().date()).days, 0) if expiry_t else 7
+                                _opt_T_tr = max(_dte_tr, 0.5) / 365.0
+                                _iv_tr = float(tr.get("iv", 0) or 0.35)
+                                if _iv_tr <= 0: _iv_tr = 0.35
+                                _lv_opt = bs_greeks(spot, float(strike_t), _opt_T_tr,
+                                                    0.045, _iv_tr, opt_type.lower())["price"]
+                                _lv_pnl = (_lv_opt - entry_px) * 100
+                                _pnl_icon = "📈" if _lv_pnl >= 0 else "📉"
+                                _live_opt_str = (f"  |  {_spot_src_lbl} est: **${_lv_opt:.2f}** "
+                                                 f"{_pnl_icon} P&L: **${_lv_pnl:+.0f}**")
+                            except Exception:
+                                pass
                         st.markdown(
                             f"- {opt_type} ${strike_t} exp {expiry_t} @ ${entry_px:.2f} — "
-                            f"**{'HOLD' if (composite > 0 and opt_type == 'CALL') or (composite < 0 and opt_type == 'PUT') else 'REVIEW / HEDGE'}**"
+                            f"**{_rec}**{_live_opt_str}"
                         )
 
                 # ── What-If P&L Simulator per ticker ──
@@ -5225,6 +5855,18 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         else:
             bh1.metric(f"{_ep_sel_tk} Spot", f"${_btk_eod:.2f}", f"{_btk_chg:+.2f}%")
         bh2.metric("Open Legs", len(_ep_tk_trades))
+
+        # Short interest quick view
+        try:
+            _ep_si = _get_short_data_dash(_ep_sel_tk)
+            _ep_spf = _ep_si.get("short_pct_float")
+            _ep_sr  = _ep_si.get("short_ratio")
+            _ep_sc  = _ep_si.get("squeeze_score", 0)
+            bh3.metric("Short % Float",  f"{_ep_spf:.1f}%" if _ep_spf else "N/A")
+            bh4.metric("Squeeze Score",  f"{_ep_sc}/10",
+                       delta="HIGH SQUEEZE RISK" if _ep_sc >= 7 else ("MODERATE" if _ep_sc >= 4 else "LOW"))
+        except Exception:
+            pass
 
         # ── Per-leg table ──
         st.markdown(f"##### 📋 Legs")
@@ -7608,6 +8250,91 @@ reveals where smart money is building or liquidating positions.
                 )
     else:
         st.info("Not enough data for advanced analysis.")
+
+    # ── Multi-Day OI Accumulation & Conviction ──
+    st.markdown("---")
+    st.markdown("<div>📈 Multi-Day OI Accumulation & Strike Conviction</div>", unsafe_allow_html=True)
+    _oi_days_c = st.slider("Lookback (trade days)", 3, 15, 7, key="oi_comp_conv_days")
+
+    with st.spinner(f"Loading {_oi_days_c}-day OI trend…"):
+        _mdf_c, _mdates_c = _load_oi_multi_day(sel_ticker, _oi_days_c)
+
+    if not _mdf_c.empty:
+        _cum_c = _mdf_c.groupby("strike").agg(
+            cum_call=("change_OI_Call", "sum"),
+            cum_put=("change_OI_Put", "sum"),
+        ).reset_index()
+        _cum_c["cum_net"] = _cum_c["cum_call"] - _cum_c["cum_put"]
+        _cum_c = _cum_c[(_cum_c["cum_call"].abs() + _cum_c["cum_put"].abs()) > 0].sort_values("strike")
+
+        _fig_c = go.Figure()
+        _fig_c.add_trace(go.Bar(x=_cum_c["strike"], y=_cum_c["cum_call"],
+                                name=f"Cum Call OI Δ ({_oi_days_c}d)", marker_color="#00c853"))
+        _fig_c.add_trace(go.Bar(x=_cum_c["strike"], y=_cum_c["cum_put"],
+                                name=f"Cum Put OI Δ ({_oi_days_c}d)", marker_color="#ff1744"))
+        _fig_c.add_trace(go.Scatter(x=_cum_c["strike"], y=_cum_c["cum_net"],
+                                    name="Net Bias", mode="lines+markers",
+                                    line=dict(color="#ffd600", width=2), marker=dict(size=5)))
+        if spot and spot > 0:
+            _fig_c.add_vline(x=spot, line_dash="dash", line_color="#aaaaaa",
+                             annotation_text=f"Spot ${spot:.1f}", annotation_position="top right")
+        _fig_c.update_layout(
+            barmode="group", template="plotly_dark",
+            title=f"{sel_ticker} — {_oi_days_c}-Day Cumulative OI Build",
+            xaxis_title="Strike", yaxis_title="Cumulative OI Change",
+            height=430, margin=dict(t=55, b=40),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+        st.plotly_chart(_fig_c, use_container_width=True)
+
+        _conv_c = _compute_oi_conviction(_mdf_c, _mdates_c, spot or 0)
+        if not _conv_c.empty:
+            _cc1, _cc2 = st.columns([3, 2])
+            with _cc1:
+                st.markdown(f"**🎯 Strike Conviction ({_oi_days_c}d build)**")
+                _dc2 = _conv_c.head(15)[
+                    ["strike", "direction", "conviction", "streak", "streak_dir", "cum_net", "consistency", "n_days"]
+                ].copy()
+                _dc2.columns = ["Strike", "Dir", "Score/10", "Streak", "Streak Dir", "Cum Net OI Δ", "Consistency", "Days"]
+                _dc2["Cum Net OI Δ"] = _dc2["Cum Net OI Δ"].apply(lambda x: f"{x:+,.0f}")
+                _dc2["Consistency"] = _dc2["Consistency"].apply(lambda x: f"{x:.0%}")
+                st.dataframe(_dc2, hide_index=True)
+            with _cc2:
+                st.markdown("**📊 Market Bias**")
+                _bh = len(_conv_c[(_conv_c["direction"] == "BULL") & (_conv_c["conviction"] >= 7)])
+                _bea = len(_conv_c[(_conv_c["direction"] == "BEAR") & (_conv_c["conviction"] >= 7)])
+                _bias2 = ("🟢 BULLISH" if _bh > _bea else "🔴 BEARISH" if _bea > _bh else "⚪ NEUTRAL")
+                st.metric("High-Conv BULL strikes (≥7)", _bh)
+                st.metric("High-Conv BEAR strikes (≥7)", _bea)
+                st.markdown(f"**Overall: {_bias2}**")
+            # Trade ideas
+            _hc2 = _conv_c[_conv_c["conviction"] >= 6].head(5)
+            if not _hc2.empty:
+                st.markdown("### 🚀 High-Conviction Trade Ideas")
+                st.caption("Based on consistent OI accumulation. Not financial advice.")
+                for _, _r2 in _hc2.iterrows():
+                    _sk2 = float(_r2["strike"])
+                    _dir2 = str(_r2["direction"])
+                    _cv2 = float(_r2["conviction"])
+                    _stk2 = int(_r2["streak"])
+                    _cum2 = float(_r2["cum_net"])
+                    _dist2 = abs(_sk2 - (spot or _sk2)) / (spot or _sk2) * 100 if spot else 0
+                    _skt2 = "ATM" if _dist2 < 3 else ("NTM" if _dist2 < 8 else "OTM")
+                    _icon2 = "🟢" if _dir2 == "BULL" else "🔴" if _dir2 == "BEAR" else "⚪"
+                    if _dir2 == "BULL":
+                        _setup2 = f"Long ${_sk2:.0f} Call" if _skt2 in ("ATM","NTM") else f"Long ${_sk2:.0f} Call (OTM)"
+                        _why2 = f"Call OI built {_stk2} consecutive days · Net +{_cum2:,.0f} contracts · {_r2['consistency']:.0%} consistent"
+                    elif _dir2 == "BEAR":
+                        _setup2 = f"Long ${_sk2:.0f} Put" if _skt2 in ("ATM","NTM") else f"${_sk2:.0f} gamma wall — sell calls above"
+                        _why2 = f"Put OI built {_stk2} consecutive days · Net {_cum2:,.0f} contracts · {_r2['consistency']:.0%} consistent"
+                    else:
+                        continue
+                    with st.container(border=True):
+                        _tc1, _tc2, _tc3 = st.columns([3, 5, 1])
+                        _tc1.markdown(f"{_icon2} **{_setup2}**  \n`{_skt2}` · {_dist2:.1f}% from spot")
+                        _tc2.markdown(_why2)
+                        _tc3.metric("Score", f"{_cv2:.0f}/10")
+    else:
+        st.info(f"Not enough multi-day OI data for {sel_ticker}.")
 
 
 
