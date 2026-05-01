@@ -1,4 +1,4 @@
-﻿async def group_stock_detail(query, ticker):
+async def group_stock_detail(query, ticker):
     """Show all open option positions for a stock with per-leg advice (close vs keep)."""
     conn = get_conn()
     try:
@@ -363,19 +363,89 @@ def make_mini_chart(ticker: str, days: int = 7) -> bytes:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.gridspec import GridSpec
+
+    BG      = "#0d1117"
+    GRID    = "#21262d"
+    UP_C    = "#26a641"
+    DN_C    = "#da3633"
+    LINE_C  = "#58a6ff"
+    TEXT_C  = "#c9d1d9"
+    VOLU_UP = "#1f6335"
+    VOLU_DN = "#7d2020"
+
     tk = yf.Ticker(ticker)
-    hist = tk.history(period=f"{days}d")
-    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
-    ax.plot(hist.index, hist["Close"], color="#00aaff", linewidth=1.5)
-    ax.fill_between(hist.index, hist["Close"], alpha=0.15, color="#00aaff")
-    ax.set_title(ticker, fontsize=9, color="white", pad=3)
-    ax.tick_params(axis="both", labelsize=6, colors="gray")
-    ax.spines[:].set_visible(False)
-    ax.set_facecolor("#111111")
-    fig.patch.set_facecolor("#111111")
-    plt.tight_layout(pad=0.4)
+    hist = tk.history(period=f"{max(days+3, 12)}d")
+    if hist.empty:
+        fig, ax = plt.subplots(figsize=(6, 3), dpi=120)
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", color=TEXT_C)
+        ax.set_facecolor(BG); fig.patch.set_facecolor(BG)
+        buf = BytesIO(); fig.savefig(buf, format="png", facecolor=BG); plt.close(fig)
+        buf.seek(0); return buf.read()
+
+    hist = hist.tail(days)
+    xs   = range(len(hist))
+    O, H, L, C, V = (hist[c].values for c in ["Open","High","Low","Close","Volume"])
+    label_disp = "S&P 500" if ticker == "^GSPC" else ticker
+
+    # Net change label
+    net_pct = (C[-1] - C[0]) / C[0] * 100 if C[0] else 0
+    net_col = UP_C if net_pct >= 0 else DN_C
+    net_str = f"{net_pct:+.2f}%"
+
+    fig = plt.figure(figsize=(7, 3.8), dpi=130, facecolor=BG)
+    gs  = GridSpec(2, 1, height_ratios=[3, 1], hspace=0.04, figure=fig)
+    ax  = fig.add_subplot(gs[0])
+    axv = fig.add_subplot(gs[1], sharex=ax)
+
+    for ax_ in (ax, axv):
+        ax_.set_facecolor(BG)
+        ax_.grid(True, color=GRID, linewidth=0.5, linestyle="--")
+        ax_.spines[:].set_visible(False)
+        ax_.tick_params(colors=TEXT_C, labelsize=7)
+
+    # Candlesticks
+    w = 0.4
+    for i, (o, h, l, c) in enumerate(zip(O, H, L, C)):
+        col = UP_C if c >= o else DN_C
+        ax.plot([i, i], [l, h], color=col, linewidth=0.8)
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (i - w/2, min(o, c)), w, max(abs(c - o), 0.01),
+            boxstyle="square,pad=0", facecolor=col, edgecolor=col, linewidth=0))
+
+    # Close line overlay
+    ax.plot(list(xs), C, color=LINE_C, linewidth=1.0, alpha=0.5, zorder=5)
+
+    # Price range annotation
+    ax.set_xlim(-0.8, len(hist) - 0.2)
+    ax.set_ylim(min(L) * 0.999, max(H) * 1.001)
+
+    # Y-axis only right side
+    ax.yaxis.set_label_position("right"); ax.yaxis.tick_right()
+    ax.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+
+    # Title area
+    ax.set_title(
+        f"{label_disp}   {C[-1]:,.2f}   {net_str}  ({days}d)",
+        loc="left", fontsize=10, color=TEXT_C, pad=6, fontweight="bold")
+
+    # Volume bars
+    vol_colors = [UP_C if C[i] >= O[i] else DN_C for i in range(len(hist))]
+    axv.bar(list(xs), V / 1e6, color=vol_colors, width=0.6, alpha=0.7)
+    axv.set_ylabel("Vol M", color=TEXT_C, fontsize=6, labelpad=2)
+    axv.yaxis.set_label_position("right"); axv.yaxis.tick_right()
+
+    # X-axis date labels (every 2nd bar)
+    date_labels = [d.strftime("%d%b") if hasattr(d, "strftime") else str(d)
+                   for d in hist.index]
+    tick_positions = list(range(0, len(hist), max(1, len(hist) // 5)))
+    axv.set_xticks(tick_positions)
+    axv.set_xticklabels([date_labels[i] for i in tick_positions], fontsize=6, color=TEXT_C)
+
+    plt.tight_layout(pad=0.5)
     buf = BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    fig.savefig(buf, format="png", facecolor=BG, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -1530,6 +1600,92 @@ def mono(text):
     """Monospaced block for tables."""
     return f"<pre>{text}</pre>"
 
+
+def _pipe_table(header_cols, rows_data, right_cols=None, title=None):
+    """NSE allinone-style table in <pre>.
+    Format (matches Live PCR bot):
+      header1     | header2  | header3
+      ------------|----------|--------
+      val1        | val2     | val3
+    All text is html.escape()-safe (no HTML tags inside).
+    right_cols = set of column indices to right-align."""
+    import html as _html
+    right_cols = right_cols or set()
+    all_rows = [list(header_cols)] + [list(r) for r in rows_data]
+    widths = [max(len(str(r[c])) for r in all_rows) for c in range(len(header_cols))]
+    def _fmt(r):
+        cells = [f"{str(r[c]):>{widths[c]}}" if c in right_cols
+                 else f"{str(r[c]):<{widths[c]}}" for c in range(len(widths))]
+        return " | ".join(cells)
+    sep = "-+-".join("-" * w for w in widths)
+    lines = []
+    if title:
+        lines.append(title)
+    lines += [_fmt(header_cols), sep] + [_fmt(r) for r in rows_data]
+    return "<pre>" + _html.escape("\n".join(lines)) + "</pre>"
+
+
+
+_SHORT_CACHE: dict = {}
+_SHORT_CACHE_TS: dict = {}
+
+def _get_short_data(ticker: str) -> dict:
+    """Fetch short interest & float data from yfinance info.
+    Cached 4 hours. Returns: float_shares, shares_short, short_pct_float,
+    short_ratio, shares_short_prior, squeeze_score (0-10), squeeze_label.
+    """
+    import time as _time
+    tk = str(ticker).upper()
+    now = _time.time()
+    if tk in _SHORT_CACHE and now - _SHORT_CACHE_TS.get(tk, 0) < 14400:
+        return _SHORT_CACHE[tk]
+    empty = {"float_shares": None, "shares_short": None, "short_pct_float": None,
+             "short_ratio": None, "shares_short_prior": None,
+             "squeeze_score": None, "squeeze_label": "N/A"}
+    try:
+        info = yf.Ticker(tk).info
+        float_s  = info.get("floatShares")
+        ss       = info.get("sharesShort")
+        spf      = info.get("shortPercentOfFloat")
+        sr       = info.get("shortRatio")
+        ss_prior = info.get("sharesShortPriorMonth")
+        if spf is None and float_s and ss:
+            spf = ss / float_s
+        pct = (spf * 100 if spf and spf < 1 else spf) if spf is not None else None
+        score = 0
+        if pct is not None:
+            if pct >= 30:    score += 4
+            elif pct >= 20:  score += 3
+            elif pct >= 10:  score += 2
+            elif pct >= 5:   score += 1
+        if sr is not None:
+            if sr >= 10:     score += 3
+            elif sr >= 5:    score += 2
+            elif sr >= 3:    score += 1
+        if ss and ss_prior and ss > ss_prior * 1.10:
+            score += 2
+        elif ss and ss_prior and ss < ss_prior * 0.90:
+            score -= 1
+        score = max(0, min(10, score))
+        label = ("HIGH SQUEEZE RISK" if score >= 7
+                 else "MODERATE" if score >= 4
+                 else "LOW")
+        result = {
+            "float_shares":       float_s,
+            "shares_short":       ss,
+            "short_pct_float":    pct,
+            "short_ratio":        sr,
+            "shares_short_prior": ss_prior,
+            "squeeze_score":      score,
+            "squeeze_label":      label,
+        }
+        _SHORT_CACHE[tk] = result
+        _SHORT_CACHE_TS[tk] = now
+        return result
+    except Exception:
+        return empty
+
+
 def _col_arrow(chg: float, strong: float = 0.5, weak: float = 0.1) -> str:
     """Return a colored-emoji arrow based on % change.
     🟢▲ / 🔴▼ / 🟡→ — strong threshold is 0.5%, weak is 0.1%.
@@ -1769,24 +1925,19 @@ async def market_overview(query):
     for _sec, name, d, tag in all_rows:
         sections[_sec].append((name, d, tag))
 
-    # Global column widths so all sections align at the same vertical positions
-    all_items_flat = [(n, d, t) for _, sec_items in sections.items() for n, d, t in sec_items]
-    name_w  = max(len(n) for n, _, _ in all_items_flat)
-    price_w = max((len(d["px_s"]) if d else 3) for _, d, _ in all_items_flat)
-
     colour_lines = []
     for sec_name, items in sections.items():
         colour_lines.append(shdr(sec_name))
-        pre_rows = []
+        _sec_rows = []
         for name, d, tag in items:
             if d:
                 arrow = _col_arrow(d["chg"])
-                note = f"  {tag}" if tag else ""
-                pre_rows.append(
-                    f"{name:<{name_w}}  {d['px_s']:>{price_w}}  {arrow} {d['chg']:>+6.2f}%{note}")
+                note = tag if tag else "-"
+                _sec_rows.append((name, d["px_s"], f"{d['chg']:>+.2f}%", arrow, note))
             else:
-                pre_rows.append(f"{name:<{name_w}}  {'N/A':>{price_w}}")
-        colour_lines.append(f"<pre>{chr(10).join(pre_rows)}</pre>")
+                _sec_rows.append((name, "N/A", "-", "-", "-"))
+        colour_lines.append(_pipe_table(("Name", "Price", "Chg%", "Dir", "Signal"),
+                                        _sec_rows, right_cols={1, 2}))
     colour_block = "\n".join(colour_lines)
 
     sp500_chart_bytes = None
@@ -1845,25 +1996,29 @@ async def news_for_ticker(query, ticker):
     news_lines = []
     try:
         feed = feedparser.parse(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US")
-        for i, entry in enumerate(feed.entries[:10], 1):
-            title = html_mod.escape(entry.get("title", ""))
-            link = entry.get("link", "")
+        import time as _time
+        for entry in feed.entries[:8]:
+            title = html_mod.escape(entry.get("title", "")).strip()
+            if not title:
+                continue
+            link  = entry.get("link", "").strip()
+            pub_p = entry.get("published_parsed", None)
+            dt_str = (_time.strftime("%d%b %H:%M", pub_p).lstrip("0") if pub_p else "")
             tl = title.lower()
             if any(w in tl for w in _neg):
-                tag = "🔴"
-                color = "#ff4136"
-                bear_c += 1
+                tag = "🔴"; bear_c += 1
             elif any(w in tl for w in _pos):
-                tag = "🟢"
-                color = "#2ecc40"
-                bull_c += 1
+                tag = "🟢"; bull_c += 1
             else:
                 tag = "🟡"
-                color = "#ffb400"
+            short = title[:90] + ("…" if len(title) > 90 else "")
             if link:
-                news_lines.append(f'{tag} <a href="{link}"><b>{title}</b></a>')
+                line = f'{tag} <a href="{link}">{short}</a>'
             else:
-                news_lines.append(f"{tag} <b>{title}</b>")
+                line = f"{tag} {short}"
+            if dt_str:
+                line += f"  <i>· {dt_str}</i>"
+            news_lines.append(line)
     except Exception:
         news_lines.append("Could not fetch news")
 
@@ -1917,7 +2072,10 @@ async def market_headlines(query):
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
-                link = entry.get("link", "")
+                import time as _time
+                link  = entry.get("link", "").strip()
+                pub_p = entry.get("published_parsed", None)
+                dt_str = (_time.strftime("%d%b %H:%M", pub_p).lstrip("0") if pub_p else "")
                 tl = title.lower()
                 if any(k in tl for k in _neg_kw):
                     tag = "🔴"
@@ -1925,7 +2083,7 @@ async def market_headlines(query):
                     tag = "🟢"
                 else:
                     tag = "🟡"
-                all_items.append((tag, title, link))
+                all_items.append((tag, title, link, dt_str))
         except Exception:
             continue
         if len(all_items) >= 15:
@@ -1933,12 +2091,15 @@ async def market_headlines(query):
 
     parts = [hdr("📰 MARKET HEADLINES")]
     if all_items:
-        for tag, title, link in all_items[:12]:
-            short = html_mod.escape(title[:85] + ("…" if len(title) > 85 else ""))
+        for tag, title, link, dt_str in all_items[:12]:
+            short = html_mod.escape(title[:90] + ("…" if len(title) > 90 else ""))
             if link:
-                parts.append(f'{tag} <a href="{link}">{short}</a>')
+                line = f'{tag} <a href="{link}">{short}</a>'
             else:
-                parts.append(f"{tag} {short}")
+                line = f"{tag} {short}"
+            if dt_str:
+                line += f"  <i>· {dt_str}</i>"
+            parts.append(line)
     else:
         parts.append("Could not fetch market headlines.")
 
@@ -2345,13 +2506,7 @@ async def positions_view(query):
         exp_vals = sorted(grp['expiry'].dropna().astype(str).tolist())
         next_exp = exp_vals[0][:10] if exp_vals else '?'
 
-        _pc = [4, 5, 6, 7, 8, 10]  # col widths: #id side type strk entry exp
-        _ph = ("#", "Side", "Type", "Strk", "Entry", "Expiry")
-        _psep = "─" * (sum(_pc) + len(_pc) - 1)
-        leg_rows = [
-            "  ".join(str(h).ljust(w) for h, w in zip(_ph, _pc)),
-            _psep,
-        ]
+        _leg_tbl_rows = []
         for _, tr in grp.iterrows():
             tid  = _safe_int(tr.get('trade_id', 0), 0)
             ot   = str(tr.get('option_type', '?'))[:4].upper()
@@ -2360,21 +2515,14 @@ async def positions_view(query):
             qty  = _safe_int(tr.get('quantity', 0), 0)
             exp  = str(tr.get('expiry', ''))[:10]
             side = 'L' if qty >= 0 else 'S'
-            leg_rows.append("  ".join([
-                str(f"#{tid}")[:_pc[0]].ljust(_pc[0]),
-                str(side).ljust(_pc[1]),
-                str(ot).ljust(_pc[2]),
-                f"${st:.0f}".rjust(_pc[3]),
-                f"${ep:.2f}".rjust(_pc[4]),
-                str(exp).ljust(_pc[5]),
-            ]))
-        leg_rows.append(_psep)
+            _leg_tbl_rows.append((f'#{tid}', side, ot, f'${st:.0f}', f'${ep:.2f}', exp))
         s_mark = 's' if n_legs > 1 else ''
         parts.append(
-            f'\n<b>{tk}</b>  {n_legs} leg{s_mark}  '
-            f'({n_calls}C / {n_puts}P  \u2022  {n_long}L / {n_short}S)\n'
-            f'Next exp: <code>{next_exp}</code>\n'
-            + mono("\n".join(leg_rows))
+            chr(10) + f"<b>{tk}</b>  {n_legs} leg{s_mark}"
+            + f"  ({n_calls}C / {n_puts}P  •  {n_long}L / {n_short}S)" + chr(10)
+            + f"Next exp: {next_exp}" + chr(10)
+            + _pipe_table(("#", "Side", "Type", "Strk", "Entry", "Expiry"),
+                          _leg_tbl_rows, right_cols={3, 4})
         )
 
     btn_rows = []
@@ -2854,17 +3002,14 @@ async def grp_leg_confirm(query, ctx):
     net_cost = sum(l["cost"] for l in done)
     sign = "+" if net_cost >= 0 else ""
     parts = [hdr(f"📦 {st.get('strat_name','Group')} · Legs so far")]
-    rows_txt = [f"{'Leg':<4} {'Type':<5} {'Side':<5} {'Strike':>6} {'Px':>5} {'Cost':>8}"]
-    rows_txt.append("─" * 38)
+    _leg_rows = []
     for i, l in enumerate(done):
         side_lbl = "BUY" if l["qty"] > 0 else "SELL"
-        rows_txt.append(
-            f"L{i+1:<3} {l['opt_type']:<5} {side_lbl:<5} ${l['strike']:>5.0f} "
-            f"${l['entry_price']:>4.2f} {l['cost']:>+8.0f}"
-        )
-    rows_txt.append("─" * 38)
-    rows_txt.append(f"{'Net Cost/Credit':>30} {net_cost:>+8.0f}")
-    parts.append(mono("\n".join(rows_txt)))
+        _leg_rows.append((f"L{i+1}", l["opt_type"], side_lbl,
+                          f"${l['strike']:.0f}", f"${l['entry_price']:.2f}", f"{l['cost']:+.0f}"))
+    _leg_rows.append(("", "", "", "", "Net", f"{net_cost:+.0f}"))
+    parts.append(_pipe_table(("Leg", "Type", "Side", "Strike", "Px", "Cost$"),
+                              _leg_rows, right_cols={3, 4, 5}))
 
     net_label = f"💰 Net cost: ${abs(net_cost):.0f}" if net_cost > 0 else f"💰 Net credit: ${abs(net_cost):.0f}"
     parts.append(net_label)
@@ -3569,15 +3714,115 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
     tot_put_oi  = df["put_oi"].sum()
     agg_pcr = tot_put_oi / tot_call_oi if tot_call_oi > 0 else 1.0
 
-    lines = []
+    # ── Compact table (pre block, ≤28 chars per line) ──────────────
+    def _fk2(n):
+        if n == 0: return "  -- "
+        if abs(n) >= 1000: return f"{'+' if n>0 else ''}{n/1000:.0f}K"
+        return f"{n:+.0f}"
+
+    def _sig_short(c, p, spot, strike, pcr):
+        pct = (strike - spot) / spot * 100 if spot > 0 else 0
+        if c > 300 and p > 300:       return "STRD"
+        if c > 500 and pct > 7:       return "SPEC↑"
+        if c > 500 and c > 0:         return "BULL"
+        if c < -300:                  return "UNWD"
+        if p > 500 and abs(pct) <= 3: return "SHRT"
+        if p > 500 and pct < -3:      return "BEAR"
+        if p < -300:                  return "HUPD"
+        return "FLAT"
+
+    tbl_lines = ["<pre>", "Stk   CΔ    PΔ   Sig", "─" * 21]
+    for _, r in df.sort_values("strike").iterrows():
+        c = float(r["call_chg"] or 0)
+        p = float(r["put_chg"] or 0)
+        sk = int(r["strike"])
+        sig_s = _sig_short(c, p, spot, float(r["strike"]), agg_pcr)
+        tbl_lines.append(f"${sk:<5}{_fk2(c):<6}{_fk2(p):<5}{sig_s}")
+    tbl_lines.append("</pre>")
+    table_str = "\n".join(tbl_lines)
+
+    # ── Bullet-point detail ──────────────────────────────────────────
+    bullets = []
     for _, r in df.iterrows():
         expl = _explain_oi_flow(
             float(r["call_chg"] or 0), float(r["put_chg"] or 0),
             float(r["call_oi"] or 0),  float(r["put_oi"] or 0),
             spot, float(r["strike"] or 0), agg_pcr
         )
-        lines.append(f"  • {expl}")
-    return "\n".join(lines)
+        bullets.append(f"  • {expl}")
+
+    # ── Plain-English summary ────────────────────────────────────────
+    total_call_build = df[df["call_chg"] > 0]["call_chg"].sum()
+    total_put_build  = df[df["put_chg"]  > 0]["put_chg"].sum()
+    total_call_unwd  = df[df["call_chg"] < 0]["call_chg"].sum()
+    total_put_unwd   = df[df["put_chg"]  < 0]["put_chg"].sum()
+
+    call_notional = (df[df["call_chg"] > 0]["call_chg"] * df[df["call_chg"] > 0]["strike"] * 100).sum()
+    put_notional  = (df[df["put_chg"]  > 0]["put_chg"]  * df[df["put_chg"]  > 0]["strike"] * 100).sum()
+    net_flow = call_notional - put_notional
+
+    straddle_rows  = df[(df["call_chg"] > 300) & (df["put_chg"] > 300)]
+    bear_atm_rows  = df[(df["put_chg"]  > 500) & ((df["strike"] - spot).abs() / spot <= 0.03)]
+    spec_call_rows = df[(df["call_chg"] > 500) & ((df["strike"] - spot) / spot > 0.07)]
+
+    # Determine dominant theme
+    if len(straddle_rows) > 0 and net_flow > 0:
+        theme = "EVENT PLAY leaning BULL"
+        theme_detail = (f"Straddle activity at {len(straddle_rows)} strike(s) — market pricing a big move. "
+                        f"Call flow ({_fmt_notional(call_notional)}) > Put flow ({_fmt_notional(put_notional)}) "
+                        f"suggests bulls have the edge if move happens.")
+    elif net_flow > 0 and call_notional > put_notional * 1.5:
+        theme = "BULLISH"
+        theme_detail = (f"Call money dominates: {_fmt_notional(call_notional)} vs "
+                        f"{_fmt_notional(put_notional)} in puts. "
+                        f"Net +{total_call_build:,.0f} calls added. "
+                        + (f"Spec OTM calls (+{spec_call_rows['call_chg'].sum():,.0f}) suggest "
+                           f"breakout bets above ${spec_call_rows['strike'].max():.0f}."
+                           if not spec_call_rows.empty else "Institutional call accumulation near ATM."))
+    elif put_notional > call_notional * 1.5:
+        theme = "BEARISH / HEDGING"
+        theme_detail = (f"Put money dominates: {_fmt_notional(put_notional)} vs "
+                        f"{_fmt_notional(call_notional)} in calls. "
+                        f"Net +{total_put_build:,.0f} puts added. "
+                        + (f"ATM put surge at ${bear_atm_rows['strike'].iloc[0]:.0f} = directional shorts entering."
+                           if not bear_atm_rows.empty else "Put hedging activity building."))
+    elif total_call_unwd < -1000 and total_put_unwd < -1000:
+        theme = "UNWINDING"
+        theme_detail = ("Both calls and puts being closed — position liquidation. "
+                        "No strong directional signal; participants reducing exposure.")
+    else:
+        theme = "MIXED / NEUTRAL"
+        theme_detail = (f"Call flow {_fmt_notional(call_notional)} ≈ Put flow {_fmt_notional(put_notional)}. "
+                        "No dominant side. Watch for breakout direction.")
+
+    # Best trade idea from the data
+    if not spec_call_rows.empty and net_flow > 0:
+        best_strike = int(spec_call_rows.nlargest(1, "call_chg")["strike"].iloc[0])
+        trade_idea = f"Breakout call above ${best_strike:.0f} (highest spec call build)"
+    elif not bear_atm_rows.empty and put_notional > call_notional:
+        best_strike = int(bear_atm_rows.nlargest(1, "put_chg")["strike"].iloc[0])
+        trade_idea = f"ATM put at ${best_strike:.0f} (directional short entry)"
+    elif not straddle_rows.empty:
+        best_strike = int(straddle_rows.nlargest(1, "_act")["strike"].iloc[0])
+        trade_idea = f"Straddle at ${best_strike:.0f} (both sides loading, event play)"
+    else:
+        best_strike = int(df.nlargest(1, "call_chg")["strike"].iloc[0]) if total_call_build > total_put_build else int(df.nlargest(1, "put_chg")["strike"].iloc[0])
+        trade_idea = f"${best_strike:.0f} highest-activity strike — wait for confirmation"
+
+    summary_lines = [
+        "",
+        f"<b>📋 Summary: {theme}</b>",
+        f"<pre>",
+        f"Bull flow : {_fmt_notional(call_notional):>8}  (+{total_call_build:,.0f}c)",
+        f"Bear flow : {_fmt_notional(put_notional):>8}  (+{total_put_build:,.0f}p)",
+        f"Net flow  : {_fmt_notional(abs(net_flow)):>8}  {'BULL' if net_flow>=0 else 'BEAR'}",
+        f"</pre>",
+        f"<i>{theme_detail}</i>",
+        f"\n💡 <b>Idea:</b> {trade_idea}",
+    ]
+    summary_str = "\n".join(summary_lines)
+
+    return f"{table_str}\n\n" + "\n".join(bullets) + summary_str
 
 
 def _oi_trend_summary(ticker: str, conn, latest_date: str) -> str:
@@ -4483,52 +4728,43 @@ async def inst_signals_detail(query, ticker):
     mp_list = sig.get("max_pain", [])
     if mp_list:
         parts.append("\n<b>MAX PAIN  (Expiry Price Magnet)</b>")
-        rows = []
+        _mp_rows = []
         for mp in mp_list[:4]:
-            dte_s = f"DTE {mp['dte']}" if mp.get("dte") is not None else ""
-            dist = ""
-            if spot > 0:
-                d_pct = (spot - mp["strike"]) / spot * 100
-                dist = f"vs spot {d_pct:+.1f}%"
-            rows.append(f"  {mp['expiry'][:8]}  ${mp['strike']:.0f}  {dte_s}")
-            if dist:
-                rows.append(f"    {dist}")
-        parts.append(mono("\n".join(rows)))
+            dte_s = f"{mp['dte']}d" if mp.get("dte") is not None else "-"
+            dist  = f"{(spot - mp['strike']) / spot * 100:+.1f}%" if spot > 0 else "-"
+            _mp_rows.append((mp["expiry"][:8], f"${mp['strike']:.0f}", dte_s, dist))
+        parts.append("\n<b>MAX PAIN  (Expiry Price Magnet)</b>\n"
+                     + _pipe_table(("Expiry", "Strike", "DTE", "vs Spot"), _mp_rows, right_cols={1, 2, 3}))
         parts.append("<i>Fade moves away from max pain as expiry nears</i>")
 
     # 2. Gamma Walls
     walls = sig.get("gamma_walls", [])
     if walls:
-        parts.append("\n<b>GAMMA WALLS  (Dealer Hedging Levels)</b>")
-        rows = []
-        for w in walls[:5]:
+        def _fk_w(n):
+            return f"{n/1000:.0f}K" if n >= 1000 else str(int(n))
+        _gw_rows = []
+        for w in walls[:6]:
             label = "CEILING" if w["type"] == "CALL" else ("FLOOR" if w["type"] == "PUT" else "WALL")
-            tot_k = f"{w['total_oi']/1000:.0f}K" if w['total_oi'] >= 1000 else str(w['total_oi'])
-            c_k   = f"{w['call_oi']/1000:.0f}K"  if w['call_oi']  >= 1000 else str(w['call_oi'])
-            p_k   = f"{w['put_oi']/1000:.0f}K"   if w['put_oi']   >= 1000 else str(w['put_oi'])
-            rows.append(f"  ${w['strike']:.0f}  {label}  tot:{tot_k}")
-            rows.append(f"    C:{c_k}  P:{p_k}")
-        parts.append(mono("\n".join(rows)))
+            _gw_rows.append((f"${w['strike']:.0f}", label, _fk_w(w["total_oi"]),
+                             _fk_w(w["call_oi"]), _fk_w(w["put_oi"])))
+        parts.append("\n<b>GAMMA WALLS  (Dealer Hedging Levels)</b>\n"
+                     + _pipe_table(("Strike", "Type", "Total OI", "C-OI", "P-OI"), _gw_rows, right_cols={2, 3, 4}))
         parts.append("<i>Price gravitates toward / stalls at these strikes</i>")
 
     # 3. Smart Money Flow
     sf = sig.get("smart_flow", {})
     if sf:
-        parts.append("\n<b>SMART MONEY FLOW</b>")
         def _fk_sf(n):
             a = abs(n); s = "+" if n >= 0 else "-"
             if a >= 1_000_000: return f"{s}{a/1_000_000:.1f}M"
             if a >= 1_000: return f"{s}{a/1_000:.0f}K"
             return f"{s}{a:.0f}"
-        rows = [
-            "  CALLS  OI:{}  vol:{}".format(
-                _fk_sf(sf.get("call_oi_chg", 0)), _fk_sf(sf.get("call_vol", 0))),
-            "         {}".format(sf.get("call_verdict", "")),
-            "  PUTS   OI:{}  vol:{}".format(
-                _fk_sf(sf.get("put_oi_chg", 0)), _fk_sf(sf.get("put_vol", 0))),
-            "         {}".format(sf.get("put_verdict", "")),
+        _sf_rows = [
+            ("CALLS", _fk_sf(sf.get("call_oi_chg", 0)), _fk_sf(sf.get("call_vol", 0)), sf.get("call_verdict", "-")),
+            ("PUTS",  _fk_sf(sf.get("put_oi_chg",  0)), _fk_sf(sf.get("put_vol",  0)), sf.get("put_verdict",  "-")),
         ]
-        parts.append(mono("\n".join(rows)))
+        parts.append("\n<b>SMART MONEY FLOW</b>\n"
+                     + _pipe_table(("Side", "OI Chg", "Volume", "Verdict"), _sf_rows, right_cols={1, 2}))
         cv, pv = sf.get("call_verdict", ""), sf.get("put_verdict", "")
         if "ACCUM" in cv and "DISTRIB" in pv:
             interp = "BULLISH — calls building, puts unwinding"
@@ -4545,28 +4781,26 @@ async def inst_signals_detail(query, ticker):
     # 4. Notional Conviction
     nt = sig.get("notional", {})
     if nt:
-        parts.append("\n<b>NOTIONAL CONVICTION  (Dollar Weight)</b>")
-        rows = [
-            "  Call:  ${:.1f}M  Bull:{:,.0f}".format(nt.get("call_m", 0), nt.get("bull_score", 0)),
-            "  Put:   ${:.1f}M  Bear:{:,.0f}".format(nt.get("put_m", 0), nt.get("bear_score", 0)),
-            "  Net:   ${:+.1f}M  ratio:{:.2f}x".format(nt.get("net_m", 0), nt.get("ratio", 0)),
+        _nt_rows = [
+            ("Call",  f"${nt.get('call_m', 0):.1f}M", f"{nt.get('bull_score', 0):,.0f}"),
+            ("Put",   f"${nt.get('put_m',  0):.1f}M", f"{nt.get('bear_score', 0):,.0f}"),
+            ("Net",   f"${nt.get('net_m',  0):+.1f}M", f"{nt.get('ratio', 0):.2f}x"),
         ]
-        parts.append(mono("\n".join(rows)))
+        parts.append("\n<b>NOTIONAL CONVICTION  (Dollar Weight)</b>\n"
+                     + _pipe_table(("Side", "Notional", "Score"), _nt_rows, right_cols={1, 2}))
         parts.append(f"<i>Dollar bias: <b>{nt.get('bias', '')}</b></i>")
 
     # 5. Put Skew
     ps = sig.get("put_skew", {})
     if ps:
-        parts.append("\n<b>PUT SKEW  (Institutional Fear Gauge)</b>")
-        rows = [
-            "  Exp:  {}".format(ps.get("expiry", "")),
-            "  Call ~5%OTM: ${:.0f}  px ${:.2f}".format(
-                ps.get("call_strike", 0), ps.get("call_px", 0)),
-            "  Put  ~5%OTM: ${:.0f}  px ${:.2f}".format(
-                ps.get("put_strike", 0), ps.get("put_px", 0)),
-            "  Skew: {:.2f}x  [{}]".format(ps.get("skew", 0), ps.get("fear", "")),
+        _ps_rows = [
+            ("Call ~5%OTM", f"${ps.get('call_strike', 0):.0f}", f"${ps.get('call_px', 0):.2f}"),
+            ("Put  ~5%OTM", f"${ps.get('put_strike',  0):.0f}", f"${ps.get('put_px',  0):.2f}"),
+            ("Skew / Fear", f"{ps.get('skew', 0):.2f}x", ps.get("fear", "-")),
         ]
-        parts.append(mono("\n".join(rows)))
+        _ps_exp = ps.get("expiry", "")
+        parts.append(f"\n<b>PUT SKEW  (Fear Gauge)  exp {_ps_exp}</b>\n"
+                     + _pipe_table(("Item", "Strike", "Px / Value"), _ps_rows, right_cols={1, 2}))
         fear = ps.get("fear", "")
         if "EXTREME" in fear or "HIGH" in fear:
             hint = "Heavy put-premium demand — institutions hedging longs; often near bottoms"
@@ -4579,13 +4813,12 @@ async def inst_signals_detail(query, ticker):
     # 6. Pin Risk
     pins = sig.get("pin_risk", [])
     if pins:
-        parts.append("\n<b>PIN RISK  (DTE \u2264 7)</b>")
-        rows = []
-        for pin in pins[:4]:
+        _pin_rows = []
+        for pin in pins[:5]:
             oi_k = f"{pin['total_oi']//1000}K" if pin['total_oi'] >= 1000 else str(pin['total_oi'])
-            rows.append("  ${:.0f}  {}  DTE{}  OI:{}".format(
-                pin["strike"], pin["expiry"][:5], pin["dte"], oi_k))
-        parts.append(mono("\n".join(rows)))
+            _pin_rows.append((f"${pin['strike']:.0f}", pin["expiry"][:8], str(pin["dte"]), oi_k))
+        parts.append("\n<b>PIN RISK  (DTE \u2264 7)</b>\n"
+                     + _pipe_table(("Strike", "Expiry", "DTE", "Total OI"), _pin_rows, right_cols={2, 3}))
         parts.append("<i>High OI near expiry = gravitational price pin</i>")
 
     if not any([mp_list, walls, sf, nt, ps, pins]):
@@ -4825,62 +5058,68 @@ async def mean_rev_detail(query, ticker):
     if pz:
         any_data = True
         z   = pz["z"]
-        bar = "\u2588" * min(int(abs(z) * 2), 10)
-        parts.append("\n<b>PCR Z-SCORE  ({}d lookback)</b>".format(pz["lookback"]))
-        rows = [
-            "  Today PCR:  {:.3f}".format(pz["today"]),
-            "  {}d mean:   {:.3f}   std: {:.3f}".format(pz["lookback"], pz["mean"], pz["std"]),
-            "  Z-score:   {:+.2f}  [{}]  {}".format(z, bar, pz["level"]),
+        bar = "\u2588" * min(int(abs(z) * 2), 8)
+        _pz_rows = [
+            ("Today PCR",  f"{pz['today']:.3f}"),
+            (f"{pz['lookback']}d mean", f"{pz['mean']:.3f}"),
+            ("Std Dev",    f"{pz['std']:.3f}"),
+            ("Z-score",    f"{z:+.2f}  {bar}"),
+            ("Level",      pz["level"]),
         ]
-        parts.append(mono("\n".join(rows)))
-        parts.append("<i>{}</i>".format(pz["action"]))
+        parts.append("\n<b>PCR Z-SCORE</b>\n"
+                     + _pipe_table(("Metric", "Value"), _pz_rows, right_cols={1}))
+        parts.append(f"<i>{pz['action']}</i>")
 
     # 2. Price Z-Score
     prz = sig.get("price_z", {})
     if prz:
         any_data = True
-        parts.append("\n<b>PRICE Z-SCORE  (20d lookback)</b>")
-        rows = [
-            "  Today:    ${:.2f}".format(prz["today"]),
-            "  20d mean: ${:.2f}   std: ${:.2f}".format(prz["mean20"], prz["std20"]),
-            "  Z-score:  {:+.2f}  [{}]".format(prz["z"], prz["level"]),
-            "  Target:   ${:.2f}   Stop: ${:.2f}".format(prz["target1"], prz["stop"]),
+        _prz_rows = [
+            ("Today",   f"${prz['today']:.2f}"),
+            ("20d Mean", f"${prz['mean20']:.2f}"),
+            ("Std Dev",  f"${prz['std20']:.2f}"),
+            ("Z-score",  f"{prz['z']:+.2f}  [{prz['level']}]"),
+            ("Target",   f"${prz['target1']:.2f}"),
+            ("Stop",     f"${prz['stop']:.2f}"),
         ]
-        parts.append(mono("\n".join(rows)))
+        parts.append("\n<b>PRICE Z-SCORE  (20d)</b>\n"
+                     + _pipe_table(("Metric", "Value"), _prz_rows, right_cols={1}))
 
     # 3. PCR Trend
     pt = sig.get("pcr_trend", {})
     if pt:
         any_data = True
         last5 = " \u2192 ".join(str(x) for x in pt["last5"])
-        parts.append("\n<b>PCR TREND  (5-day rolling)</b>")
-        rows = [
-            "  5d avg: {:.3f}   Today: {:.3f}   ({:+.1f}%)".format(
-                pt["avg5"], pt["today"], pt["pct_chg"]),
-            "  Trend:  {}".format(pt["trend"]),
-            "  Last 5: {}".format(last5),
+        _pt_rows = [
+            ("5d Avg",  f"{pt['avg5']:.3f}"),
+            ("Today",   f"{pt['today']:.3f}"),
+            ("Chg%",    f"{pt['pct_chg']:+.1f}%"),
+            ("Trend",   pt["trend"]),
+            ("Last 5",  last5),
         ]
-        parts.append(mono("\n".join(rows)))
+        parts.append("\n<b>PCR TREND  (5d rolling)</b>\n"
+                     + _pipe_table(("Metric", "Value"), _pt_rows, right_cols={1}))
         if "SPIKE" in pt["trend"]:
-            parts.append("<i>Sudden spike -- may be expiry distortion or event hedge</i>")
+            parts.append("<i>Sudden spike \u2014 may be expiry distortion or event hedge</i>")
 
     # 4. Net OI Extreme
     oi = sig.get("oi_extreme", {})
     if oi:
         any_data = True
-        parts.append("\n<b>NET OI EXTREME  (20d lookback)</b>")
-        rows = [
-            "  Net OI today:  {:>+12,}".format(oi["net_oi_today"]),
-            "  20d mean:      {:>+12,}".format(oi["net_oi_mean"]),
-            "  Z-score:       {:>+12.2f}  [{}]".format(oi["z"], oi["level"]),
-            "  Call OI: {:>9,}   Put OI: {:>9,}".format(oi["call_oi"], oi["put_oi"]),
+        _oi_rows = [
+            ("Net OI Today", f"{oi['net_oi_today']:+,}"),
+            ("20d Mean",     f"{oi['net_oi_mean']:+,}"),
+            ("Z-score",      f"{oi['z']:+.2f}  [{oi['level']}]"),
+            ("Call OI",      f"{oi['call_oi']:,}"),
+            ("Put OI",       f"{oi['put_oi']:,}"),
         ]
-        parts.append(mono("\n".join(rows)))
+        parts.append("\n<b>NET OI EXTREME  (20d)</b>\n"
+                     + _pipe_table(("Metric", "Value"), _oi_rows, right_cols={1}))
         if "PEAK" in oi["level"]:
-            note = ("Too many puts -- peak bearish positioning, contrarian BUY zone"
+            note = ("Too many puts \u2014 peak bearish positioning, contrarian BUY zone"
                     if "BEARISH" in oi["level"] else
-                    "Too many calls -- peak bullish positioning, contrarian SELL zone")
-            parts.append("<i>{}</i>".format(note))
+                    "Too many calls \u2014 peak bullish positioning, contrarian SELL zone")
+            parts.append(f"<i>{note}</i>")
 
     # 5. Composite
     comp = sig.get("composite", {})
@@ -4888,13 +5127,15 @@ async def mean_rev_detail(query, ticker):
         any_data = True
         sc    = comp["score"]
         arrow = "\u25b2" if sc > 0 else "\u25bc"
-        parts.append("\n<b>COMPOSITE MEAN REVERSION SCORE</b>")
-        rows = ["  Score:  {:+.2f}  {}  [{}]".format(sc, arrow, comp["level"])]
-        if comp["factors"]:
-            rows.append("  Inputs: {}".format(",  ".join(comp["factors"])))
-        parts.append(mono("\n".join(rows)))
+        _comp_rows = [
+            ("Score",   f"{sc:+.2f}  {arrow}"),
+            ("Level",   comp["level"]),
+            ("Inputs",  ", ".join(comp["factors"]) if comp["factors"] else "-"),
+        ]
+        parts.append("\n<b>COMPOSITE SCORE</b>\n"
+                     + _pipe_table(("Metric", "Value"), _comp_rows))
         if comp["action"]:
-            parts.append("<b>Trade idea:</b>  {}".format(comp["action"]))
+            parts.append(f"<b>Trade idea:</b>  {comp['action']}")
 
     if not any_data:
         parts.append("\n<i>Not enough historical data for mean reversion analysis.</i>")
@@ -5130,6 +5371,45 @@ async def tech_signals_detail(query, ticker):
         ]
         parts.append(mono("\n".join(rows)))
         parts.append("<b>Signal: {} {}</b>".format(comp["conf"], comp["signal"]))
+
+
+    # Short Interest & Float
+    try:
+        sd = _get_short_data(tk)
+        if sd.get("squeeze_score") is not None:
+            any_data = True
+            spf  = sd["short_pct_float"]
+            sr   = sd["short_ratio"]
+            ss   = sd["shares_short"]
+            flt  = sd["float_shares"]
+            ssp  = sd["shares_short_prior"]
+            sc   = sd["squeeze_score"]
+            slbl = sd["squeeze_label"]
+            def _fmt_M(n):
+                if n is None: return "N/A"
+                if n >= 1e9: return f"{n/1e9:.2f}B"
+                if n >= 1e6: return f"{n/1e6:.1f}M"
+                return f"{n:,.0f}"
+            chg_s = ""
+            if ss and ssp:
+                chg_pct = (ss - ssp) / ssp * 100
+                chg_s = f"({chg_pct:+.1f}% vs prev)"
+            sq_em = "🔴" if sc >= 7 else ("🟡" if sc >= 4 else "🟢")
+            rows = [
+                ("Float",          _fmt_M(flt)),
+                ("Shares Short",   f"{_fmt_M(ss)} {chg_s}".strip()),
+                ("Short % Float",  f"{spf:.1f}%" if spf else "N/A"),
+                ("Days to Cover",  f"{sr:.1f}d" if sr else "N/A"),
+                ("Squeeze Score",  f"{sc}/10  {sq_em} {slbl}"),
+            ]
+            parts.append(chr(10) + "<b>SHORT INTEREST & FLOAT</b>")
+            parts.append(_pipe_table(("Metric", "Value"), rows, right_cols={1}))
+            if sc >= 7:
+                parts.append("<i>High short interest — squeeze risk if bullish catalyst hits</i>")
+            elif sc >= 4:
+                parts.append("<i>Moderate short interest — watch for covering rallies</i>")
+    except Exception:
+        pass
 
     if not any_data:
         parts.append("\n<i>Not enough price history (need 30+ days in stock_daily).</i>")
@@ -5712,36 +5992,23 @@ async def oi_menu(query, expiry=None):
         if n >= 1_000_000:     return f"{n/1_000_000:.2f}M"
         if n >= 1_000:         return f"{n/1_000:.0f}K"
         return f"{n:.0f}"
-    _oi_hdrs = ["Ticker", "Call OI", "Put OI", "PCR"]
-    _oi_data = []
-    for _, r in top_oi.iterrows():
-        _oi_data.append([
-            str(r['ticker']),
-            _fk_oi(r['total_call_oi']),
-            _fk_oi(r['total_put_oi']),
-            f"{min(float(r['pcr'] or 0), 9.99):.2f}",
-        ])
-    _oi_w = [max(len(_oi_hdrs[i]), max(len(row[i]) for row in _oi_data)) for i in range(len(_oi_hdrs))]
-    oi_rows  = [" | ".join(_oi_hdrs[i].ljust(_oi_w[i]) for i in range(len(_oi_hdrs)))]
-    oi_rows += ["-+-".join("-" * w for w in _oi_w)]
-    for row in _oi_data:
-        oi_rows.append(" | ".join(row[i].ljust(_oi_w[i]) for i in range(len(row))))
-    parts.append("\n<b>Top by Open Interest</b>\n" + mono("\n".join(oi_rows)))
+    _oi_tbl_data = [
+        (str(r["ticker"]), _fk_oi(r["total_call_oi"]), _fk_oi(r["total_put_oi"]),
+         f"{min(float(r['pcr'] or 0), 9.99):.2f}")
+        for _, r in top_oi.iterrows()
+    ]
+    parts.append("\n<b>Top by Open Interest</b>\n"
+                 + _pipe_table(("Ticker", "Call OI", "Put OI", "PCR"), _oi_tbl_data, right_cols={1, 2, 3}))
 
-    # Highest PCR — same dynamic-width approach
+    # Highest PCR
     high_pcr = df[df["pcr"] > 0].nlargest(5, "pcr")
     if not high_pcr.empty:
-        _pcr_hdrs = ["Ticker", "PCR", "Bias"]
-        _pcr_data = []
+        _pcr_tbl = []
         for _, r in high_pcr.iterrows():
             bias = "Bearish" if r["pcr"] > 1.3 else ("Bullish" if r["pcr"] < 0.7 else "Neutral")
-            _pcr_data.append([str(r['ticker']), f"{min(float(r['pcr'] or 0), 9.99):.2f}", bias])
-        _pcr_w = [max(len(_pcr_hdrs[i]), max(len(row[i]) for row in _pcr_data)) for i in range(len(_pcr_hdrs))]
-        pcr_rows  = [" | ".join(_pcr_hdrs[i].ljust(_pcr_w[i]) for i in range(len(_pcr_hdrs)))]
-        pcr_rows += ["-+-".join("-" * w for w in _pcr_w)]
-        for row in _pcr_data:
-            pcr_rows.append(" | ".join(row[i].ljust(_pcr_w[i]) for i in range(len(row))))
-        parts.append("\n<b>Highest Put/Call Ratio</b>\n" + mono("\n".join(pcr_rows)))
+            _pcr_tbl.append((str(r["ticker"]), f"{min(float(r['pcr'] or 0), 9.99):.2f}", bias))
+        parts.append("\n<b>Highest Put/Call Ratio</b>\n"
+                     + _pipe_table(("Ticker", "PCR", "Bias"), _pcr_tbl, right_cols={1}))
 
     # Build expiry selection buttons (expiry_date values)
     exp_btns = []
@@ -6113,32 +6380,26 @@ async def oi_compare_view(query, ctx, exp1, exp2):
     # Biggest call OI increases
     top_call_gain = merged.nlargest(5, "call_chg")
     if not top_call_gain.empty:
-        parts.append("\n🟢 <b>Biggest Call OI Increases</b>")
-        rows = [f"{'ST':<3} {'Ticker':<6} {'Call OI Chg':>11} {'PCR':>5}"]
-        rows.append("─" * 29)
-        for _, r in top_call_gain.iterrows():
-            rows.append(f"[B] {r['ticker']:<6} {r['call_chg']:>+11,.0f} {r['pcr_2']:>5.2f}")
-        parts.append(mono("\n".join(rows)))
+        _cg_rows = [("🟢", r["ticker"], f"{r['call_chg']:+,.0f}", f"{r['pcr_2']:.2f}")
+                    for _, r in top_call_gain.iterrows()]
+        parts.append("\n🟢 <b>Biggest Call OI Increases</b>\n"
+                     + _pipe_table(("ST", "Ticker", "Call OI Chg", "PCR"), _cg_rows, right_cols={2, 3}))
 
     # Biggest put OI increases
     top_put_gain = merged.nlargest(5, "put_chg")
     if not top_put_gain.empty:
-        parts.append("\n🔴 <b>Biggest Put OI Increases</b>")
-        rows = [f"{'ST':<3} {'Ticker':<6} {'Put OI Chg':>10} {'PCR':>5}"]
-        rows.append("─" * 28)
-        for _, r in top_put_gain.iterrows():
-            rows.append(f"[S] {r['ticker']:<6} {r['put_chg']:>+10,.0f} {r['pcr_2']:>5.2f}")
-        parts.append(mono("\n".join(rows)))
+        _pg_rows = [("🔴", r["ticker"], f"{r['put_chg']:+,.0f}", f"{r['pcr_2']:.2f}")
+                    for _, r in top_put_gain.iterrows()]
+        parts.append("\n🔴 <b>Biggest Put OI Increases</b>\n"
+                     + _pipe_table(("ST", "Ticker", "Put OI Chg", "PCR"), _pg_rows, right_cols={2, 3}))
 
     # PCR changes
     top_pcr_inc = merged.dropna(subset=["pcr_chg"]).nlargest(5, "pcr_chg")
     if not top_pcr_inc.empty:
-        parts.append("\n📈 <b>Biggest PCR Increases (More Bearish)</b>")
-        rows = [f"{'Ticker':<6} {'PCR Δ':>6} {'New PCR':>7}"]
-        rows.append("─" * 22)
-        for _, r in top_pcr_inc.iterrows():
-            rows.append(f"{r['ticker']:<6} {r['pcr_chg']:>+6.2f} {r['pcr_2']:>7.2f}")
-        parts.append(mono("\n".join(rows)))
+        _pcr_ch_rows = [(r["ticker"], f"{r['pcr_chg']:+.2f}", f"{r['pcr_2']:.2f}")
+                        for _, r in top_pcr_inc.iterrows()]
+        parts.append("\n📈 <b>Biggest PCR Increases (More Bearish)</b>\n"
+                     + _pipe_table(("Ticker", "PCR Δ", "New PCR"), _pcr_ch_rows, right_cols={1, 2}))
     
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔀 New Compare", callback_data="oi_compare_select1")],
@@ -6549,6 +6810,7 @@ def _generate_live_vs_eod_chart(ticker, live_data_list, eod_date):
     conn = get_conn()
     n    = len(live_data_list)
     fig  = plt.figure(figsize=(12, 7 * n))
+    buf  = BytesIO()
     signal_list = []  # collect per-expiry signal data for the text write-up
 
     try:
@@ -7413,7 +7675,8 @@ async def more_features_menu(query):
          InlineKeyboardButton("🤖 MiroFish Signals", callback_data="menu_mirofish")],
         [InlineKeyboardButton("🌙 AH Predictor", callback_data="menu_aftermarket_predict"),
          InlineKeyboardButton("⚠️ Overnight Risk", callback_data="menu_overnight_risk")],
-        [InlineKeyboardButton("🎲 Monte Carlo Sim", callback_data="menu_exit")],
+        [InlineKeyboardButton("🎯 Recommend Engine", callback_data="menu_recommend"),
+         InlineKeyboardButton("🎲 Monte Carlo Sim", callback_data="menu_exit")],
         [BACK_BTN],
     ])
     await query.message.reply_text(
@@ -7547,14 +7810,8 @@ async def market_analytics_report(query):
     if unusual_tickers:
         _oi_rows.append(["[?]", ", ".join(unusual_tickers[:3])[:7], "", "", ""])
     if _oi_rows:
-        _oi_cw  = [max(len(_oi_hdr[i]), max((len(r[i]) for r in _oi_rows), default=0)) for i in range(5)]
-        _oi_jn  = lambda i, v: v.rjust(_oi_cw[i]) if i in _oi_RGHT else v.ljust(_oi_cw[i])
-        _oi_sep = "-+-".join("-" * w for w in _oi_cw)
-        _oi_lines = [f"OI FLOW  {latest_date}",
-                     " | ".join(_oi_jn(i, _oi_hdr[i]) for i in range(5)), _oi_sep]
-        for r in _oi_rows:
-            _oi_lines.append(" | ".join(_oi_jn(i, r[i]) for i in range(5)))
-        parts.append("<pre>" + "\n".join(_oi_lines) + "</pre>")
+        parts.append(f"<b>OI FLOW  {latest_date}</b>\n"
+                     + _pipe_table(tuple(_oi_hdr), _oi_rows, right_cols=_oi_RGHT))
 
     # ── 3. Technical Signals (moondevonyt / Harvard RBI) ──────────
     try:
@@ -7590,14 +7847,8 @@ async def market_analytics_report(query):
             except Exception:
                 continue
         if _t_data:
-            _t_cw   = [max(len(_t_hdr[i]), max(len(r[i]) for r in _t_data)) for i in range(7)]
-            _t_jn   = lambda i, v: v.rjust(_t_cw[i]) if i in _t_RGHT else v.ljust(_t_cw[i])
-            _t_sep  = "-+-".join("-" * w for w in _t_cw)
-            _t_out  = ["TECH SIGNALS  RSI/MACD/BB/EMA",
-                       " | ".join(_t_jn(i, _t_hdr[i]) for i in range(7)), _t_sep]
-            for r in _t_data:
-                _t_out.append(" | ".join(_t_jn(i, r[i]) for i in range(7)))
-            parts.append("<pre>" + "\n".join(_t_out) + "</pre>")
+            parts.append("<b>TECH SIGNALS  RSI/MACD/BB/EMA</b>\n"
+                         + _pipe_table(tuple(_t_hdr), _t_data, right_cols=_t_RGHT))
     except Exception as te_ex:
         log.warning(f"market_analytics tech signals failed: {te_ex}")
 
@@ -7993,38 +8244,43 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
         "HOLD":        "Trade is on track. Keep holding and monitor.",
     }
 
-    html_cards = []
+    # ── Pipe-table layout ─────────────────────────────────────────────
+    # Row data lists for both tables
+    _tbl1_rows = []  # #|Tk|Type|Strike|DTE|Entry|Now
+    _tbl2_rows = []  # #|PnL$|P%|Win|OI|Action
+    html_cards  = []  # per-position advice cards (kept below tables)
 
-    for (em, tk, otype, strike, entry, cur_px, pnl_pct, pnl, dte_s, prob_s, oi_s, action) in rows:
-        buy_s = f"${entry:.2f}"  if entry  < 100 else f"${entry:.0f}"
-        cur_s = f"${cur_px:.2f}" if cur_px < 100 else f"${cur_px:.0f}"
+    for idx, (em, tk, otype, strike, entry, cur_px, pnl_pct, pnl, dte_s, prob_s, oi_s, action) in enumerate(rows, 1):
+        buy_s = f"{entry:.2f}"  if entry  < 100 else f"{entry:.0f}"
+        cur_s = f"{cur_px:.2f}" if cur_px < 100 else f"{cur_px:.0f}"
         pct_s = f"{pnl_pct:+.1f}%"
         pnl_s = f"${pnl:+,.0f}"
         a_em  = _action_em.get(action, "✅")
         advice = _action_advice.get(action, "Monitor position.")
 
-        # DTE urgency note
         dte_num = int(dte_s[1:]) if dte_s.startswith("D") and dte_s[1:].isdigit() else None
-        if dte_num is not None and dte_num <= 3:
-            dte_note = f" ⚠️ <b>Only {dte_num} days left!</b>"
-        elif dte_num is not None and dte_num <= 7:
-            dte_note = f" ({dte_num}d to expiry)"
-        else:
-            dte_note = f" ({dte_s} to expiry)"
+        dte_disp = f"{dte_num}d" if dte_num is not None else dte_s
+        urg_flag = "⚠" if dte_num is not None and dte_num <= 3 else ""
 
-        # OI alignment note
-        oi_note = f"  OI: <i>{oi_s}</i>" if oi_s and oi_s != "?" else ""
+        oi_disp = oi_s if oi_s and oi_s != "?" else "-"
+        act_disp = f"{a_em}{action[:8]}"
 
-        side_word = "Sold" if entry < 0 else "Bought"
+        _tbl1_rows.append((str(idx), tk[:5], otype[:1], f"{int(strike)}", f"{dte_disp}{urg_flag}", buy_s, cur_s))
+        _tbl2_rows.append((str(idx), pnl_s, pct_s, prob_s[:6], oi_disp[:8], act_disp[:12]))
 
+        # Advice card — kept for context below tables
         html_cards.append(
-            f"{em} <b>{tk} {otype} ${int(strike)}</b>{dte_note}\n"
-            f"   Entered {buy_s}  →  Now {cur_s}  |  <b>{pct_s} ({pnl_s})</b>\n"
-            f"   Win probability: {prob_s}{oi_note}\n"
-            f"   {a_em} <b>{action}</b> — {advice}"
+            f"{em} <b>{tk} {otype} ${int(strike)}</b>"
+            f"  {a_em} <b>{action}</b> — {advice}"
         )
 
-    colour_section = "\n\n".join(html_cards)
+    t1_hdr = ("#", "Ticker", "T", "Strike", "DTE", "Entry", "Now")
+    t2_hdr = ("#", "PnL$", "P%", "Win", "OI", "Action")
+    table1 = _pipe_table(t1_hdr, _tbl1_rows) if _tbl1_rows else ""
+    table2 = _pipe_table(t2_hdr, _tbl2_rows) if _tbl2_rows else ""
+
+    advice_section = "\n".join(html_cards)
+    colour_section = f"{table1}\n{table2}\n\n{advice_section}"
 
     urgent_section = ""
     if urgent_lines:
@@ -8321,14 +8577,7 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             _frows.append(["[?]", name, "ERR", "---"])
     if _frows:
-        _fw = [max(len(_fhdr[i]), max(len(r[i]) for r in _frows)) for i in range(len(_fhdr))]
-        _RIGHT_F = {2, 3}
-        _fj = lambda i, v: v.rjust(_fw[i]) if i in _RIGHT_F else v.ljust(_fw[i])
-        _fsep = "-+-".join("-" * w for w in _fw)
-        _flines = [" | ".join(_fj(i, _fhdr[i]) for i in range(len(_fhdr))), _fsep]
-        for r in _frows:
-            _flines.append(" | ".join(_fj(i, r[i]) for i in range(len(_fhdr))))
-        parts.append("<b>FUTURES</b>\n<pre>" + "\n".join(_flines) + "</pre>")
+        parts.append("<b>FUTURES</b>\n" + _pipe_table(tuple(_fhdr), _frows, right_cols={2, 3}))
 
     # ── Volume Spike / Whale Alert (moondevonyt WhaleAgent concept) ─
     try:
@@ -8362,10 +8611,16 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 continue
         if spike_lines:
-            vol_rows = [f"{'Tkr':<6} {'Vol':>5}   {'Chg%':>5}  Note"]
-            vol_rows.append("─" * 28)
-            vol_rows.extend(spike_lines)
-            parts.append("\n<b>VOLUME SPIKES (moondev WhaleAgent)</b>\n" + mono("\n".join(vol_rows)))
+            # Parse spike_lines back into table rows
+            _vs_rows = []
+            for sl in spike_lines:
+                # format: f"{sym:<6} {vol_ratio:>4.1f}x  {chg:>+5.1f}%  {tag}"
+                parts_sl = sl.split()
+                if len(parts_sl) >= 4:
+                    _vs_rows.append((parts_sl[0], parts_sl[1], parts_sl[2], parts_sl[3]))
+            if _vs_rows:
+                parts.append("\n<b>VOLUME SPIKES</b>\n"
+                             + _pipe_table(("Ticker", "Vol Ratio", "Chg%", "Signal"), _vs_rows, right_cols={1, 2}))
     except Exception as ve:
         log.warning(f"intraday volume spike check failed: {ve}")
 
@@ -8540,12 +8795,20 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
                         pass
 
                 if _oi_data:
-                    _oi_lines = ["<b>YOUR POSITIONS — NEXT EXPIRY OI</b>"]
+                    _oi_t_hdr = ("ST", "Ticker", "Exp", "C-OI", "P-OI", "Bias")
+                    _oi_t_rows = []
                     for _od in _oi_data:
                         _st_badge, _tk2, _exp2, _c2s, _p2s = _od
+                        _bias_s = "BULL" if _st_badge == "[B]" else ("BEAR" if _st_badge == "[S]" else "FLAT")
                         _em2 = "🟢" if _st_badge == "[B]" else ("🔴" if _st_badge == "[S]" else "🟡")
-                        _oi_lines.append(f"{_em2} <b>{_tk2}</b>  {_exp2}  C:{_c2s}  P:{_p2s}")
-                    parts.append("\n" + "\n".join(_oi_lines))
+                        _oi_t_rows.append((_em2, _tk2, _exp2, _c2s, _p2s, _bias_s))
+                    _oi_all = [_oi_t_hdr] + _oi_t_rows
+                    _oi_ws = [max(len(str(r[c])) for r in _oi_all) for c in range(len(_oi_t_hdr))]
+                    _oi_sep = "+" + "+".join("-" * (w + 2) for w in _oi_ws) + "+"
+                    def _oi_fmt(r):
+                        return "|" + "|".join(f" {str(r[c]):<{_oi_ws[c]}} " for c in range(len(_oi_ws))) + "|"
+                    _oi_table_lines = [_oi_sep, _oi_fmt(_oi_t_hdr), _oi_sep] + [_oi_fmt(r) for r in _oi_t_rows] + [_oi_sep]
+                    parts.append("\n<b>YOUR POSITIONS — NEXT EXPIRY OI</b>\n<pre>" + "\n".join(_oi_table_lines) + "</pre>")
 
                 if key_moves:
                     parts.append("\n<b>⚡ OI ACTIVITY — WHAT IS THE MARKET DOING?</b>")
@@ -8627,10 +8890,49 @@ async def global_market_view(query):
         
         rec_text = "\n".join([f"• {r}" for r in recommendations[:6]])
         
+        # Build macro cascade section
+        cascade_lines = []
+        _md_ch = market_data.get("changes", {})
+        _oil_c  = _md_ch.get("CL=F",    0) or 0
+        _gld_c  = _md_ch.get("GC=F",    0) or 0
+        _tnx_c  = _md_ch.get("^TNX",    0) or 0
+        _btc_c  = _md_ch.get("BTC-USD", 0) or 0
+        _vix_p  = _md_ch.get("^VIX",    0) or 0
+        _vix_v  = market_data.get("prices", {}).get("^VIX", 20.0) or 20.0
+        if abs(_oil_c) > 0.8:
+            cascade_lines.append(f"🛢 Oil{"↑" if _oil_c>0 else "↓"}{_oil_c:+.1f}%  →  "
+                                 f"{"▼DAL/UAL/AAL  ▲XLE/XOM/CVX" if _oil_c>0 else "▲DAL/UAL  ▼XLE/CVX"}")
+        if abs(_gld_c) > 0.5:
+            cascade_lines.append(f"🥇 Gold{"↑" if _gld_c>0 else "↓"}{_gld_c:+.1f}% →  "
+                                 f"{"▲GDX/NEM  ▼DXY  ▲EEM" if _gld_c>0 else "▲DXY  ▼GDX/NEM"}")
+        if abs(_tnx_c) > 0.3:
+            cascade_lines.append(f"📈 10Y{"↑" if _tnx_c>0 else "↓"}{_tnx_c:+.1f}% →  "
+                                 f"{"▲JPM/BAC  ▼VNQ/XLU  ▼Growth" if _tnx_c>0 else "▲VNQ/TLT  ▲Growth  ▼Banks"}")
+        if abs(_btc_c) > 3.0:
+            cascade_lines.append(f"₿ BTC{"↑" if _btc_c>0 else "↓"}{_btc_c:+.1f}% →  "
+                                 f"{"Risk-ON: ▲MSTR/COIN/RIOT" if _btc_c>0 else "Risk-OFF: ▼spec"}")
+        if _vix_v > 25:
+            cascade_lines.append(f"😨 VIX {_vix_v:.1f} ELEVATED → Sell premium, buy hedges")
+        elif _vix_v < 15:
+            cascade_lines.append(f"😴 VIX {_vix_v:.1f} LOW → Iron condors / covered calls")
+        cascade_text = ""
+        if cascade_lines:
+            cascade_text = (f"\n\n{hdr('🌐 MACRO CASCADE MAP')}\n"
+                            + "\n".join(cascade_lines))
+        # Stock relations for context
+        rel_text = (f"\n\n{hdr('📡 KEY STOCK RELATIONS')}\n"
+                    "NVDA↑ → SMCI/ANET/AMD (AI infra spend)\n"
+                    "AAPL↑ → TSM/QCOM/AVGO (supply chain)\n"
+                    "GOOGL↑ → META/TTD/MGNI (ad-tech floor)\n"
+                    "Oil↑ → ▼DAL/UAL  ▲XLE/CVX  ▼XRT\n"
+                    "Gold↑ → ▲GDX  ▼DXY → ▲EEM/FXI\n"
+                    "Rates↑ → ▲Banks  ▼REITs  ▼Long-tech")
         full_message = (
             f"{summary}\n\n"
             f"{hdr('💡 OPTIONS STRATEGY IMPLICATIONS')}\n"
             f"{rec_text}"
+            f"{cascade_text}"
+            f"{rel_text}"
         )
         
         await _loading.delete()
@@ -10267,10 +10569,28 @@ async def aftermarket_predict(query, ticker: str = None):
 
         tk_pnl_em  = "🟢" if tk_pnl_now >= 0 else "🔴"
         tk_tmrw_em = "🟢" if tk_pnl_tmrw >= 0 else "🔴"
+
+        # Short interest context for AH predictor
+        try:
+            _sd = _get_short_data(tk)
+            _spf = _sd.get("short_pct_float")
+            _sr  = _sd.get("short_ratio")
+            _sc  = _sd.get("squeeze_score")
+            _sq_parts = []
+            if _spf is not None: _sq_parts.append(f"SI:{_spf:.1f}%")
+            if _sr  is not None: _sq_parts.append(f"DTC:{_sr:.1f}d")
+            if _sc  is not None:
+                _sq_em = "🔴" if _sc >= 7 else ("🟡" if _sc >= 4 else "🟢")
+                _sq_parts.append(f"Sq:{_sc}/10{_sq_em}")
+            _si_line = "  " + " | ".join(_sq_parts) if _sq_parts else ""
+        except Exception:
+            _si_line = ""
+
         stock_line = (
             f"{stock_em} <b>{tk}</b>  EOD <b>${spot_reg:.2f}</b> → {ah_src} <b>${spot_ext:.2f}</b> {ext_tag}\n"
             f"{tk_pnl_em} P&amp;L now <b>${tk_pnl_now:+,.0f}</b>  "
             f"{tk_tmrw_em} Tmrw est <b>${tk_pnl_tmrw:+,.0f}</b>"
+            + (_si_line if _si_line else "")
             + ev_line
         )
 
@@ -11473,19 +11793,89 @@ def make_mini_chart(ticker: str, days: int = 7) -> bytes:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.gridspec import GridSpec
+
+    BG      = "#0d1117"
+    GRID    = "#21262d"
+    UP_C    = "#26a641"
+    DN_C    = "#da3633"
+    LINE_C  = "#58a6ff"
+    TEXT_C  = "#c9d1d9"
+    VOLU_UP = "#1f6335"
+    VOLU_DN = "#7d2020"
+
     tk = yf.Ticker(ticker)
-    hist = tk.history(period=f"{days}d")
-    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
-    ax.plot(hist.index, hist["Close"], color="#00aaff", linewidth=1.5)
-    ax.fill_between(hist.index, hist["Close"], alpha=0.15, color="#00aaff")
-    ax.set_title(ticker, fontsize=9, color="white", pad=3)
-    ax.tick_params(axis="both", labelsize=6, colors="gray")
-    ax.spines[:].set_visible(False)
-    ax.set_facecolor("#111111")
-    fig.patch.set_facecolor("#111111")
-    plt.tight_layout(pad=0.4)
+    hist = tk.history(period=f"{max(days+3, 12)}d")
+    if hist.empty:
+        fig, ax = plt.subplots(figsize=(6, 3), dpi=120)
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", color=TEXT_C)
+        ax.set_facecolor(BG); fig.patch.set_facecolor(BG)
+        buf = BytesIO(); fig.savefig(buf, format="png", facecolor=BG); plt.close(fig)
+        buf.seek(0); return buf.read()
+
+    hist = hist.tail(days)
+    xs   = range(len(hist))
+    O, H, L, C, V = (hist[c].values for c in ["Open","High","Low","Close","Volume"])
+    label_disp = "S&P 500" if ticker == "^GSPC" else ticker
+
+    # Net change label
+    net_pct = (C[-1] - C[0]) / C[0] * 100 if C[0] else 0
+    net_col = UP_C if net_pct >= 0 else DN_C
+    net_str = f"{net_pct:+.2f}%"
+
+    fig = plt.figure(figsize=(7, 3.8), dpi=130, facecolor=BG)
+    gs  = GridSpec(2, 1, height_ratios=[3, 1], hspace=0.04, figure=fig)
+    ax  = fig.add_subplot(gs[0])
+    axv = fig.add_subplot(gs[1], sharex=ax)
+
+    for ax_ in (ax, axv):
+        ax_.set_facecolor(BG)
+        ax_.grid(True, color=GRID, linewidth=0.5, linestyle="--")
+        ax_.spines[:].set_visible(False)
+        ax_.tick_params(colors=TEXT_C, labelsize=7)
+
+    # Candlesticks
+    w = 0.4
+    for i, (o, h, l, c) in enumerate(zip(O, H, L, C)):
+        col = UP_C if c >= o else DN_C
+        ax.plot([i, i], [l, h], color=col, linewidth=0.8)
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (i - w/2, min(o, c)), w, max(abs(c - o), 0.01),
+            boxstyle="square,pad=0", facecolor=col, edgecolor=col, linewidth=0))
+
+    # Close line overlay
+    ax.plot(list(xs), C, color=LINE_C, linewidth=1.0, alpha=0.5, zorder=5)
+
+    # Price range annotation
+    ax.set_xlim(-0.8, len(hist) - 0.2)
+    ax.set_ylim(min(L) * 0.999, max(H) * 1.001)
+
+    # Y-axis only right side
+    ax.yaxis.set_label_position("right"); ax.yaxis.tick_right()
+    ax.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+
+    # Title area
+    ax.set_title(
+        f"{label_disp}   {C[-1]:,.2f}   {net_str}  ({days}d)",
+        loc="left", fontsize=10, color=TEXT_C, pad=6, fontweight="bold")
+
+    # Volume bars
+    vol_colors = [UP_C if C[i] >= O[i] else DN_C for i in range(len(hist))]
+    axv.bar(list(xs), V / 1e6, color=vol_colors, width=0.6, alpha=0.7)
+    axv.set_ylabel("Vol M", color=TEXT_C, fontsize=6, labelpad=2)
+    axv.yaxis.set_label_position("right"); axv.yaxis.tick_right()
+
+    # X-axis date labels (every 2nd bar)
+    date_labels = [d.strftime("%d%b") if hasattr(d, "strftime") else str(d)
+                   for d in hist.index]
+    tick_positions = list(range(0, len(hist), max(1, len(hist) // 5)))
+    axv.set_xticks(tick_positions)
+    axv.set_xticklabels([date_labels[i] for i in tick_positions], fontsize=6, color=TEXT_C)
+
+    plt.tight_layout(pad=0.5)
     buf = BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    fig.savefig(buf, format="png", facecolor=BG, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -12326,6 +12716,41 @@ def _get_spot_with_ah(ticker: str) -> dict:
             pass
     return result
 
+
+def _tg_spot_label(ticker: str) -> tuple:
+    """Returns (best_price, display_label, source_key) using live/AH/EOD.
+    source_key: 'ah' | 'pm' | 'live' | 'eod' | 'wkd'
+    Use best_price for all calculations; display_label for Telegram output.
+    """
+    from datetime import datetime as _dt
+    try:
+        import pytz as _tz
+        _now = _dt.now(_tz.timezone("US/Eastern"))
+        _wday = _now.weekday()  # 0=Mon 6=Sun
+        _hour = _now.hour + _now.minute / 60
+    except Exception:
+        _wday, _hour = 0, 12.0
+
+    ah = _get_spot_with_ah(ticker)
+    reg = ah["spot_reg"]
+    ext = ah["spot_ext"]
+    src = ah["ext_src"]
+    is_ext = ah["is_extended"]
+    chg = ah["ext_chg_pct"]
+
+    if _wday >= 5:  # Weekend
+        lbl = f"📅 WKD ${reg:.2f}" if reg > 0 else "📅 N/A"
+        return reg, lbl, "wkd"
+    if is_ext and ext > 0 and abs(ext - reg) > 0.01:
+        if "Post" in src or "post" in src:
+            return ext, f"🌙 AH ${ext:.2f} ({chg:+.1f}% vs EOD ${reg:.2f})", "ah"
+        else:
+            return ext, f"🌅 PM ${ext:.2f} ({chg:+.1f}% vs EOD ${reg:.2f})", "pm"
+    if 9.5 <= _hour <= 16.0 and _wday < 5:
+        return reg, f"📈 Live ${reg:.2f}", "live"
+    return reg, f"☀️ EOD ${reg:.2f}", "eod"
+
+
 # ─── Black-Scholes ───
 def bs_price(S, K, T, r, sigma, opt="put"):
     if T <= 0:
@@ -12539,6 +12964,31 @@ def shdr(title):
 def mono(text):
     """Monospaced block for tables."""
     return f"<pre>{text}</pre>"
+
+
+def _pipe_table(header_cols, rows_data, right_cols=None, title=None):
+    """NSE allinone-style table in <pre>.
+    Format (matches Live PCR bot):
+      header1     | header2  | header3
+      ------------|----------|--------
+      val1        | val2     | val3
+    All text is html.escape()-safe (no HTML tags inside).
+    right_cols = set of column indices to right-align."""
+    import html as _html
+    right_cols = right_cols or set()
+    all_rows = [list(header_cols)] + [list(r) for r in rows_data]
+    widths = [max(len(str(r[c])) for r in all_rows) for c in range(len(header_cols))]
+    def _fmt(r):
+        cells = [f"{str(r[c]):>{widths[c]}}" if c in right_cols
+                 else f"{str(r[c]):<{widths[c]}}" for c in range(len(widths))]
+        return " | ".join(cells)
+    sep = "-+-".join("-" * w for w in widths)
+    lines = []
+    if title:
+        lines.append(title)
+    lines += [_fmt(header_cols), sep] + [_fmt(r) for r in rows_data]
+    return "<pre>" + _html.escape("\n".join(lines)) + "</pre>"
+
 
 def _col_arrow(chg: float, strong: float = 0.5, weak: float = 0.1) -> str:
     """Return a colored-emoji arrow based on % change.
@@ -12779,24 +13229,19 @@ async def market_overview(query):
     for _sec, name, d, tag in all_rows:
         sections[_sec].append((name, d, tag))
 
-    # Global column widths so all sections align at the same vertical positions
-    all_items_flat = [(n, d, t) for _, sec_items in sections.items() for n, d, t in sec_items]
-    name_w  = max(len(n) for n, _, _ in all_items_flat)
-    price_w = max((len(d["px_s"]) if d else 3) for _, d, _ in all_items_flat)
-
     colour_lines = []
     for sec_name, items in sections.items():
         colour_lines.append(shdr(sec_name))
-        pre_rows = []
+        _sec_rows = []
         for name, d, tag in items:
             if d:
                 arrow = _col_arrow(d["chg"])
-                note = f"  {tag}" if tag else ""
-                pre_rows.append(
-                    f"{name:<{name_w}}  {d['px_s']:>{price_w}}  {arrow} {d['chg']:>+6.2f}%{note}")
+                note = tag if tag else "-"
+                _sec_rows.append((name, d["px_s"], f"{d['chg']:>+.2f}%", arrow, note))
             else:
-                pre_rows.append(f"{name:<{name_w}}  {'N/A':>{price_w}}")
-        colour_lines.append(f"<pre>{chr(10).join(pre_rows)}</pre>")
+                _sec_rows.append((name, "N/A", "-", "-", "-"))
+        colour_lines.append(_pipe_table(("Name", "Price", "Chg%", "Dir", "Signal"),
+                                        _sec_rows, right_cols={1, 2}))
     colour_block = "\n".join(colour_lines)
 
     sp500_chart_bytes = None
@@ -12855,25 +13300,29 @@ async def news_for_ticker(query, ticker):
     news_lines = []
     try:
         feed = feedparser.parse(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US")
-        for i, entry in enumerate(feed.entries[:10], 1):
-            title = html_mod.escape(entry.get("title", ""))
-            link = entry.get("link", "")
+        import time as _time
+        for entry in feed.entries[:8]:
+            title = html_mod.escape(entry.get("title", "")).strip()
+            if not title:
+                continue
+            link  = entry.get("link", "").strip()
+            pub_p = entry.get("published_parsed", None)
+            dt_str = (_time.strftime("%d%b %H:%M", pub_p).lstrip("0") if pub_p else "")
             tl = title.lower()
             if any(w in tl for w in _neg):
-                tag = "🔴"
-                color = "#ff4136"
-                bear_c += 1
+                tag = "🔴"; bear_c += 1
             elif any(w in tl for w in _pos):
-                tag = "🟢"
-                color = "#2ecc40"
-                bull_c += 1
+                tag = "🟢"; bull_c += 1
             else:
                 tag = "🟡"
-                color = "#ffb400"
+            short = title[:90] + ("…" if len(title) > 90 else "")
             if link:
-                news_lines.append(f'{tag} <a href="{link}"><b>{title}</b></a>')
+                line = f'{tag} <a href="{link}">{short}</a>'
             else:
-                news_lines.append(f"{tag} <b>{title}</b>")
+                line = f"{tag} {short}"
+            if dt_str:
+                line += f"  <i>· {dt_str}</i>"
+            news_lines.append(line)
     except Exception:
         news_lines.append("Could not fetch news")
 
@@ -12927,7 +13376,10 @@ async def market_headlines(query):
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
-                link = entry.get("link", "")
+                import time as _time
+                link  = entry.get("link", "").strip()
+                pub_p = entry.get("published_parsed", None)
+                dt_str = (_time.strftime("%d%b %H:%M", pub_p).lstrip("0") if pub_p else "")
                 tl = title.lower()
                 if any(k in tl for k in _neg_kw):
                     tag = "🔴"
@@ -12935,7 +13387,7 @@ async def market_headlines(query):
                     tag = "🟢"
                 else:
                     tag = "🟡"
-                all_items.append((tag, title, link))
+                all_items.append((tag, title, link, dt_str))
         except Exception:
             continue
         if len(all_items) >= 15:
@@ -12943,12 +13395,15 @@ async def market_headlines(query):
 
     parts = [hdr("📰 MARKET HEADLINES")]
     if all_items:
-        for tag, title, link in all_items[:12]:
-            short = html_mod.escape(title[:85] + ("…" if len(title) > 85 else ""))
+        for tag, title, link, dt_str in all_items[:12]:
+            short = html_mod.escape(title[:90] + ("…" if len(title) > 90 else ""))
             if link:
-                parts.append(f'{tag} <a href="{link}">{short}</a>')
+                line = f'{tag} <a href="{link}">{short}</a>'
             else:
-                parts.append(f"{tag} {short}")
+                line = f"{tag} {short}"
+            if dt_str:
+                line += f"  <i>· {dt_str}</i>"
+            parts.append(line)
     else:
         parts.append("Could not fetch market headlines.")
 
@@ -13899,17 +14354,14 @@ async def grp_leg_confirm(query, ctx):
     net_cost = sum(l["cost"] for l in done)
     sign = "+" if net_cost >= 0 else ""
     parts = [hdr(f"📦 {st.get('strat_name','Group')} · Legs so far")]
-    rows_txt = [f"{'Leg':<4} {'Type':<5} {'Side':<5} {'Strike':>6} {'Px':>5} {'Cost':>8}"]
-    rows_txt.append("─" * 38)
+    _leg_rows = []
     for i, l in enumerate(done):
         side_lbl = "BUY" if l["qty"] > 0 else "SELL"
-        rows_txt.append(
-            f"L{i+1:<3} {l['opt_type']:<5} {side_lbl:<5} ${l['strike']:>5.0f} "
-            f"${l['entry_price']:>4.2f} {l['cost']:>+8.0f}"
-        )
-    rows_txt.append("─" * 38)
-    rows_txt.append(f"{'Net Cost/Credit':>30} {net_cost:>+8.0f}")
-    parts.append(mono("\n".join(rows_txt)))
+        _leg_rows.append((f"L{i+1}", l["opt_type"], side_lbl,
+                          f"${l['strike']:.0f}", f"${l['entry_price']:.2f}", f"{l['cost']:+.0f}"))
+    _leg_rows.append(("", "", "", "", "Net", f"{net_cost:+.0f}"))
+    parts.append(_pipe_table(("Leg", "Type", "Side", "Strike", "Px", "Cost$"),
+                              _leg_rows, right_cols={3, 4, 5}))
 
     net_label = f"💰 Net cost: ${abs(net_cost):.0f}" if net_cost > 0 else f"💰 Net credit: ${abs(net_cost):.0f}"
     parts.append(net_label)
@@ -15158,60 +15610,59 @@ async def inst_signals_detail(query, ticker):
         sig = {}
     conn.close()
 
-    spot = sig.get("notional", {}).get("avg_spot", 0) if sig.get("notional") else 0
+    _oi_spot = sig.get("notional", {}).get("avg_spot", 0) if sig.get("notional") else 0
+    # Override with live/AH price for accurate distance calculations
+    _live_px, _spot_lbl, _spot_src = _tg_spot_label(tk)
+    spot = _live_px if _live_px > 0 else _oi_spot
+
     parts = [hdr(f"INSTITUTIONAL SIGNALS -- {tk}")]
+    parts.append(f"<b>Spot: {_spot_lbl}</b>")
+    if _oi_spot > 0 and _live_px > 0 and abs(_live_px - _oi_spot) / max(_oi_spot, 1) > 0.005:
+        parts.append(f"<i>(OI avg: ${_oi_spot:.2f} — distances recalculated to live price)</i>")
     parts.append("<i>Max Pain = strike where most options expire worthless. Gamma Walls = high-OI strikes where dealers hedge hard, acting as price magnets/barriers.</i>")
 
     # 1. Max Pain
     mp_list = sig.get("max_pain", [])
     if mp_list:
-        parts.append("\n<b>MAX PAIN  (Expiry Price Magnet)</b>")
-        rows = []
+        _mp_rows = []
         for mp in mp_list[:4]:
-            dte_s = f"DTE {mp['dte']}" if mp.get("dte") is not None else ""
-            dist = ""
-            if spot > 0:
-                d_pct = (spot - mp["strike"]) / spot * 100
-                dist = f"vs spot {d_pct:+.1f}%"
-            rows.append(f"  {mp['expiry'][:8]}  ${mp['strike']:.0f}  {dte_s}")
-            if dist:
-                rows.append(f"    {dist}")
-        parts.append(mono("\n".join(rows)))
+            dte_s = f"{mp['dte']}d" if mp.get("dte") is not None else "-"
+            dist  = f"{(spot - mp['strike']) / spot * 100:+.1f}%" if spot > 0 else "-"
+            _mp_rows.append((mp["expiry"][:8], f"${mp['strike']:.0f}", dte_s, dist))
+        parts.append("\n<b>MAX PAIN  (Expiry Price Magnet)</b>\n"
+                     + _pipe_table(("Expiry", "Strike", "DTE", "vs Spot"), _mp_rows, right_cols={1, 2, 3}))
         parts.append("<i>Fade moves away from max pain as expiry nears</i>")
 
     # 2. Gamma Walls
     walls = sig.get("gamma_walls", [])
+    # 2. Gamma Walls
+    walls = sig.get("gamma_walls", [])
     if walls:
-        parts.append("\n<b>GAMMA WALLS  (Dealer Hedging Levels)</b>")
-        rows = []
-        for w in walls[:5]:
+        def _fk_w(n):
+            return f"{n/1000:.0f}K" if n >= 1000 else str(int(n))
+        _gw_rows = []
+        for w in walls[:6]:
             label = "CEILING" if w["type"] == "CALL" else ("FLOOR" if w["type"] == "PUT" else "WALL")
-            tot_k = f"{w['total_oi']/1000:.0f}K" if w['total_oi'] >= 1000 else str(w['total_oi'])
-            c_k   = f"{w['call_oi']/1000:.0f}K"  if w['call_oi']  >= 1000 else str(w['call_oi'])
-            p_k   = f"{w['put_oi']/1000:.0f}K"   if w['put_oi']   >= 1000 else str(w['put_oi'])
-            rows.append(f"  ${w['strike']:.0f}  {label}  tot:{tot_k}")
-            rows.append(f"    C:{c_k}  P:{p_k}")
-        parts.append(mono("\n".join(rows)))
+            _gw_rows.append((f"${w['strike']:.0f}", label, _fk_w(w["total_oi"]),
+                             _fk_w(w["call_oi"]), _fk_w(w["put_oi"])))
+        parts.append("\n<b>GAMMA WALLS  (Dealer Hedging Levels)</b>\n"
+                     + _pipe_table(("Strike", "Type", "Total OI", "C-OI", "P-OI"), _gw_rows, right_cols={2, 3, 4}))
         parts.append("<i>Price gravitates toward / stalls at these strikes</i>")
 
     # 3. Smart Money Flow
     sf = sig.get("smart_flow", {})
     if sf:
-        parts.append("\n<b>SMART MONEY FLOW</b>")
         def _fk_sf(n):
             a = abs(n); s = "+" if n >= 0 else "-"
             if a >= 1_000_000: return f"{s}{a/1_000_000:.1f}M"
             if a >= 1_000: return f"{s}{a/1_000:.0f}K"
             return f"{s}{a:.0f}"
-        rows = [
-            "  CALLS  OI:{}  vol:{}".format(
-                _fk_sf(sf.get("call_oi_chg", 0)), _fk_sf(sf.get("call_vol", 0))),
-            "         {}".format(sf.get("call_verdict", "")),
-            "  PUTS   OI:{}  vol:{}".format(
-                _fk_sf(sf.get("put_oi_chg", 0)), _fk_sf(sf.get("put_vol", 0))),
-            "         {}".format(sf.get("put_verdict", "")),
+        _sf_rows = [
+            ("CALLS", _fk_sf(sf.get("call_oi_chg", 0)), _fk_sf(sf.get("call_vol", 0)), sf.get("call_verdict", "-")),
+            ("PUTS",  _fk_sf(sf.get("put_oi_chg",  0)), _fk_sf(sf.get("put_vol",  0)), sf.get("put_verdict",  "-")),
         ]
-        parts.append(mono("\n".join(rows)))
+        parts.append("\n<b>SMART MONEY FLOW</b>\n"
+                     + _pipe_table(("Side", "OI Chg", "Volume", "Verdict"), _sf_rows, right_cols={1, 2}))
         cv, pv = sf.get("call_verdict", ""), sf.get("put_verdict", "")
         if "ACCUM" in cv and "DISTRIB" in pv:
             interp = "BULLISH — calls building, puts unwinding"
@@ -15228,28 +15679,26 @@ async def inst_signals_detail(query, ticker):
     # 4. Notional Conviction
     nt = sig.get("notional", {})
     if nt:
-        parts.append("\n<b>NOTIONAL CONVICTION  (Dollar Weight)</b>")
-        rows = [
-            "  Call:  ${:.1f}M  Bull:{:,.0f}".format(nt.get("call_m", 0), nt.get("bull_score", 0)),
-            "  Put:   ${:.1f}M  Bear:{:,.0f}".format(nt.get("put_m", 0), nt.get("bear_score", 0)),
-            "  Net:   ${:+.1f}M  ratio:{:.2f}x".format(nt.get("net_m", 0), nt.get("ratio", 0)),
+        _nt_rows = [
+            ("Call",  f"${nt.get('call_m', 0):.1f}M", f"{nt.get('bull_score', 0):,.0f}"),
+            ("Put",   f"${nt.get('put_m',  0):.1f}M", f"{nt.get('bear_score', 0):,.0f}"),
+            ("Net",   f"${nt.get('net_m',  0):+.1f}M", f"{nt.get('ratio', 0):.2f}x"),
         ]
-        parts.append(mono("\n".join(rows)))
+        parts.append("\n<b>NOTIONAL CONVICTION  (Dollar Weight)</b>\n"
+                     + _pipe_table(("Side", "Notional", "Score"), _nt_rows, right_cols={1, 2}))
         parts.append(f"<i>Dollar bias: <b>{nt.get('bias', '')}</b></i>")
 
     # 5. Put Skew
     ps = sig.get("put_skew", {})
     if ps:
-        parts.append("\n<b>PUT SKEW  (Institutional Fear Gauge)</b>")
-        rows = [
-            "  Exp:  {}".format(ps.get("expiry", "")),
-            "  Call ~5%OTM: ${:.0f}  px ${:.2f}".format(
-                ps.get("call_strike", 0), ps.get("call_px", 0)),
-            "  Put  ~5%OTM: ${:.0f}  px ${:.2f}".format(
-                ps.get("put_strike", 0), ps.get("put_px", 0)),
-            "  Skew: {:.2f}x  [{}]".format(ps.get("skew", 0), ps.get("fear", "")),
+        _ps_rows = [
+            ("Call ~5%OTM", f"${ps.get('call_strike', 0):.0f}", f"${ps.get('call_px', 0):.2f}"),
+            ("Put  ~5%OTM", f"${ps.get('put_strike',  0):.0f}", f"${ps.get('put_px',  0):.2f}"),
+            ("Skew / Fear", f"{ps.get('skew', 0):.2f}x", ps.get("fear", "-")),
         ]
-        parts.append(mono("\n".join(rows)))
+        _ps_exp = ps.get("expiry", "")
+        parts.append(f"\n<b>PUT SKEW  (Fear Gauge)  exp {_ps_exp}</b>\n"
+                     + _pipe_table(("Item", "Strike", "Px / Value"), _ps_rows, right_cols={1, 2}))
         fear = ps.get("fear", "")
         if "EXTREME" in fear or "HIGH" in fear:
             hint = "Heavy put-premium demand — institutions hedging longs; often near bottoms"
@@ -15262,13 +15711,12 @@ async def inst_signals_detail(query, ticker):
     # 6. Pin Risk
     pins = sig.get("pin_risk", [])
     if pins:
-        parts.append("\n<b>PIN RISK  (DTE \u2264 7)</b>")
-        rows = []
-        for pin in pins[:4]:
+        _pin_rows = []
+        for pin in pins[:5]:
             oi_k = f"{pin['total_oi']//1000}K" if pin['total_oi'] >= 1000 else str(pin['total_oi'])
-            rows.append("  ${:.0f}  {}  DTE{}  OI:{}".format(
-                pin["strike"], pin["expiry"][:5], pin["dte"], oi_k))
-        parts.append(mono("\n".join(rows)))
+            _pin_rows.append((f"${pin['strike']:.0f}", pin["expiry"][:8], str(pin["dte"]), oi_k))
+        parts.append("\n<b>PIN RISK  (DTE \u2264 7)</b>\n"
+                     + _pipe_table(("Strike", "Expiry", "DTE", "Total OI"), _pin_rows, right_cols={2, 3}))
         parts.append("<i>High OI near expiry = gravitational price pin</i>")
 
     if not any([mp_list, walls, sf, nt, ps, pins]):
@@ -15488,62 +15936,68 @@ async def mean_rev_detail(query, ticker):
     if pz:
         any_data = True
         z   = pz["z"]
-        bar = "\u2588" * min(int(abs(z) * 2), 10)
-        parts.append("\n<b>PCR Z-SCORE  ({}d lookback)</b>".format(pz["lookback"]))
-        rows = [
-            "  Today PCR:  {:.3f}".format(pz["today"]),
-            "  {}d mean:   {:.3f}   std: {:.3f}".format(pz["lookback"], pz["mean"], pz["std"]),
-            "  Z-score:   {:+.2f}  [{}]  {}".format(z, bar, pz["level"]),
+        bar = "\u2588" * min(int(abs(z) * 2), 8)
+        _pz_rows = [
+            ("Today PCR",  f"{pz['today']:.3f}"),
+            (f"{pz['lookback']}d mean", f"{pz['mean']:.3f}"),
+            ("Std Dev",    f"{pz['std']:.3f}"),
+            ("Z-score",    f"{z:+.2f}  {bar}"),
+            ("Level",      pz["level"]),
         ]
-        parts.append(mono("\n".join(rows)))
-        parts.append("<i>{}</i>".format(pz["action"]))
+        parts.append("\n<b>PCR Z-SCORE</b>\n"
+                     + _pipe_table(("Metric", "Value"), _pz_rows, right_cols={1}))
+        parts.append(f"<i>{pz['action']}</i>")
 
     # 2. Price Z-Score
     prz = sig.get("price_z", {})
     if prz:
         any_data = True
-        parts.append("\n<b>PRICE Z-SCORE  (20d lookback)</b>")
-        rows = [
-            "  Today:    ${:.2f}".format(prz["today"]),
-            "  20d mean: ${:.2f}   std: ${:.2f}".format(prz["mean20"], prz["std20"]),
-            "  Z-score:  {:+.2f}  [{}]".format(prz["z"], prz["level"]),
-            "  Target:   ${:.2f}   Stop: ${:.2f}".format(prz["target1"], prz["stop"]),
+        _prz_rows = [
+            ("Today",   f"${prz['today']:.2f}"),
+            ("20d Mean", f"${prz['mean20']:.2f}"),
+            ("Std Dev",  f"${prz['std20']:.2f}"),
+            ("Z-score",  f"{prz['z']:+.2f}  [{prz['level']}]"),
+            ("Target",   f"${prz['target1']:.2f}"),
+            ("Stop",     f"${prz['stop']:.2f}"),
         ]
-        parts.append(mono("\n".join(rows)))
+        parts.append("\n<b>PRICE Z-SCORE  (20d)</b>\n"
+                     + _pipe_table(("Metric", "Value"), _prz_rows, right_cols={1}))
 
     # 3. PCR Trend
     pt = sig.get("pcr_trend", {})
     if pt:
         any_data = True
         last5 = " \u2192 ".join(str(x) for x in pt["last5"])
-        parts.append("\n<b>PCR TREND  (5-day rolling)</b>")
-        rows = [
-            "  5d avg: {:.3f}   Today: {:.3f}   ({:+.1f}%)".format(
-                pt["avg5"], pt["today"], pt["pct_chg"]),
-            "  Trend:  {}".format(pt["trend"]),
-            "  Last 5: {}".format(last5),
+        _pt_rows = [
+            ("5d Avg",  f"{pt['avg5']:.3f}"),
+            ("Today",   f"{pt['today']:.3f}"),
+            ("Chg%",    f"{pt['pct_chg']:+.1f}%"),
+            ("Trend",   pt["trend"]),
+            ("Last 5",  last5),
         ]
-        parts.append(mono("\n".join(rows)))
+        parts.append("\n<b>PCR TREND  (5d rolling)</b>\n"
+                     + _pipe_table(("Metric", "Value"), _pt_rows, right_cols={1}))
         if "SPIKE" in pt["trend"]:
-            parts.append("<i>Sudden spike -- may be expiry distortion or event hedge</i>")
+            parts.append("<i>Sudden spike \u2014 may be expiry distortion or event hedge</i>")
 
     # 4. Net OI Extreme
     oi = sig.get("oi_extreme", {})
     if oi:
         any_data = True
-        parts.append("\n<b>NET OI EXTREME  (20d lookback)</b>")
-        rows = [
-            "  Net OI today:  {:>+12,}".format(oi["net_oi_today"]),
-            "  20d mean:      {:>+12,}".format(oi["net_oi_mean"]),
-            "  Z-score:       {:>+12.2f}  [{}]".format(oi["z"], oi["level"]),
-            "  Call OI: {:>9,}   Put OI: {:>9,}".format(oi["call_oi"], oi["put_oi"]),
+        _oi_rows = [
+            ("Net OI Today", f"{oi['net_oi_today']:+,}"),
+            ("20d Mean",     f"{oi['net_oi_mean']:+,}"),
+            ("Z-score",      f"{oi['z']:+.2f}  [{oi['level']}]"),
+            ("Call OI",      f"{oi['call_oi']:,}"),
+            ("Put OI",       f"{oi['put_oi']:,}"),
         ]
-        parts.append(mono("\n".join(rows)))
+        parts.append("\n<b>NET OI EXTREME  (20d)</b>\n"
+                     + _pipe_table(("Metric", "Value"), _oi_rows, right_cols={1}))
         if "PEAK" in oi["level"]:
-            note = ("Too many puts -- peak bearish positioning, contrarian BUY zone"
+            note = ("Too many puts \u2014 peak bearish positioning, contrarian BUY zone"
                     if "BEARISH" in oi["level"] else
-                    "Too many calls -- peak bullish positioning, contrarian SELL zone")
-            parts.append("<i>{}</i>".format(note))
+                    "Too many calls \u2014 peak bullish positioning, contrarian SELL zone")
+            parts.append(f"<i>{note}</i>")
 
     # 5. Composite
     comp = sig.get("composite", {})
@@ -15551,13 +16005,15 @@ async def mean_rev_detail(query, ticker):
         any_data = True
         sc    = comp["score"]
         arrow = "\u25b2" if sc > 0 else "\u25bc"
-        parts.append("\n<b>COMPOSITE MEAN REVERSION SCORE</b>")
-        rows = ["  Score:  {:+.2f}  {}  [{}]".format(sc, arrow, comp["level"])]
-        if comp["factors"]:
-            rows.append("  Inputs: {}".format(",  ".join(comp["factors"])))
-        parts.append(mono("\n".join(rows)))
+        _comp_rows = [
+            ("Score",   f"{sc:+.2f}  {arrow}"),
+            ("Level",   comp["level"]),
+            ("Inputs",  ", ".join(comp["factors"]) if comp["factors"] else "-"),
+        ]
+        parts.append("\n<b>COMPOSITE SCORE</b>\n"
+                     + _pipe_table(("Metric", "Value"), _comp_rows))
         if comp["action"]:
-            parts.append("<b>Trade idea:</b>  {}".format(comp["action"]))
+            parts.append(f"<b>Trade idea:</b>  {comp['action']}")
 
     if not any_data:
         parts.append("\n<i>Not enough historical data for mean reversion analysis.</i>")
@@ -15777,6 +16233,45 @@ async def tech_signals_detail(query, ticker):
         ]
         parts.append(mono("\n".join(rows)))
         parts.append("<b>Signal: {} {}</b>".format(comp["conf"], comp["signal"]))
+
+
+    # Short Interest & Float
+    try:
+        sd = _get_short_data(tk)
+        if sd.get("squeeze_score") is not None:
+            any_data = True
+            spf  = sd["short_pct_float"]
+            sr   = sd["short_ratio"]
+            ss   = sd["shares_short"]
+            flt  = sd["float_shares"]
+            ssp  = sd["shares_short_prior"]
+            sc   = sd["squeeze_score"]
+            slbl = sd["squeeze_label"]
+            def _fmt_M(n):
+                if n is None: return "N/A"
+                if n >= 1e9: return f"{n/1e9:.2f}B"
+                if n >= 1e6: return f"{n/1e6:.1f}M"
+                return f"{n:,.0f}"
+            chg_s = ""
+            if ss and ssp:
+                chg_pct = (ss - ssp) / ssp * 100
+                chg_s = f"({chg_pct:+.1f}% vs prev)"
+            sq_em = "🔴" if sc >= 7 else ("🟡" if sc >= 4 else "🟢")
+            rows = [
+                ("Float",          _fmt_M(flt)),
+                ("Shares Short",   f"{_fmt_M(ss)} {chg_s}".strip()),
+                ("Short % Float",  f"{spf:.1f}%" if spf else "N/A"),
+                ("Days to Cover",  f"{sr:.1f}d" if sr else "N/A"),
+                ("Squeeze Score",  f"{sc}/10  {sq_em} {slbl}"),
+            ]
+            parts.append(chr(10) + "<b>SHORT INTEREST & FLOAT</b>")
+            parts.append(_pipe_table(("Metric", "Value"), rows, right_cols={1}))
+            if sc >= 7:
+                parts.append("<i>High short interest — squeeze risk if bullish catalyst hits</i>")
+            elif sc >= 4:
+                parts.append("<i>Moderate short interest — watch for covering rallies</i>")
+    except Exception:
+        pass
 
     if not any_data:
         parts.append("\n<i>Not enough price history (need 30+ days in stock_daily).</i>")
@@ -16359,36 +16854,23 @@ async def oi_menu(query, expiry=None):
         if n >= 1_000_000:     return f"{n/1_000_000:.2f}M"
         if n >= 1_000:         return f"{n/1_000:.0f}K"
         return f"{n:.0f}"
-    _oi_hdrs = ["Ticker", "Call OI", "Put OI", "PCR"]
-    _oi_data = []
-    for _, r in top_oi.iterrows():
-        _oi_data.append([
-            str(r['ticker']),
-            _fk_oi(r['total_call_oi']),
-            _fk_oi(r['total_put_oi']),
-            f"{min(float(r['pcr'] or 0), 9.99):.2f}",
-        ])
-    _oi_w = [max(len(_oi_hdrs[i]), max(len(row[i]) for row in _oi_data)) for i in range(len(_oi_hdrs))]
-    oi_rows  = [" | ".join(_oi_hdrs[i].ljust(_oi_w[i]) for i in range(len(_oi_hdrs)))]
-    oi_rows += ["-+-".join("-" * w for w in _oi_w)]
-    for row in _oi_data:
-        oi_rows.append(" | ".join(row[i].ljust(_oi_w[i]) for i in range(len(row))))
-    parts.append("\n<b>Top by Open Interest</b>\n" + mono("\n".join(oi_rows)))
+    _oi_tbl_data = [
+        (str(r["ticker"]), _fk_oi(r["total_call_oi"]), _fk_oi(r["total_put_oi"]),
+         f"{min(float(r['pcr'] or 0), 9.99):.2f}")
+        for _, r in top_oi.iterrows()
+    ]
+    parts.append("\n<b>Top by Open Interest</b>\n"
+                 + _pipe_table(("Ticker", "Call OI", "Put OI", "PCR"), _oi_tbl_data, right_cols={1, 2, 3}))
 
-    # Highest PCR — same dynamic-width approach
+    # Highest PCR
     high_pcr = df[df["pcr"] > 0].nlargest(5, "pcr")
     if not high_pcr.empty:
-        _pcr_hdrs = ["Ticker", "PCR", "Bias"]
-        _pcr_data = []
+        _pcr_tbl = []
         for _, r in high_pcr.iterrows():
             bias = "Bearish" if r["pcr"] > 1.3 else ("Bullish" if r["pcr"] < 0.7 else "Neutral")
-            _pcr_data.append([str(r['ticker']), f"{min(float(r['pcr'] or 0), 9.99):.2f}", bias])
-        _pcr_w = [max(len(_pcr_hdrs[i]), max(len(row[i]) for row in _pcr_data)) for i in range(len(_pcr_hdrs))]
-        pcr_rows  = [" | ".join(_pcr_hdrs[i].ljust(_pcr_w[i]) for i in range(len(_pcr_hdrs)))]
-        pcr_rows += ["-+-".join("-" * w for w in _pcr_w)]
-        for row in _pcr_data:
-            pcr_rows.append(" | ".join(row[i].ljust(_pcr_w[i]) for i in range(len(row))))
-        parts.append("\n<b>Highest Put/Call Ratio</b>\n" + mono("\n".join(pcr_rows)))
+            _pcr_tbl.append((str(r["ticker"]), f"{min(float(r['pcr'] or 0), 9.99):.2f}", bias))
+        parts.append("\n<b>Highest Put/Call Ratio</b>\n"
+                     + _pipe_table(("Ticker", "PCR", "Bias"), _pcr_tbl, right_cols={1}))
 
     # Build expiry selection buttons (expiry_date values)
     exp_btns = []
@@ -16760,32 +17242,26 @@ async def oi_compare_view(query, ctx, exp1, exp2):
     # Biggest call OI increases
     top_call_gain = merged.nlargest(5, "call_chg")
     if not top_call_gain.empty:
-        parts.append("\n🟢 <b>Biggest Call OI Increases</b>")
-        rows = [f"{'ST':<3} {'Ticker':<6} {'Call OI Chg':>11} {'PCR':>5}"]
-        rows.append("─" * 29)
-        for _, r in top_call_gain.iterrows():
-            rows.append(f"[B] {r['ticker']:<6} {r['call_chg']:>+11,.0f} {r['pcr_2']:>5.2f}")
-        parts.append(mono("\n".join(rows)))
+        _cg_rows = [("🟢", r["ticker"], f"{r['call_chg']:+,.0f}", f"{r['pcr_2']:.2f}")
+                    for _, r in top_call_gain.iterrows()]
+        parts.append("\n🟢 <b>Biggest Call OI Increases</b>\n"
+                     + _pipe_table(("ST", "Ticker", "Call OI Chg", "PCR"), _cg_rows, right_cols={2, 3}))
 
     # Biggest put OI increases
     top_put_gain = merged.nlargest(5, "put_chg")
     if not top_put_gain.empty:
-        parts.append("\n🔴 <b>Biggest Put OI Increases</b>")
-        rows = [f"{'ST':<3} {'Ticker':<6} {'Put OI Chg':>10} {'PCR':>5}"]
-        rows.append("─" * 28)
-        for _, r in top_put_gain.iterrows():
-            rows.append(f"[S] {r['ticker']:<6} {r['put_chg']:>+10,.0f} {r['pcr_2']:>5.2f}")
-        parts.append(mono("\n".join(rows)))
+        _pg_rows = [("🔴", r["ticker"], f"{r['put_chg']:+,.0f}", f"{r['pcr_2']:.2f}")
+                    for _, r in top_put_gain.iterrows()]
+        parts.append("\n🔴 <b>Biggest Put OI Increases</b>\n"
+                     + _pipe_table(("ST", "Ticker", "Put OI Chg", "PCR"), _pg_rows, right_cols={2, 3}))
 
     # PCR changes
     top_pcr_inc = merged.dropna(subset=["pcr_chg"]).nlargest(5, "pcr_chg")
     if not top_pcr_inc.empty:
-        parts.append("\n📈 <b>Biggest PCR Increases (More Bearish)</b>")
-        rows = [f"{'Ticker':<6} {'PCR Δ':>6} {'New PCR':>7}"]
-        rows.append("─" * 22)
-        for _, r in top_pcr_inc.iterrows():
-            rows.append(f"{r['ticker']:<6} {r['pcr_chg']:>+6.2f} {r['pcr_2']:>7.2f}")
-        parts.append(mono("\n".join(rows)))
+        _pcr_ch_rows = [(r["ticker"], f"{r['pcr_chg']:+.2f}", f"{r['pcr_2']:.2f}")
+                        for _, r in top_pcr_inc.iterrows()]
+        parts.append("\n📈 <b>Biggest PCR Increases (More Bearish)</b>\n"
+                     + _pipe_table(("Ticker", "PCR Δ", "New PCR"), _pcr_ch_rows, right_cols={1, 2}))
     
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔀 New Compare", callback_data="oi_compare_select1")],
@@ -17077,6 +17553,122 @@ async def oi_change_chart_view(query, ticker):
     )
 
 
+
+
+def _oi_multiday_conviction_text(ticker, n_days=7):
+    """Multi-day OI conviction summary — Telegram mobile format (pre blocks ≤28 chars)."""
+    conn = get_conn()
+    try:
+        dates_df = pd.read_sql(
+            "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=? "
+            "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC",
+            conn, params=[ticker.upper()])
+        all_dates = dates_df["trade_date_now"].tolist()
+    except Exception:
+        conn.close()
+        return ""
+    dates_use = all_dates[:n_days]
+    if not dates_use:
+        conn.close()
+        return ""
+    frames = []
+    for td in dates_use:
+        try:
+            df = pd.read_sql(
+                "SELECT strike, change_OI_Call, change_OI_Put "
+                "FROM options_change WHERE ticker=? AND trade_date_now=?",
+                conn, params=[ticker.upper(), td])
+            if not df.empty:
+                df["trade_date"] = td
+                frames.append(df)
+        except Exception:
+            continue
+    conn.close()
+    if not frames:
+        return ""
+    multi_df = pd.concat(frames, ignore_index=True)
+    day_agg = multi_df.groupby(["strike", "trade_date"]).agg(
+        call_chg=("change_OI_Call", "sum"),
+        put_chg=("change_OI_Put", "sum"),
+    ).reset_index()
+    day_agg["net_chg"] = day_agg["call_chg"] - day_agg["put_chg"]
+    strike_agg = day_agg.groupby("strike").agg(
+        cum_call=("call_chg", "sum"),
+        cum_put=("put_chg", "sum"),
+        cum_net=("net_chg", "sum"),
+        n_days=("trade_date", "count"),
+        bull_days=("net_chg", lambda x: (x > 0).sum()),
+        bear_days=("net_chg", lambda x: (x < 0).sum()),
+    ).reset_index()
+    date_rank = {d: i for i, d in enumerate(dates_use)}
+    streaks = []
+    for strike in strike_agg["strike"].unique():
+        sk = day_agg[day_agg["strike"] == strike].copy()
+        sk["rank"] = sk["trade_date"].map(date_rank)
+        sk = sk.sort_values("rank")
+        streak, streak_dir = 0, "FLT"
+        for _, row in sk.iterrows():
+            cur = "BUL" if row["net_chg"] > 0 else ("BEA" if row["net_chg"] < 0 else "FLT")
+            if streak == 0:
+                streak_dir = cur
+                streak = 1 if cur != "FLT" else 0
+            elif cur == streak_dir and cur != "FLT":
+                streak += 1
+            else:
+                break
+        streaks.append({"strike": strike, "streak": streak, "streak_dir": streak_dir})
+    streak_df = pd.DataFrame(streaks)
+    strike_agg = strike_agg.merge(streak_df, on="strike", how="left")
+    strike_agg["consistency"] = strike_agg.apply(
+        lambda r: r["bull_days"] / r["n_days"] if r["cum_net"] >= 0
+                  else r["bear_days"] / r["n_days"], axis=1)
+    max_cum = strike_agg["cum_net"].abs().max()
+    strike_agg["mag"] = (strike_agg["cum_net"].abs() / max_cum * 4).clip(0, 4) if max_cum > 0 else 0.0
+    strike_agg["cons_s"] = (strike_agg["consistency"] * 3).clip(0, 3)
+    strike_agg["streak_s"] = strike_agg["streak"].clip(0, 2).astype(float)
+    strike_agg["conviction"] = (strike_agg["mag"] + strike_agg["cons_s"] + strike_agg["streak_s"]).clip(0, 9).round(1)
+    strike_agg["direction"] = strike_agg["cum_net"].apply(lambda x: "BUL" if x > 0 else ("BEA" if x < 0 else "FLT"))
+    strike_agg = strike_agg.sort_values("conviction", ascending=False)
+
+    def _fk(n):
+        return f"{n/1000:.0f}K" if abs(n) >= 1000 else f"{n:.0f}"
+
+    lines_out = [f"<b>📈 {ticker} {n_days}d OI BUILD</b>", ""]
+    lines_out.append("<pre>")
+    lines_out.append("Stk  Dir Scr Str")
+    lines_out.append("─" * 17)
+    for _, r in strike_agg.head(6).iterrows():
+        sk = int(r["strike"])
+        d = str(r["direction"])
+        sc = f"{r['conviction']:.1f}"
+        st_days = f"{int(r['streak'])}d"
+        arrow = "▲" if d == "BUL" else ("▼" if d == "BEA" else "─")
+        lines_out.append(f"{sk:<5}{d} {sc:<4}{st_days}{arrow}")
+    lines_out.append("</pre>")
+    lines_out.append("")
+    hc = strike_agg[strike_agg["conviction"] >= 5.5].head(2)
+    if not hc.empty:
+        lines_out.append("🚀 <b>Trade Ideas</b>")
+        for _, r in hc.iterrows():
+            sk = int(r["strike"])
+            d = str(r["direction"])
+            stk = int(r["streak"])
+            net = _fk(r["cum_net"])
+            pct = f"{r['consistency']:.0%}"
+            icon = "🟢" if d == "BUL" else "🔴"
+            setup = f"Long  Call" if d == "BUL" else f"Long  Put"
+            reason = f"Build {stk}d · Net {'+' if r['cum_net']>0 else ''}{net} · {pct}"
+            lines_out.append(f"{icon} <b>{setup}</b>")
+            lines_out.append(f"  {reason}")
+        lines_out.append("")
+    bull_hi = len(strike_agg[(strike_agg["direction"] == "BUL") & (strike_agg["conviction"] >= 6)])
+    bear_hi = len(strike_agg[(strike_agg["direction"] == "BEA") & (strike_agg["conviction"] >= 6)])
+    bias = "🟢 BULLISH" if bull_hi > bear_hi else ("🔴 BEARISH" if bear_hi > bull_hi else "⚪ NEUTRAL")
+    lines_out.append(f"Bias: <b>{bias}</b> ({bull_hi}B/{bear_hi}Be)")
+    lines_out.append(f"<i>({len(dates_use)} trade days)</i>")
+    return "\n".join(lines_out)
+
+
 async def oi_change_chart_eod_view(query, ticker):
     """Show EOD vs EOD OI change chart (existing functionality)"""
     _loading = await query.message.reply_text(f"⏳ Generating EOD comparison chart for {ticker}...", parse_mode=H)
@@ -17124,6 +17716,13 @@ async def oi_change_chart_eod_view(query, ticker):
             caption=f"📊 <b>{ticker} OI Change Analysis (EOD)</b>\n{prev_date} → {today_date}\n\n🟦 Blue=Calls above 0 · 🟥 Red=Puts below 0\nTaller bars = more contracts. Call OI rising = bullish flow. Put OI rising = bearish/hedge flow.",
             parse_mode=H
         )
+        # Multi-day OI conviction insights
+        _md_txt = _oi_multiday_conviction_text(ticker)
+        if _md_txt:
+            try:
+                await query.message.reply_text(_md_txt, parse_mode=H)
+            except Exception:
+                pass
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔴 Try Live vs EOD", callback_data=f"oi_change_live_{ticker}")],
             [InlineKeyboardButton("📊 Other Ticker", callback_data="oi_change_menu")],
@@ -17195,6 +17794,7 @@ def _generate_live_vs_eod_chart(ticker, live_data_list, eod_date):
     conn = get_conn()
     n    = len(live_data_list)
     fig  = plt.figure(figsize=(12, 7 * n))
+    buf  = BytesIO()
 
     try:
         for idx, live_df in enumerate(live_data_list):
@@ -17406,6 +18006,13 @@ async def oi_change_chart_live_view(query, ticker):
                    f"Call OI growing = bullish flow. Put OI growing = bearish/hedge.",
             parse_mode=H
         )
+        # Multi-day OI conviction insights
+        _md_txt = _oi_multiday_conviction_text(ticker)
+        if _md_txt:
+            try:
+                await query.message.reply_text(_md_txt, parse_mode=H)
+            except Exception:
+                pass
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Refresh Live Data", callback_data=f"oi_change_live_{ticker}")],
             [InlineKeyboardButton("📊 See EOD vs EOD", callback_data=f"oi_change_eod_{ticker}")],
@@ -17828,7 +18435,8 @@ async def more_features_menu(query):
          InlineKeyboardButton("🤖 MiroFish Signals", callback_data="menu_mirofish")],
         [InlineKeyboardButton("🌙 AH Predictor", callback_data="menu_aftermarket_predict"),
          InlineKeyboardButton("⚠️ Overnight Risk", callback_data="menu_overnight_risk")],
-        [InlineKeyboardButton("🎲 Monte Carlo Sim", callback_data="menu_exit")],
+        [InlineKeyboardButton("🎯 Recommend Engine", callback_data="menu_recommend"),
+         InlineKeyboardButton("🎲 Monte Carlo Sim", callback_data="menu_exit")],
         [BACK_BTN],
     ])
     await query.message.reply_text(
@@ -17962,14 +18570,8 @@ async def market_analytics_report(query):
     if unusual_tickers:
         _oi_rows.append(["[?]", ", ".join(unusual_tickers[:3])[:7], "", "", ""])
     if _oi_rows:
-        _oi_cw  = [max(len(_oi_hdr[i]), max((len(r[i]) for r in _oi_rows), default=0)) for i in range(5)]
-        _oi_jn  = lambda i, v: v.rjust(_oi_cw[i]) if i in _oi_RGHT else v.ljust(_oi_cw[i])
-        _oi_sep = "-+-".join("-" * w for w in _oi_cw)
-        _oi_lines = [f"OI FLOW  {latest_date}",
-                     " | ".join(_oi_jn(i, _oi_hdr[i]) for i in range(5)), _oi_sep]
-        for r in _oi_rows:
-            _oi_lines.append(" | ".join(_oi_jn(i, r[i]) for i in range(5)))
-        parts.append("<pre>" + "\n".join(_oi_lines) + "</pre>")
+        parts.append(f"<b>OI FLOW  {latest_date}</b>\n"
+                     + _pipe_table(tuple(_oi_hdr), _oi_rows, right_cols=_oi_RGHT))
 
     # ── 3. Technical Signals (moondevonyt / Harvard RBI) ──────────
     try:
@@ -18005,14 +18607,8 @@ async def market_analytics_report(query):
             except Exception:
                 continue
         if _t_data:
-            _t_cw   = [max(len(_t_hdr[i]), max(len(r[i]) for r in _t_data)) for i in range(7)]
-            _t_jn   = lambda i, v: v.rjust(_t_cw[i]) if i in _t_RGHT else v.ljust(_t_cw[i])
-            _t_sep  = "-+-".join("-" * w for w in _t_cw)
-            _t_out  = ["TECH SIGNALS  RSI/MACD/BB/EMA",
-                       " | ".join(_t_jn(i, _t_hdr[i]) for i in range(7)), _t_sep]
-            for r in _t_data:
-                _t_out.append(" | ".join(_t_jn(i, r[i]) for i in range(7)))
-            parts.append("<pre>" + "\n".join(_t_out) + "</pre>")
+            parts.append("<b>TECH SIGNALS  RSI/MACD/BB/EMA</b>\n"
+                         + _pipe_table(tuple(_t_hdr), _t_data, right_cols=_t_RGHT))
     except Exception as te_ex:
         log.warning(f"market_analytics tech signals failed: {te_ex}")
 
@@ -18408,38 +19004,43 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
         "HOLD":        "Trade is on track. Keep holding and monitor.",
     }
 
-    html_cards = []
+    # ── Pipe-table layout ─────────────────────────────────────────────
+    # Row data lists for both tables
+    _tbl1_rows = []  # #|Tk|Type|Strike|DTE|Entry|Now
+    _tbl2_rows = []  # #|PnL$|P%|Win|OI|Action
+    html_cards  = []  # per-position advice cards (kept below tables)
 
-    for (em, tk, otype, strike, entry, cur_px, pnl_pct, pnl, dte_s, prob_s, oi_s, action) in rows:
-        buy_s = f"${entry:.2f}"  if entry  < 100 else f"${entry:.0f}"
-        cur_s = f"${cur_px:.2f}" if cur_px < 100 else f"${cur_px:.0f}"
+    for idx, (em, tk, otype, strike, entry, cur_px, pnl_pct, pnl, dte_s, prob_s, oi_s, action) in enumerate(rows, 1):
+        buy_s = f"{entry:.2f}"  if entry  < 100 else f"{entry:.0f}"
+        cur_s = f"{cur_px:.2f}" if cur_px < 100 else f"{cur_px:.0f}"
         pct_s = f"{pnl_pct:+.1f}%"
         pnl_s = f"${pnl:+,.0f}"
         a_em  = _action_em.get(action, "✅")
         advice = _action_advice.get(action, "Monitor position.")
 
-        # DTE urgency note
         dte_num = int(dte_s[1:]) if dte_s.startswith("D") and dte_s[1:].isdigit() else None
-        if dte_num is not None and dte_num <= 3:
-            dte_note = f" ⚠️ <b>Only {dte_num} days left!</b>"
-        elif dte_num is not None and dte_num <= 7:
-            dte_note = f" ({dte_num}d to expiry)"
-        else:
-            dte_note = f" ({dte_s} to expiry)"
+        dte_disp = f"{dte_num}d" if dte_num is not None else dte_s
+        urg_flag = "⚠" if dte_num is not None and dte_num <= 3 else ""
 
-        # OI alignment note
-        oi_note = f"  OI: <i>{oi_s}</i>" if oi_s and oi_s != "?" else ""
+        oi_disp = oi_s if oi_s and oi_s != "?" else "-"
+        act_disp = f"{a_em}{action[:8]}"
 
-        side_word = "Sold" if entry < 0 else "Bought"
+        _tbl1_rows.append((str(idx), tk[:5], otype[:1], f"{int(strike)}", f"{dte_disp}{urg_flag}", buy_s, cur_s))
+        _tbl2_rows.append((str(idx), pnl_s, pct_s, prob_s[:6], oi_disp[:8], act_disp[:12]))
 
+        # Advice card — kept for context below tables
         html_cards.append(
-            f"{em} <b>{tk} {otype} ${int(strike)}</b>{dte_note}\n"
-            f"   Entered {buy_s}  →  Now {cur_s}  |  <b>{pct_s} ({pnl_s})</b>\n"
-            f"   Win probability: {prob_s}{oi_note}\n"
-            f"   {a_em} <b>{action}</b> — {advice}"
+            f"{em} <b>{tk} {otype} ${int(strike)}</b>"
+            f"  {a_em} <b>{action}</b> — {advice}"
         )
 
-    colour_section = "\n\n".join(html_cards)
+    t1_hdr = ("#", "Ticker", "T", "Strike", "DTE", "Entry", "Now")
+    t2_hdr = ("#", "PnL$", "P%", "Win", "OI", "Action")
+    table1 = _pipe_table(t1_hdr, _tbl1_rows) if _tbl1_rows else ""
+    table2 = _pipe_table(t2_hdr, _tbl2_rows) if _tbl2_rows else ""
+
+    advice_section = "\n".join(html_cards)
+    colour_section = f"{table1}\n{table2}\n\n{advice_section}"
 
     urgent_section = ""
     if urgent_lines:
@@ -18519,14 +19120,7 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             _frows.append(["[?]", name, "ERR", "---"])
     if _frows:
-        _fw = [max(len(_fhdr[i]), max(len(r[i]) for r in _frows)) for i in range(len(_fhdr))]
-        _RIGHT_F = {2, 3}
-        _fj = lambda i, v: v.rjust(_fw[i]) if i in _RIGHT_F else v.ljust(_fw[i])
-        _fsep = "-+-".join("-" * w for w in _fw)
-        _flines = [" | ".join(_fj(i, _fhdr[i]) for i in range(len(_fhdr))), _fsep]
-        for r in _frows:
-            _flines.append(" | ".join(_fj(i, r[i]) for i in range(len(_fhdr))))
-        parts.append("<b>FUTURES</b>\n<pre>" + "\n".join(_flines) + "</pre>")
+        parts.append("<b>FUTURES</b>\n" + _pipe_table(tuple(_fhdr), _frows, right_cols={2, 3}))
 
     # ── Volume Spike / Whale Alert (moondevonyt WhaleAgent concept) ─
     try:
@@ -18560,10 +19154,16 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 continue
         if spike_lines:
-            vol_rows = [f"{'Tkr':<6} {'Vol':>5}   {'Chg%':>5}  Note"]
-            vol_rows.append("─" * 28)
-            vol_rows.extend(spike_lines)
-            parts.append("\n<b>VOLUME SPIKES (moondev WhaleAgent)</b>\n" + mono("\n".join(vol_rows)))
+            # Parse spike_lines back into table rows
+            _vs_rows = []
+            for sl in spike_lines:
+                # format: f"{sym:<6} {vol_ratio:>4.1f}x  {chg:>+5.1f}%  {tag}"
+                parts_sl = sl.split()
+                if len(parts_sl) >= 4:
+                    _vs_rows.append((parts_sl[0], parts_sl[1], parts_sl[2], parts_sl[3]))
+            if _vs_rows:
+                parts.append("\n<b>VOLUME SPIKES</b>\n"
+                             + _pipe_table(("Ticker", "Vol Ratio", "Chg%", "Signal"), _vs_rows, right_cols={1, 2}))
     except Exception as ve:
         log.warning(f"intraday volume spike check failed: {ve}")
 
@@ -18647,6 +19247,14 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
 
                             if not top_df.empty:
                                 strike_lines = []
+                                # Pre-build lookup for paired trade detection
+                                _all_strikes = {}
+                                for _, _pr in top_df.iterrows():
+                                    _sk = float(_pr["strike"] or 0)
+                                    _all_strikes[_sk] = {
+                                        "c": float(_pr["change_OI_Call"] or 0),
+                                        "p": float(_pr["change_OI_Put"] or 0),
+                                    }
                                 for _, sr in top_df.iterrows():
                                     s_strike = float(sr["strike"] or 0)
                                     c2 = float(sr["change_OI_Call"] or 0)
@@ -18682,43 +19290,109 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
                                     standing_oi = c_oi_now if opt_type_s == "CALL" else p_oi_now
                                     unusual = standing_oi > 0 and abs(dominant_chg) / standing_oi > 0.15
 
-                                    # Direction interpretation
-                                    if dominant_chg > 0:
-                                        # OI added — new positions opened
-                                        if opt_type_s == "CALL":
-                                            if zone.startswith("OTM"):
-                                                direction_txt = "Traders opened new bullish bets — buying upside calls"
-                                                action_hint = "Bullish speculation or a hedge against a short position"
-                                            elif zone == "ATM":
-                                                direction_txt = "Significant ATM call buying — directional bullish trade"
-                                                action_hint = "High conviction bullish play or market maker delta hedge"
-                                            else:
-                                                direction_txt = "ITM call buying — very high delta, strong bullish conviction"
-                                                action_hint = "Could be stock replacement strategy or covered call unwinding"
-                                        else:
-                                            if zone.startswith("OTM"):
-                                                direction_txt = "New put contracts opened — bearish bets or downside protection"
-                                                action_hint = "Fund hedging their long stock or outright bearish speculation"
-                                            elif zone == "ATM":
-                                                direction_txt = "ATM put buying — traders protecting against near-term drop"
-                                                action_hint = "Defensive hedge; watch for follow-through selling in stock"
-                                            else:
-                                                direction_txt = "Deep ITM puts added — likely closing a covered put or rolling"
-                                                action_hint = "Institutional roll or complex strategy, not simple bearish bet"
-                                    else:
-                                        # OI dropped — positions closed or expired
-                                        if opt_type_s == "CALL":
-                                            direction_txt = "Call positions being closed — bulls taking profits or cutting losses"
-                                            action_hint = "Profit-taking if stock rallied; surrender if it dropped"
-                                        else:
-                                            direction_txt = "Put positions closed — bearish bets or hedges removed"
-                                            action_hint = "Risk being lifted; could signal near-term bottom or hedge expiry"
-
+                                    # Both-side flow analysis
                                     unusual_tag = " ⚠️ <b>UNUSUAL SIZE</b>" if unusual else ""
+                                    THRESH = 300
+                                    call_added   = c2 > THRESH
+                                    put_added    = p2 > THRESH
+                                    call_removed = c2 < -THRESH
+                                    put_removed  = p2 < -THRESH
+                                    c_pfx = "+" if c2 > 0 else ""
+                                    p_pfx = "+" if p2 > 0 else ""
+                                    c2_disp = (f"{c_pfx}{_fk2(c2)}") if abs(c2) >= 100 else "—"
+                                    p2_disp = (f"{p_pfx}{_fk2(p2)}") if abs(p2) >= 100 else "—"
+                                    c_not = abs(c2) * s_strike * 100
+                                    p_not = abs(p2) * s_strike * 100
+                                    c_not_s = (f"${c_not/1e6:.1f}M" if c_not >= 1e6 else f"${c_not/1e3:.0f}K") if abs(c2) >= 100 else "—"
+                                    p_not_s = (f"${p_not/1e6:.1f}M" if p_not >= 1e6 else f"${p_not/1e3:.0f}K") if abs(p2) >= 100 else "—"
+
+                                    # Pattern + hedge classification
+                                    if call_added and put_added:
+                                        _bal = min(abs(c2), abs(p2)) / max(abs(c2), abs(p2))
+                                        if _bal > 0.6:
+                                            pattern_tag = "📊 STRADDLE"; hedge_pct = 65
+                                            pattern_txt = "Equal call+put added — big move expected, direction unknown"
+                                        elif abs(c2) > abs(p2):
+                                            pattern_tag = "📈 BULL+HEDGE"; hedge_pct = 40
+                                            pattern_txt = "Call-heavy with puts — bullish with tail protection"
+                                        else:
+                                            pattern_tag = "📉 BEAR+HEDGE"; hedge_pct = 60
+                                            pattern_txt = "Put-heavy — hedged long stock or bearish play"
+                                    elif call_added and put_removed:
+                                        pattern_tag = "🔁 RISK REV ↑"; hedge_pct = 15
+                                        pattern_txt = "Calls bought + puts closed — converting hedge to bull bet"
+                                    elif put_added and call_removed:
+                                        pattern_tag = "🔁 RISK REV ↓"; hedge_pct = 55
+                                        pattern_txt = "Puts bought + calls closed — turning defensive/bearish"
+                                    elif call_removed and put_removed:
+                                        pattern_tag = "🚪 UNWINDING"; hedge_pct = 50
+                                        pattern_txt = "Both sides closing — full position unwind or expiry roll"
+                                    elif call_added:
+                                        if zone.startswith("OTM"):
+                                            pattern_tag = "🚀 BULL SPEC"; hedge_pct = 10
+                                            pattern_txt = "OTM call accumulation — speculative upside bet"
+                                        elif zone == "ATM":
+                                            pattern_tag = "🎯 ATM BULL"; hedge_pct = 20
+                                            pattern_txt = "ATM calls added — directional, likely institutional"
+                                        else:
+                                            pattern_tag = "💪 ITM BULL"; hedge_pct = 25
+                                            pattern_txt = "ITM calls — high delta, near stock-replacement"
+                                    elif put_added:
+                                        if zone.startswith("OTM"):
+                                            pattern_tag = "🛡️ HEDGE"; hedge_pct = 80
+                                            pattern_txt = "OTM puts — classic downside protection on long stock"
+                                        elif zone == "ATM":
+                                            pattern_tag = "🔴 ATM BEAR"; hedge_pct = 60
+                                            pattern_txt = "ATM puts — defensive hedge or bearish directional"
+                                        else:
+                                            pattern_tag = "⚙️ COMPLEX"; hedge_pct = 70
+                                            pattern_txt = "Deep ITM puts — roll or institutional structure"
+                                    elif call_removed:
+                                        pattern_tag = "🏃 BULL EXIT"; hedge_pct = 30
+                                        pattern_txt = "Bulls exiting — profit-taking or rolling to new strike"
+                                    elif put_removed:
+                                        pattern_tag = "✅ HEDGE OFF"; hedge_pct = 20
+                                        pattern_txt = "Put hedges lifted — risk appetite improving, bull signal"
+                                    else:
+                                        pattern_tag = "💤 NOISE"; hedge_pct = 50
+                                        pattern_txt = "Minor OI movement — settlement or small roll"
+
+                                    hedge_lbl = ("🛡️ Hedge" if hedge_pct >= 65 else
+                                                 "🔀 Mixed" if hedge_pct >= 35 else
+                                                 "⚡ Spec")
+
+                                    # Notional plain-English explanation
+                                    notional_exp = f"{_fk2(abs(dominant_chg))}×${s_strike:.0f}×100={notional_s}"
+
+                                    # Paired strike detection (spread / strangle)
+                                    spread_note = ""
+                                    for _os, _od in _all_strikes.items():
+                                        if abs(_os - s_strike) < 1:
+                                            continue
+                                        _pct_away = abs(_os - s_strike) / max(s_strike, 1) * 100
+                                        if _pct_away > 10:
+                                            continue
+                                        _oc = _od["c"]; _op = _od["p"]
+                                        if call_added and _oc < -THRESH and _os > s_strike:
+                                            spread_note = f"sells ${_os:.0f}C → BULL CALL SPREAD"
+                                            break
+                                        if call_added and _oc < -THRESH and _os < s_strike:
+                                            spread_note = f"sells ${_os:.0f}C → BACKSPREAD"
+                                            break
+                                        if put_added and _op < -THRESH and _os < s_strike:
+                                            spread_note = f"sells ${_os:.0f}P → BEAR PUT SPREAD"
+                                            break
+                                        if call_added and _op > THRESH:
+                                            spread_note = f"+ ${_os:.0f}P → STRANGLE (move play)"
+                                            break
+                                        if put_added and _oc > THRESH:
+                                            spread_note = f"+ ${_os:.0f}C → STRANGLE (move play)"
+                                            break
+                                    spread_line = f"\n   🔗 <i>Pair: {spread_note}</i>" if spread_note else ""
+
                                     pos_tag = ""
                                     if my_pos:
-                                        my_qty = my_pos["qty"]
-                                        my_ot  = my_pos["otype"].upper()
+                                        my_ot = my_pos["otype"].upper()
                                         if opt_type_s == my_ot:
                                             if dominant_chg > 0:
                                                 pos_tag = "\n   💡 <i>Same direction as your position — supportive flow</i>"
@@ -18726,10 +19400,12 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
                                                 pos_tag = "\n   ⚠️ <i>Flow reducing OI in your strike — watch for exit pressure</i>"
 
                                     strike_lines.append(
-                                        f"\n🔹 <b>${s_strike:.0f} {opt_type_s}</b> [{zone}]{my_flag}{unusual_tag}\n"
-                                        f"   Change: <b>{_fk2(dominant_chg)} contracts</b>  |  Notional ≈ <b>{notional_s}</b>\n"
-                                        f"   {direction_txt}.\n"
-                                        f"   → <i>{action_hint}</i>{pos_tag}"
+                                        f"\n🔹 <b>${s_strike:.0f}</b> [{zone}]{my_flag}{unusual_tag}\n"
+                                        f"   {pattern_tag}  {hedge_lbl}\n"
+                                        f"<pre>Calls: {c2_disp:>7}  {c_not_s}\n"
+                                        f"Puts:  {p2_disp:>7}  {p_not_s}</pre>"
+                                        f"   💰 Notional: {notional_exp}\n"
+                                        f"   <i>{pattern_txt}</i>{spread_line}{pos_tag}"
                                     )
 
                                 if strike_lines:
@@ -18738,12 +19414,20 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
                         pass
 
                 if _oi_data:
-                    _oi_lines = ["<b>YOUR POSITIONS — NEXT EXPIRY OI</b>"]
+                    _oi_t_hdr = ("ST", "Ticker", "Exp", "C-OI", "P-OI", "Bias")
+                    _oi_t_rows = []
                     for _od in _oi_data:
                         _st_badge, _tk2, _exp2, _c2s, _p2s = _od
+                        _bias_s = "BULL" if _st_badge == "[B]" else ("BEAR" if _st_badge == "[S]" else "FLAT")
                         _em2 = "🟢" if _st_badge == "[B]" else ("🔴" if _st_badge == "[S]" else "🟡")
-                        _oi_lines.append(f"{_em2} <b>{_tk2}</b>  {_exp2}  C:{_c2s}  P:{_p2s}")
-                    parts.append("\n" + "\n".join(_oi_lines))
+                        _oi_t_rows.append((_em2, _tk2, _exp2, _c2s, _p2s, _bias_s))
+                    _oi_all = [_oi_t_hdr] + _oi_t_rows
+                    _oi_ws = [max(len(str(r[c])) for r in _oi_all) for c in range(len(_oi_t_hdr))]
+                    _oi_sep = "+" + "+".join("-" * (w + 2) for w in _oi_ws) + "+"
+                    def _oi_fmt(r):
+                        return "|" + "|".join(f" {str(r[c]):<{_oi_ws[c]}} " for c in range(len(_oi_ws))) + "|"
+                    _oi_table_lines = [_oi_sep, _oi_fmt(_oi_t_hdr), _oi_sep] + [_oi_fmt(r) for r in _oi_t_rows] + [_oi_sep]
+                    parts.append("\n<b>YOUR POSITIONS — NEXT EXPIRY OI</b>\n<pre>" + "\n".join(_oi_table_lines) + "</pre>")
 
                 if key_moves:
                     parts.append("\n<b>⚡ OI ACTIVITY — WHAT IS THE MARKET DOING?</b>")
@@ -18824,20 +19508,64 @@ async def global_market_view(query):
             recommendations.append("🟡 Neutral macro → Iron condors, butterflies")
         
         rec_text = "\n".join([f"• {r}" for r in recommendations[:6]])
-        
+
+        # Macro cascade section
+        _md_ch  = market_data.get("changes", {})
+        _oil_c  = _md_ch.get("CL=F",    0) or 0
+        _gld_c  = _md_ch.get("GC=F",    0) or 0
+        _tnx_c  = _md_ch.get("^TNX",    0) or 0
+        _btc_c  = _md_ch.get("BTC-USD", 0) or 0
+        _vix_v  = market_data.get("prices", {}).get("^VIX", 20.0) or 20.0
+        cascade_lines = []
+        if abs(_oil_c) > 0.8:
+            cascade_lines.append(
+                f"Oil{'up' if _oil_c>0 else 'dn'} {_oil_c:+.1f}%  "
+                f"{'-> DAL/UAL down  XLE/XOM up' if _oil_c>0 else '-> DAL/UAL up  XLE down'}")
+        if abs(_gld_c) > 0.5:
+            cascade_lines.append(
+                f"Gold{'up' if _gld_c>0 else 'dn'} {_gld_c:+.1f}% "
+                f"{'-> GDX/NEM up  DXY down  EEM up' if _gld_c>0 else '-> DXY up  GDX down'}")
+        if abs(_tnx_c) > 0.3:
+            cascade_lines.append(
+                f"10Y {'up' if _tnx_c>0 else 'dn'} {_tnx_c:+.1f}% "
+                f"{'-> Banks up  REITs/Tech down' if _tnx_c>0 else '-> Growth/REITs up  Banks down'}")
+        if abs(_btc_c) > 3.0:
+            cascade_lines.append(
+                f"BTC {'up' if _btc_c>0 else 'dn'} {_btc_c:+.1f}% "
+                f"{'-> Risk-ON: MSTR/COIN up' if _btc_c>0 else '-> Risk-OFF: reduce spec'}")
+        if _vix_v > 25:
+            cascade_lines.append(f"VIX {_vix_v:.1f} ELEVATED -> sell premium, hedge longs")
+        elif _vix_v < 15:
+            cascade_lines.append(f"VIX {_vix_v:.1f} LOW -> condors / covered calls attractive")
+        cascade_text = ""
+        if cascade_lines:
+            cascade_text = (f"\n\n{hdr('MACRO CASCADE MAP')}\n"
+                            + "\n".join(cascade_lines))
+        rel_text = (
+            f"\n\n{hdr('KEY STOCK RELATIONS')}\n"
+            "NVDA up -> SMCI/ANET/AMD (AI infra spend)\n"
+            "AAPL up -> TSM/QCOM/AVGO (supply chain)\n"
+            "GOOGL up -> META/TTD/MGNI (ad-tech floor)\n"
+            "Oil up -> DAL/UAL down  XLE/CVX up\n"
+            "Gold up -> GDX up  DXY down -> EEM up\n"
+            "Rates up -> Banks up  REITs/Tech down"
+        )
         full_message = (
             f"{summary}\n\n"
-            f"{hdr('💡 OPTIONS STRATEGY IMPLICATIONS')}\n"
+            f"{hdr('OPTIONS STRATEGY IMPLICATIONS')}\n"
             f"{rec_text}"
+            f"{cascade_text}"
+            f"{rel_text}"
         )
-        
+
         await _loading.delete()
-        
+
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh", callback_data="menu_global_market")],
-            [InlineKeyboardButton("🧩 More Features", callback_data="menu_more"), BACK_BTN]
+            [InlineKeyboardButton("🔄 Refresh",        callback_data="menu_global_market"),
+             InlineKeyboardButton("🎯 Recommend",      callback_data="menu_recommend")],
+            [InlineKeyboardButton("🧩 More Features",  callback_data="menu_more"), BACK_BTN],
         ])
-        
+
         await query.message.reply_text(full_message, parse_mode=H, reply_markup=kb)
         
     except Exception as e:
@@ -19111,6 +19839,361 @@ async def quick_quote(query, ticker):
                                        reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
         try: await _loading.delete()
         except Exception: pass
+
+# ═══════════════════════════════════════════════════════════
+#  RECOMMENDATION ENGINE — Technical + OI + Fundamental + Short Interest
+# ═══════════════════════════════════════════════════════════
+
+# Downstream cascade relationships (static knowledge map)
+_DOWNSTREAM_MAP = {
+    "NVDA":  {"up": ["TSM","ASML","AMAT"],       "down": ["SMCI","ANET","AMD","MSFT","AMZN"],
+              "theme": "AI capex multiplier — GPU demand drives cloud build-out"},
+    "AAPL":  {"up": ["TSM","QCOM","AVGO","SWKS"], "down": ["APP","SPOT","SNAP"],
+              "theme": "iPhone cycle ripples through supply chain & app ecosystem"},
+    "GOOGL": {"up": [],                           "down": ["META","TTD","MGNI","DV"],
+              "theme": "Digital ad pricing sets revenue ceiling for all ad-tech"},
+    "AMZN":  {"up": ["UPS","FDX"],               "down": ["SHOP","WMT"],
+              "theme": "AWS growth re-rates cloud; retail margin pressure on peers"},
+    "TSLA":  {"up": ["LAC","ALB"],               "down": ["CHPT","EVGO","NIO","RIVN"],
+              "theme": "EV adoption catalyst for supply chain & charging infra"},
+    "JPM":   {"up": [],                           "down": ["KRE","AIG","MET","BX"],
+              "theme": "Banking bellwether — credit conditions signal macro health"},
+    "MSFT":  {"up": ["QCOM","INTC"],             "down": ["PANW","CRWD","NOW"],
+              "theme": "Azure growth drives cloud security & dev-tools spend"},
+    "META":  {"up": [],                           "down": ["SNAP","PINS","TTD"],
+              "theme": "Social ad ROI benchmark — smaller platforms follow"},
+}
+
+
+def _score_ticker_full(ticker: str, conn, vix_val: float = 20.0) -> dict:
+    """Score ticker 0-100: tech(30) + OI(30) + fundamental(20) + short_interest(20) − VIX."""
+    tk = str(ticker).upper()
+    try:
+        h = yf.Ticker(tk).history(period="60d")
+        if len(h) < 20:
+            return {}
+        closes = h["Close"]
+        px = float(closes.iloc[-1])
+
+        # ── RSI(14) ──────────────────────────────────────────
+        delta = closes.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rs    = gain / loss.replace(0, 1e-9)
+        rsi   = float(100 - 100 / (1 + rs.iloc[-1]))
+
+        # ── MACD(12,26,9) ────────────────────────────────────
+        ema12      = closes.ewm(span=12).mean()
+        ema26      = closes.ewm(span=26).mean()
+        macd_line  = ema12 - ema26
+        macd_sig   = macd_line.ewm(span=9).mean()
+        macd_bull  = bool(macd_line.iloc[-1] > macd_sig.iloc[-1])
+        macd_cross = bool(macd_line.iloc[-1] > macd_sig.iloc[-1] and
+                         macd_line.iloc[-2] <= macd_sig.iloc[-2])
+
+        # ── Bollinger Bands (20,2) ────────────────────────────
+        sma20  = closes.rolling(20).mean()
+        std20  = closes.rolling(20).std()
+        bb_up  = float(sma20.iloc[-1] + 2 * std20.iloc[-1])
+        bb_lo  = float(sma20.iloc[-1] - 2 * std20.iloc[-1])
+        bb_pct = (px - bb_lo) / (bb_up - bb_lo) if bb_up != bb_lo else 0.5
+        bb_bot = bb_pct < 0.2
+        bb_top = bb_pct > 0.8
+
+        # ── SMA200 ────────────────────────────────────────────
+        sma200   = float(closes.rolling(200, min_periods=50).mean().iloc[-1]) if len(closes) >= 50 else px
+        above200 = px > sma200
+
+        # ── Technical score (0-30) ────────────────────────────
+        tech = 0
+        if rsi < 30:    tech += 10
+        elif rsi < 40:  tech += 7
+        elif rsi < 50:  tech += 4
+        elif rsi > 70:  tech -= 8
+        elif rsi > 60:  tech -= 4
+
+        if macd_cross:  tech += 10
+        elif macd_bull: tech += 5
+        else:           tech -= 3
+
+        if bb_bot:      tech += 10
+        elif bb_top:    tech -= 8
+
+        if above200:    tech += 5
+        else:           tech -= 5
+        tech = max(0, min(30, tech))
+
+        # ── OI / Mean Reversion score (0-30) ─────────────────
+        oi_score = 15
+        pcr_z = 0.0
+        oi_bull = False
+        oi_bear = False
+        try:
+            mr      = analyze_mean_reversion(tk, conn)
+            pcr_z   = float(mr.get("PCR_z",    0) or 0)
+            comp    = float(mr.get("Composite", 0) or 0)
+            if pcr_z > 2:    oi_score += 8
+            elif pcr_z > 1:  oi_score += 4
+            elif pcr_z < -2: oi_score -= 7
+            elif pcr_z < -1: oi_score -= 3
+            if comp > 3:     oi_score += 10;  oi_bull = True
+            elif comp > 1:   oi_score += 5
+            elif comp < -3:  oi_score -= 8;   oi_bear = True
+            elif comp < -1:  oi_score -= 4
+            oi_score = max(0, min(30, oi_score))
+        except Exception:
+            pass
+
+        # ── Fundamental score (0-20) ──────────────────────────
+        fund = 10
+        try:
+            info = yf.Ticker(tk).info
+            sector_pe_map = {
+                "Technology": 30, "Healthcare": 25, "Financials": 15,
+                "Energy": 12, "Industrials": 20, "Consumer Discretionary": 25,
+                "Communication Services": 22, "Consumer Staples": 22,
+                "Utilities": 18, "Real Estate": 20,
+            }
+            s_pe   = sector_pe_map.get(info.get("sector", ""), 22)
+            fwd_pe = info.get("forwardPE") or 0
+            peg    = info.get("pegRatio")
+            eg     = info.get("earningsGrowth")
+            if fwd_pe > 0:
+                if fwd_pe < s_pe * 0.7:    fund += 10
+                elif fwd_pe < s_pe:        fund += 5
+                elif fwd_pe > s_pe * 1.5:  fund -= 5
+            if peg is not None:
+                if peg < 1:    fund += 8
+                elif peg < 2:  fund += 4
+                elif peg > 3:  fund -= 4
+            if eg is not None:
+                if eg > 0.20:   fund += 8
+                elif eg > 0.10: fund += 4
+                elif eg < 0:    fund -= 4
+            fund = max(0, min(20, fund))
+        except Exception:
+            pass
+
+        # ── Short interest score (0-20) ───────────────────────
+        si_sc      = 5
+        short_pct  = 0.0
+        squeeze_sc = 0
+        dtc        = 0.0
+        try:
+            sd         = _get_short_data(tk)
+            short_pct  = float(sd.get("short_pct_float") or 0)
+            squeeze_sc = int(sd.get("squeeze_score") or 0)
+            dtc        = float(sd.get("short_ratio") or 0)
+            if short_pct >= 20 and macd_bull and rsi < 55:
+                si_sc = 18  # classic squeeze setup
+            elif short_pct >= 10 and macd_bull:
+                si_sc = 12
+            elif short_pct < 3:
+                si_sc = 8   # clean float — no overhang
+            else:
+                si_sc = 5
+        except Exception:
+            pass
+
+        # ── VIX environment adjustment ────────────────────────
+        vix_adj = (5 if vix_val < 15 else
+                   -10 if vix_val > 30 else
+                   -5  if vix_val > 25 else 0)
+
+        total = int(max(0, min(100, tech + oi_score + fund + si_sc + vix_adj)))
+
+        # ── Insight headline ──────────────────────────────────
+        ins = []
+        if macd_cross and rsi < 45:
+            ins.append(f"MACD bull cross + RSI {rsi:.0f} — momentum reversal signal")
+        elif rsi < 30 and bb_bot:
+            ins.append(f"RSI {rsi:.0f} oversold at BB lower band — high-prob bounce zone")
+        elif rsi < 35:
+            ins.append(f"RSI {rsi:.0f} oversold — watch for bounce catalyst")
+        if squeeze_sc >= 7:
+            ins.append(f"HIGH squeeze risk ({short_pct:.0f}% SI) — catalyst = explosive move")
+        elif squeeze_sc >= 5:
+            ins.append(f"Moderate squeeze ({short_pct:.0f}% SI) — watch momentum shift")
+        if pcr_z > 2:
+            ins.append(f"PCR Z-score {pcr_z:.1f} — put-heavy OI = oversold positioning")
+        if above200 and macd_cross:
+            ins.append("Above 200d + MACD cross — institutional momentum continuation")
+        insight = ins[0] if ins else f"Tech:{tech} OI:{oi_score} Fund:{fund} SI:{si_sc}"
+
+        return {
+            "ticker":        tk,
+            "total":         total,
+            "tech_score":    tech,
+            "oi_score":      oi_score,
+            "fund_score":    fund,
+            "si_score":      si_sc,
+            "rsi":           rsi,
+            "macd_bull":     macd_bull,
+            "macd_cross":    macd_cross,
+            "bb_bot":        bb_bot,
+            "bb_top":        bb_top,
+            "above200":      above200,
+            "pcr_z":         pcr_z,
+            "oi_bull":       oi_bull,
+            "oi_bear":       oi_bear,
+            "short_pct":     short_pct,
+            "squeeze_score": squeeze_sc,
+            "dtc":           dtc,
+            "insight":       insight,
+        }
+    except Exception as e:
+        log.debug(f"_score_ticker_full {tk}: {e}")
+        return {}
+
+
+async def recommend_engine(query):
+    """🎯 Recommendation engine: technical + OI + fundamental + short interest + macro cascade."""
+    _loading = await query.message.reply_text(
+        "🎯 Scoring universe — please wait (~30s)…", parse_mode=H)
+    conn = get_conn()
+    tickers = _ticker_universe()
+
+    # ── Macro context ─────────────────────────────────────────
+    vix_val    = 20.0
+    macro_chg  = {}
+    try:
+        vix_h = yf.Ticker("^VIX").history(period="3d")
+        if len(vix_h):
+            vix_val = float(vix_h["Close"].iloc[-1])
+    except Exception:
+        pass
+    for sym, key in [("CL=F", "oil"), ("GC=F", "gold"), ("^TNX", "tnx"), ("BTC-USD", "btc")]:
+        try:
+            h = yf.Ticker(sym).history(period="5d")
+            if len(h) >= 2:
+                macro_chg[key] = ((float(h["Close"].iloc[-1]) - float(h["Close"].iloc[-2]))
+                                  / float(h["Close"].iloc[-2]) * 100)
+        except Exception:
+            pass
+
+    # ── Score each ticker ────────────────────────────────────
+    scored = []
+    for tk in tickers[:18]:
+        try:
+            s = _score_ticker_full(tk, conn, vix_val)
+            if s:
+                scored.append(s)
+        except Exception:
+            pass
+    conn.close()
+    scored.sort(key=lambda x: x["total"], reverse=True)
+
+    vix_em = "🔴" if vix_val > 25 else ("🟡" if vix_val > 18 else "🟢")
+    regime  = ("Risk-OFF — hedge first" if vix_val > 25
+               else ("Caution zone" if vix_val > 18 else "Risk-ON"))
+
+    parts = [
+        hdr("🎯 RECOMMENDATION ENGINE"),
+        f"{vix_em} VIX <b>{vix_val:.1f}</b>  {regime}",
+    ]
+
+    # ── Scored universe summary table ────────────────────────
+    if scored:
+        tbl = []
+        for s in scored[:10]:
+            sig = "BUY"   if s["total"] >= 65 else ("WATCH" if s["total"] >= 45 else "AVOID")
+            em  = "🟢"    if s["total"] >= 65 else ("🟡"    if s["total"] >= 45 else "🔴")
+            tbl.append((f"{em}{s['ticker']}", str(s["total"]), sig))
+        parts.append("\n<b>UNIVERSE SCORES</b>")
+        parts.append(_pipe_table(("Ticker", "Score", "Signal"), tbl))
+
+    # ── Top 3 detailed picks ─────────────────────────────────
+    parts.append("\n<b>TOP PICKS (Detailed)</b>")
+    for s in scored[:3]:
+        em  = "🟢" if s["total"] >= 65 else "🟡"
+        lbl = "STRONG BUY" if s["total"] >= 65 else "WATCH"
+        rsi_v  = s.get("rsi", 0)
+        macd_s = "↑" if s.get("macd_bull") else "↓"
+        bb_s   = "BOT" if s.get("bb_bot") else ("TOP" if s.get("bb_top") else "MID")
+        ema_s  = "↑" if s.get("above200") else "↓"
+        spf    = s.get("short_pct", 0)
+        sc     = s.get("squeeze_score", 0)
+        sq_em  = "🔴" if sc >= 7 else ("🟡" if sc >= 4 else "🟢")
+        oi_s   = "↑Bull" if s.get("oi_bull") else ("↓Bear" if s.get("oi_bear") else "Neut")
+        parts.append(
+            f"\n{em} <b>{s['ticker']}</b>  {s['total']}/100  [{lbl}]\n"
+            f"  Tech:  RSI:{rsi_v:.0f} MACD:{macd_s} BB:{bb_s} EMA200:{ema_s}\n"
+            f"  OI:    PCR_z:{s.get('pcr_z', 0):.1f}  {oi_s}\n"
+            f"  Short: SI:{spf:.1f}%  Sq:{sc}/10{sq_em}\n"
+            f"  💡 {s.get('insight', '—')}"
+        )
+
+    # ── Quick opportunities: squeeze + oversold ──────────────
+    quick = [s for s in scored if s.get("squeeze_score", 0) >= 6 and s.get("rsi", 50) < 58]
+    quick += [s for s in scored if s.get("rsi", 50) < 32 and s not in quick]
+    if quick:
+        parts.append("\n<b>⚡ QUICK OPPORTUNITIES (24h)</b>")
+        for s in quick[:4]:
+            reasons = []
+            if s.get("squeeze_score", 0) >= 6:
+                reasons.append(f"Sq:{s['squeeze_score']}/10🔴 SI:{s.get('short_pct', 0):.0f}%")
+            if s.get("rsi", 50) < 32:
+                reasons.append(f"RSI:{s.get('rsi', 0):.0f} oversold")
+            if s.get("macd_cross"):
+                reasons.append("MACD cross")
+            if reasons:
+                parts.append(f"⚡ <b>{s['ticker']}</b>: {' | '.join(reasons)}")
+
+    # ── Macro cascade ────────────────────────────────────────
+    mc = ["\n<b>🌐 MACRO CASCADE</b>"]
+    oil = macro_chg.get("oil", 0)
+    gld = macro_chg.get("gold", 0)
+    tnx = macro_chg.get("tnx", 0)
+    btc = macro_chg.get("btc", 0)
+    if abs(oil) > 1.0:
+        mc.append(f"Oil{'↑' if oil>0 else '↓'}{oil:+.1f}% → "
+                  f"{'▼DAL/UAL  ▲XLE/XOM' if oil > 0 else '▲DAL/UAL  ▼XLE'}")
+    if abs(gld) > 0.5:
+        mc.append(f"Gold{'↑' if gld>0 else '↓'}{gld:+.1f}% → "
+                  f"{'▲GDX/NEM  ▼DXY→▲EEM' if gld > 0 else '▲DXY  ▼GDX/NEM'}")
+    if abs(tnx) > 0.3:
+        mc.append(f"10Y{'↑' if tnx>0 else '↓'}{tnx:+.1f}% → "
+                  f"{'▲Banks  ▼REITs/Tech' if tnx > 0 else '▲Growth/REITs  ▼Banks'}")
+    if abs(btc) > 3.0:
+        mc.append(f"BTC{'↑' if btc>0 else '↓'}{btc:+.1f}% → "
+                  f"{'Risk-ON: ▲MSTR/COIN/RIOT' if btc > 0 else 'Risk-OFF: ▼spec positions'}")
+    if vix_val > 25:
+        mc.append(f"VIX {vix_val:.1f} ELEVATED → sell premium, hedge longs")
+    elif vix_val < 15:
+        mc.append(f"VIX {vix_val:.1f} LOW → condors / covered calls attractive")
+    if len(mc) > 1:
+        parts.append("\n".join(mc))
+
+    # ── Stock relation map (tracked tickers in downstream map) ─
+    rel_lines = ["\n<b>📡 STOCK RELATIONS</b>"]
+    for tk_map, v in _DOWNSTREAM_MAP.items():
+        tracked_down = [d for d in v.get("down", []) if d in tickers]
+        if tk_map in tickers or tracked_down:
+            dn_str = " / ".join(v.get("down", [])[:3])
+            rel_lines.append(
+                f"<b>{tk_map}</b> → {dn_str}\n"
+                f"  <i>{v['theme'][:60]}</i>"
+            )
+    if len(rel_lines) > 1:
+        parts.append("\n".join(rel_lines[:6]))
+
+    parts.append(
+        f"\n<i>Scored {len(scored)} tickers | VIX {vix_val:.1f} | "
+        f"{datetime.now().strftime('%H:%M')} ET</i>"
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh",       callback_data="menu_recommend"),
+         InlineKeyboardButton("🌍 Global Market", callback_data="menu_global_market")],
+        [InlineKeyboardButton("📡 Market",        callback_data="menu_analytics"),
+         InlineKeyboardButton("📊 OI Signals",    callback_data="menu_signals")],
+        [BACK_BTN],
+    ])
+    try:
+        await _loading.delete()
+    except Exception:
+        pass
+    await query.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=kb)
 
 # ═══════════════════════════════════════════════════════════
 #  CALLBACK ROUTER
@@ -19732,6 +20815,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await overnight_risk_report(query)
         elif data == "menu_aftermarket_predict":
             await aftermarket_predict(query)
+        elif data == "menu_recommend":
+            await recommend_engine(query)
         elif data == "menu_ai_chat":
             await ai_chat_menu(query)
         elif data == "noop":
@@ -20420,8 +21505,22 @@ async def aftermarket_predict(query):
         ])
         pnl_em = "🟢" if pnl_entry >= 0 else "🔴"
         tmrw_em = "🟢" if pnl_tmrw >= 0 else "🔴"
+        # Short interest context
+        _si_ctx = ""
+        try:
+            _sd2 = _get_short_data(tk)
+            _parts2 = []
+            if _sd2.get("short_pct_float"): _parts2.append(f"SI:{_sd2['short_pct_float']:.1f}%")
+            if _sd2.get("short_ratio"):     _parts2.append(f"DTC:{_sd2['short_ratio']:.1f}d")
+            if _sd2.get("squeeze_score") is not None:
+                _sc2 = _sd2["squeeze_score"]
+                _sq2 = "🔴" if _sc2 >= 7 else ("🟡" if _sc2 >= 4 else "🟢")
+                _parts2.append(f"Sq:{_sc2}/10{_sq2}")
+            if _parts2: _si_ctx = "\n   " + " | ".join(_parts2)
+        except Exception:
+            pass
         decisions.append(
-            f"{pnl_em} <b>{tk}</b> {ot[:3]} ${strk:.0f} [{side_s}, {dte}d]\n"
+            f"{pnl_em} <b>{tk}</b> {ot[:3]} ${strk:.0f} [{side_s}, {dte}d]{_si_ctx}\n"
             f"   AH: <b>${spot_ext:.2f}</b> {ext_tag} | <i>{ah_src}</i>\n"
             f"   Option now <b>${val_now:.2f}</b>  vs entry <b>${entry:.2f}</b>  → P&amp;L vs entry: <b>${pnl_vs_entry_dol:+,.0f} ({pnl_entry:+.0f}%)</b>\n"
             f"   {tmrw_em} Tomorrow: <b>${val_tmrw:.2f}</b> ({pnl_tmrw:+.0f}% from now) | <b>{rec}</b>"
