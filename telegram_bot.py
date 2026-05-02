@@ -4971,7 +4971,8 @@ def analyze_mean_reversion(ticker, conn):
     # Net OI = call_oi - put_oi. Extreme negative = peak bearish positioning = floor likely
     try:
         an = pd.read_sql("""
-            SELECT trade_date, net_oi, call_oi, put_oi
+            SELECT trade_date, net_notional_oi as net_oi,
+                   call_notional_oi as call_oi, put_notional_oi as put_oi
             FROM us_analytics_daily WHERE ticker = ?
             ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
             LIMIT 30
@@ -11153,15 +11154,16 @@ def _build_exit_verdict(ticker: str, legs_data: list, total_pnl: float, total_va
             act = "HOLD — part of spread, don't close in isolation"
         elif l["pnl"] >= abs(total_var95) * 0.5 and l["pnl"] > 0:
             act = "CONSIDER TAKING PROFIT"
-            action_needed.append(f"{l['ot'].upper()} K${l['strike']:.0f}")
+            action_needed.append(f"{l['ot'].upper()} ${l['strike']:.0f}")
         elif l["pnl"] < 0 and abs(l["pnl"]) > abs(l.get("var95", 0)) * 0.6:
             act = "REVIEW — approaching max loss level"
-            action_needed.append(f"{l['ot'].upper()} K${l['strike']:.0f}")
+            action_needed.append(f"{l['ot'].upper()} ${l['strike']:.0f}")
         else:
             act = "HOLD"
 
+        _leg_em = ("📈" if l['ot']=='call' else "🛡️") if l['qty']>0 else ("⚡" if l['ot']=='call' else "💰")
         leg_lines.append(
-            f"{pnl_em} {side} {l['ot'].upper()} K${l['strike']:.0f}{dte_s}  "
+            f"{pnl_em} {_leg_em} {side} {l['ot'].upper()} ${l['strike']:.0f}{dte_s}  "
             f"P&amp;L <b>${l['pnl']:+,.0f}</b>\n"
             f"   Role: <i>{role}</i>\n"
             f"   → {act}"
@@ -11325,7 +11327,8 @@ async def exit_batch_ticker(query, ticker):
     n_long  = sum(1 for l in legs_data if l['qty'] > 0)
     n_short = sum(1 for l in legs_data if l['qty'] < 0)
     leg_lines = [
-        f"{'🟢' if l['pnl']>=0 else '🔴'} {l['ot'].upper():<4} K${l['strike']:.0f}"
+        f"{'🟢' if l['pnl']>=0 else '🔴'} {('+' if l['qty']>0 else '-') + ('C' if l['ot']=='call' else 'P')}"
+        f" ${l['strike']:.0f}"
         f" {l['pnl']:>+8,.0f}  VaR:{l['var95']:>+7,.0f}"
         for l in legs_data
     ]
@@ -15145,43 +15148,107 @@ async def mirofish_ticker_detail(query, ticker):
         parts.append(mono("\n".join(rows)))
 
         # Aggregate direction -- hedge-aware via intent algo
-        total_call_chg = oc["change_OI_Call"].sum()
-        total_put_chg  = oc["change_OI_Put"].sum()
+        total_call_chg = float(oc["change_OI_Call"].sum())
+        total_put_chg  = float(oc["change_OI_Put"].sum())
+        # Aggregate by strike (cancel calendar rolls before signal)
+        _oc_agg = oc.groupby("strike", as_index=False).agg(
+            {"change_OI_Call": "sum", "change_OI_Put": "sum",
+             "openInt_Call_now": "sum", "openInt_Put_now": "sum"}).copy()
+        _oc_agg = _oc_agg.rename(columns={"change_OI_Call": "call_oi_change",
+                                           "change_OI_Put":  "put_oi_change"})
         r1 = float(oc["R1"].dropna().iloc[0]) if not oc["R1"].dropna().empty else 0
         s1 = float(oc["S1"].dropna().iloc[0]) if not oc["S1"].dropna().empty else 0
         close = float(sd["close"].iloc[0] or 0) if not sd.empty else 0
+        pcr_sd = float(sd["pcr_oi"].iloc[0] or 1.0) if not sd.empty else 1.0
 
-        if close > 0 and "strike" in oc.columns and len(oc) >= 2:
-            _oc2 = oc.rename(columns={"change_OI_Call": "call_oi_change",
-                                       "change_OI_Put":  "put_oi_change"})
-            _, _sig, _sc, _desc, _dets = _oi_intent_algo(_oc2, close)
+        if close > 0 and len(_oc_agg) >= 2:
+            _, _sig, _sc, _desc, _dets = _oi_intent_algo(_oc_agg, close)
             h_pct = _dets.get("hedge_pct", 0)
             _sig_em = {"BULLISH": "📈", "MILD BULL": "📈", "BEARISH": "📉", "MILD BEAR": "📉",
                        "HEDGED BULL": "🛡", "STRADDLE": "⚡", "HEDGE": "🛡", "UNWIND": "🔄"}.get(_sig, "⚪")
-            bias = f"{_sig_em} <b>{_sig}</b>  <i>hedge {h_pct:.0f}%</i>"
-            _rec_map = {
-                "BULLISH":     f"📈 Call buy near ${s1:.0f}" if s1 > 0 else "📈 Consider calls",
-                "MILD BULL":   "📈 Mild call bias -- wait for confirmation",
-                "BEARISH":     f"📉 Put buy near ${r1:.0f}" if r1 > 0 else "📉 Consider puts",
-                "MILD BEAR":   "📉 Mild put bias -- watch for acceleration",
-                "HEDGED BULL": "Institutions hedging longs -- OI bullish ex-hedge",
-                "STRADDLE":    "Vol play -- straddle if event upcoming",
-                "HEDGE":       "Deep OTM put build = protective, not directional",
-                "UNWIND":      "Positions closing -- wait for fresh signal",
-            }
-            rec = _rec_map.get(_sig, "Monitor for clearer direction")
+            # Reconcile: if position PCR says BULL but flow says BEAR, note the divergence
+            _pos_bias = "BULL" if pcr_sd < 0.8 else ("BEAR" if pcr_sd > 1.3 else "NEUTRAL")
+            _flow_bear = "BEAR" in _sig
+            _flow_bull = "BULL" in _sig
+            if _flow_bear and _pos_bias == "BULL":
+                _sig_display = f"{_sig_em} <b>{_sig}</b> (flow)  |  🟢 BULL position (PCR {pcr_sd:.2f})"
+                rec = "Calendar rolls masking bullish position — existing OI is bullish, today's flow includes roll activity."
+            elif _flow_bull and _pos_bias == "BEAR":
+                _sig_display = f"{_sig_em} <b>{_sig}</b> (flow)  |  🔴 BEAR position (PCR {pcr_sd:.2f})"
+                rec = "Bullish flow but overall position is bearish — potential reversal setup or fresh buying into weakness."
+            else:
+                _sig_display = f"{_sig_em} <b>{_sig}</b>  <i>hedge {h_pct:.0f}%</i>"
+                _rec_map = {
+                    "BULLISH":     f"📈 Call buy near ${s1:.0f}" if s1 > 0 else "📈 Consider calls",
+                    "MILD BULL":   "📈 Mild call bias — wait for confirmation",
+                    "BEARISH":     f"📉 Put buy near ${r1:.0f}" if r1 > 0 else "📉 Consider puts",
+                    "MILD BEAR":   "📉 Mild put bias — watch for acceleration",
+                    "HEDGED BULL": "Institutions hedging longs — OI bullish ex-hedge",
+                    "STRADDLE":    "Vol play — straddle if event upcoming",
+                    "HEDGE":       "Deep OTM put build = protective, not directional",
+                    "UNWIND":      "Positions closing — wait for fresh signal",
+                }
+                rec = _rec_map.get(_sig, "Monitor for clearer direction")
         else:
             _sig_l, _ = _oi_signal_light(total_call_chg, total_put_chg)
             _sig_em = "📈" if "BULL" in _sig_l else ("📉" if "BEAR" in _sig_l else "⚪")
-            bias = f"{_sig_em} <b>{_sig_l}</b>"
+            _sig_display = f"{_sig_em} <b>{_sig_l}</b>"
             rec = ("📈 Consider calls" if _sig_l == "BULLISH" else
                    "📉 Consider puts"  if _sig_l == "BEARISH" else
                    "Monitor for breakout")
 
         if r1 > 0 and s1 > 0:
             parts.append(f"🎯 R1 <b>${r1:.1f}</b>  ·  S1 <b>${s1:.1f}</b>")
-        parts.append(f"📌 Bias: {bias}")
+        parts.append(f"📌 Bias: {_sig_display}")
         parts.append(f"💡 <i>{rec}</i>")
+
+        # OI Walls
+        try:
+            _conn_kl = get_conn()
+            _kl = _oi_key_levels(tk, _conn_kl)
+            _conn_kl.close()
+            if _kl:
+                _cw = _kl.get("call_wall", 0); _pw = _kl.get("put_wall", 0)
+                _mp = _kl.get("max_pain", 0);  _gw = _kl.get("gamma_walls", [])
+                _gw_s = " / ".join(f"${g:.0f}" for g in _gw[:3]) if _gw else "—"
+                parts.append(
+                    f"\n<b>\U0001f9f1 OI Walls</b> ({_kl.get('expiry','')[:8]})\n"
+                    + mono(
+                        f"{'Call Wall':<10} ${_cw:.0f}\n"
+                        f"{'Put Wall':<10} ${_pw:.0f}\n"
+                        f"{'Max Pain':<10} ${_mp:.0f}\n"
+                        f"{'Gamma':<10} {_gw_s}"
+                    )
+                )
+        except Exception: pass
+
+        # Volume / delivery analysis
+        try:
+            _vm = _classify_stock_move(tk, total_call_chg, total_put_chg)
+            if _vm:
+                _vs = _vm["signal"]; _vc = _vm["confidence"]; _vr = _vm["vol_ratio"]
+                _vpc = _vm["price_chg"]; _vl = _vm["vol_label"]
+                _sig_icons = {"REAL_BUY":"\U0001f7e2","DELTA_HEDGE":"\U0001f535","SHORT_COVER":"\U0001f7e1",
+                              "SPEC_CALL":"\u26a1","REAL_SELL":"\U0001f534","EVENT_STRADDLE":"\u26a1","MIXED":"\u26aa"}
+                _vi = _sig_icons.get(_vs, "\u26aa")
+                parts.append(
+                    f"\n<b>\U0001f4ca Volume Analysis</b>\n"
+                    f"{_vi} <b>{_vs.replace('_',' ')}</b>  [{_vc}]\n"
+                    + mono(
+                        f"{'Vol Ratio':<10} {_vr:.2f}x ({_vl})\n"
+                        f"{'Price Chg':<10} {_vpc:+.2f}%"
+                    )
+                    + f"\n<i>{_vm['explanation'][:120]}</i>"
+                )
+        except Exception: pass
+
+
+
+
+
+
+
+
 
     try:
         await _loading.delete()
@@ -15849,7 +15916,8 @@ def analyze_mean_reversion(ticker, conn):
     # Net OI = call_oi - put_oi. Extreme negative = peak bearish positioning = floor likely
     try:
         an = pd.read_sql("""
-            SELECT trade_date, net_oi, call_oi, put_oi
+            SELECT trade_date, net_notional_oi as net_oi,
+                   call_notional_oi as call_oi, put_notional_oi as put_oi
             FROM us_analytics_daily WHERE ticker = ?
             ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
             LIMIT 30
@@ -16977,8 +17045,9 @@ async def oi_detail(query, ticker):
         + f"\n\nBias: <b>{bias}</b>"
     )
 
-    # ── Per-expiry breakdown ──────────────────────────────────────
+    # -- Per-expiry breakdown -- This Week / Next Week / Later
     try:
+        _ec = get_conn()
         exp_df = pd.read_sql("""
             SELECT expiry_date,
                    SUM(openInt_Call) as c_oi, SUM(openInt_Put) as p_oi
@@ -16986,24 +17055,45 @@ async def oi_detail(query, ticker):
             WHERE ticker = ? AND trade_date = ?
             GROUP BY expiry_date
             ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
-        """, get_conn(), params=(str(ticker).upper(), str(dt)))
+        """, _ec, params=(str(ticker).upper(), str(dt)))
+        _ec.close()
         if not exp_df.empty:
-            rows = [f"{'Expiry':<8} {'Call':>6} {'Put':>6} {'PCR':>5}"]
-            rows.append("─" * 28)
             def _fkoi(n):
                 n = float(n or 0)
                 if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
                 if n >= 1_000: return f"{n/1_000:.0f}K"
                 return f"{n:.0f}"
+            _today = datetime.now().date()
+            _dtf = (4 - _today.weekday()) % 7
+            _this_fri = _today + timedelta(days=_dtf)
+            _next_fri = _this_fri + timedelta(days=7)
+            _bk_tw = chr(0x26a1) + " THIS WEEK"
+            _bk_nw = chr(0x1f4c5) + " NEXT WEEK"
+            _bk_lt = chr(0x1f52d) + " LATER"
+            _buckets = {_bk_tw: [], _bk_nw: [], _bk_lt: []}
             for _, er in exp_df.iterrows():
-                c = float(er.get('c_oi') or 0)
-                p = float(er.get('p_oi') or 0)
-                ep = p / c if c > 0 else 0
-                rows.append(f"{str(er['expiry_date'])[:8]:<8} {_fkoi(c):>6} {_fkoi(p):>6} {ep:>5.2f}")
-            msg += f"\n\n<b>By Expiry:</b>\n{mono(chr(10).join(rows))}"
+                try:
+                    _edt = datetime.strptime(str(er["expiry_date"]), "%m-%d-%Y").date()
+                    if _edt <= _this_fri:   _buckets[_bk_tw].append(er)
+                    elif _edt <= _next_fri: _buckets[_bk_nw].append(er)
+                    else:                   _buckets[_bk_lt].append(er)
+                except Exception:
+                    _buckets[_bk_lt].append(er)
+            exp_parts = ["\n\n<b>By Expiry:</b>"]
+            for _lbl, _rows in _buckets.items():
+                if not _rows: continue
+                tbl_lines = ["{:<8} {:>6} {:>6} {:>5}".format("Expiry","Call","Put","PCR")]
+                tbl_lines.append("-" * 28)
+                for er in _rows:
+                    c = float(er.get("c_oi") or 0)
+                    p = float(er.get("p_oi") or 0)
+                    ep = p / c if c > 0 else 0
+                    tbl_lines.append("{:<8} {:>6} {:>6} {:>5.2f}".format(
+                        str(er["expiry_date"])[:8], _fkoi(c), _fkoi(p), ep))
+                exp_parts.append(f"\n<b>{_lbl}</b>\n{mono(chr(10).join(tbl_lines))}")
+            msg += "".join(exp_parts)
     except Exception as ex:
         log.warning(f"oi_detail expiry breakdown failed: {ex}")
-
     # ── IV, volatility & strategy suggestions ────────────────────
     try:
         tk_obj = yf.Ticker(str(ticker).upper())
@@ -17131,6 +17221,70 @@ async def oi_detail(query, ticker):
         conn3.close()
     except Exception as _ex3:
         log.warning(f"oi_detail strike breakdown failed: {_ex3}")
+
+
+    # -- OI Key Levels (walls + max pain) -----------------------------------------
+    try:
+        _conn_w = get_conn()
+        _kl2 = _oi_key_levels(str(ticker).upper(), _conn_w)
+        _conn_w.close()
+        if _kl2:
+            _cw2 = _kl2.get("call_wall", 0); _pw2 = _kl2.get("put_wall", 0)
+            _mp2 = _kl2.get("max_pain", 0);  _gw2 = _kl2.get("gamma_walls", [])
+            _gw2_s = " / ".join(f"${g:.0f}" for g in _gw2[:4]) if _gw2 else '—'
+            msg += (
+                f"\n\n<b>\U0001f9f1 OI Walls  ({_kl2.get('expiry','')[:8]})</b>\n"
+                + mono(
+                    f"{'Call Wall':<10} ${_cw2:.0f}\n"
+                    f"{'Put Wall':<10} ${_pw2:.0f}\n"
+                    f"{'Max Pain':<10} ${_mp2:.0f}\n"
+                    f"{'Gamma Wls':<10} {_gw2_s}"
+                )
+            )
+    except Exception as _ex_w:
+        log.warning(f"oi_detail walls failed: {_ex_w}")
+
+    # -- Calendar spread detection ------------------------------------------------
+    try:
+        _conn_cal = get_conn()
+        _cal_rolls = [r for r in analyze_oi_rolls(str(ticker).upper(), _conn_cal)
+                      if r["type"] == "CALENDAR_ROLL"]
+        _conn_cal.close()
+        if _cal_rolls:
+            cal_lines = ["\n<b>\U0001f5d3 Calendar Spreads Detected:</b>"]
+            for cr in _cal_rolls[:3]:
+                expl = ("Near-expiry closed, far-expiry opened - extending duration. Same directional bet, more time.")
+                cal_lines.append(
+                    f"\U0001f4c6 {cr['option']} <b>${cr['strike']:.0f}</b>  "
+                    f"{str(cr['near_expiry'])[:8]} \u2192 {str(cr['far_expiry'])[:8]}  ~{cr['qty']:,}c\n"
+                    f"   <i>{expl}</i>"
+                )
+            msg += "\n".join(cal_lines)
+    except Exception as _ex_cal:
+        log.warning(f"oi_detail calendar failed: {_ex_cal}")
+
+    # -- Volume / delivery analysis -----------------------------------------------
+    try:
+        _oc_agg_v = pd.read_sql("""
+            SELECT SUM(change_OI_Call) as cc, SUM(change_OI_Put) as pp
+            FROM options_change WHERE ticker=? AND trade_date_now=(
+              SELECT trade_date_now FROM options_change WHERE ticker=?
+              ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1)
+        """, get_conn(), params=(str(ticker).upper(), str(ticker).upper()))
+        if not _oc_agg_v.empty:
+            _vm2 = _classify_stock_move(str(ticker).upper(),
+                                        float(_oc_agg_v["cc"].iloc[0] or 0),
+                                        float(_oc_agg_v["pp"].iloc[0] or 0))
+            if _vm2 and _vm2.get("signal") != "NEUTRAL":
+                _vi2 = {"REAL_BUY":"\U0001f7e2","DELTA_HEDGE":"\U0001f535","SHORT_COVER":"\U0001f7e1",
+                         "SPEC_CALL":"\u26a1","REAL_SELL":"\U0001f534","EVENT_STRADDLE":"\u26a1","MIXED":"\u26aa"}.get(_vm2["signal"],"\u26aa")
+                msg += (
+                    f"\n\n<b>\U0001f4ca Volume Context</b>\n"
+                    f"{_vi2} <b>{_vm2['signal'].replace('_',' ')}</b>  [{_vm2['confidence']}]\n"
+                    + mono(f"Vol {_vm2['vol_ratio']:.2f}x avg ({_vm2['vol_label']})  Price {_vm2['price_chg']:+.2f}%")
+                    + f"\n<i>{_vm2['explanation'][:100]}</i>"
+                )
+    except Exception: pass
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 OI Change Chart", callback_data=f"oi_change_{ticker}"),
@@ -18337,16 +18491,184 @@ async def signal_scanner(query):
         parts.append("📊 <b>STRIKE-LEVEL OI ANALYSIS</b>")
         parts.extend(_strike_parts)
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data="menu_signals"),
-         InlineKeyboardButton("🤖 MiroFish", callback_data="menu_mirofish")],
-        [BACK_BTN]
-    ])
+    # Build per-ticker selection buttons
+    _scan_tickers = []
+    _seen_tk = set()
+    for _df_src in [bulls.head(5), bears.head(5), hedges.head(3)]:
+        for _t in _df_src["ticker"].tolist():
+            _ts = str(_t).upper()
+            if _ts not in _seen_tk:
+                _seen_tk.add(_ts); _scan_tickers.append(_ts)
+    _tk_btns = [InlineKeyboardButton(t, callback_data=f"sigtk_{t}") for t in _scan_tickers[:12]]
+    _tk_rows = [_tk_btns[i:i+3] for i in range(0, len(_tk_btns), 3)]
+    parts.append("\n\n<b>👇 Tap a ticker for deep analysis:</b>")
+    kb = InlineKeyboardMarkup(
+        _tk_rows
+        + [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_signals"),
+            InlineKeyboardButton("🤖 MiroFish", callback_data="menu_mirofish")]]
+        + [[BACK_BTN]]
+    )
     await query.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=kb)
     try: await _loading.delete()
     except Exception: pass
 
 # ═══════════════════════════════════════════════════════════
+
+async def signal_ticker_detail(query, ticker):
+    """Per-ticker OI signal detail with this-week/next-week expiry split, OI walls, volume analysis."""
+    tk = str(ticker).upper()
+    _loading = await query.message.reply_text(f"⏳ Loading {tk} signals...", parse_mode=H)
+    conn = get_conn()
+    try:
+        lr = pd.read_sql("""SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
+            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            LIMIT 1""", conn, params=(tk,))
+        if lr.empty:
+            await query.message.reply_text(f"No OI data for {tk}.", reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
+            conn.close(); return
+        latest_date = lr["trade_date_now"].iloc[0]
+        agg = pd.read_sql("""SELECT SUM(change_OI_Call) as cc, SUM(change_OI_Put) as pp,
+               SUM(openInt_Call_now) as co, SUM(openInt_Put_now) as po
+            FROM options_change WHERE ticker=? AND trade_date_now=?""", conn, params=(tk, latest_date))
+        call_chg = float(agg["cc"].iloc[0] or 0) if not agg.empty else 0
+        put_chg  = float(agg["pp"].iloc[0] or 0) if not agg.empty else 0
+        call_oi  = float(agg["co"].iloc[0] or 0) if not agg.empty else 0
+        put_oi   = float(agg["po"].iloc[0] or 0) if not agg.empty else 0
+        pcr = put_oi / call_oi if call_oi > 0 else 1.0
+    except Exception as _e:
+        log.warning(f"signal_ticker_detail {tk}: {_e}")
+        conn.close(); return
+
+    sig_lbl, sig_txt = _oi_signal_light(call_chg, put_chg, pcr)
+    sig_em = "🟢" if "BULL" in sig_lbl else ("🔴" if "BEAR" in sig_lbl else ("🔵" if "HEDGE" in sig_lbl else "🟡"))
+
+    def _fk(n):
+        n = float(n or 0); s = "+" if n >= 0 else ""
+        a = abs(n)
+        if a >= 1_000_000: return f"{s}{a/1_000_000:.1f}M"
+        if a >= 1_000:     return f"{s}{a/1_000:.0f}K"
+        return f"{s}{n:.0f}"
+
+    parts = [
+        hdr(f"📊 {tk} · {latest_date}"),
+        f"{sig_em} <b>{sig_lbl}</b>\n<i>{sig_txt}</i>",
+        mono(
+            f"{'Call dOI':<10} {_fk(call_chg):>8}\n"
+            f"{'Put  dOI':<10} {_fk(put_chg):>8}\n"
+            f"{'PCR':<10} {pcr:>8.2f}"
+        )
+    ]
+
+    # OI walls
+    try:
+        _kl = _oi_key_levels(tk, conn, latest_date)
+        if _kl:
+            _cws = _kl.get("call_wall",0); _pws = _kl.get("put_wall",0); _mps = _kl.get("max_pain",0)
+            _gws = " / ".join(f"${g:.0f}" for g in _kl.get("gamma_walls",[])[:3]) or "—"
+            parts.append(
+                f"\n<b>🧱 OI Walls ({_kl.get('expiry','')[:8]})</b>\n"
+                + mono(f"{'CWall':<8}${_cws:.0f}  {'PWall':<7}${_pws:.0f}\n"
+                      f"{'MaxPain':<8}${_mps:.0f}  Γ:{_gws}")
+            )
+    except Exception: pass
+
+    # Per-expiry: This Week / Next Week / Later
+    try:
+        exp_df = pd.read_sql("""
+            SELECT expiry_date,
+                   SUM(change_OI_Call) as cc, SUM(change_OI_Put) as pp,
+                   SUM(openInt_Call_now) as co, SUM(openInt_Put_now) as po
+            FROM options_change WHERE ticker=? AND trade_date_now=?
+            GROUP BY expiry_date
+            ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
+        """, conn, params=(tk, latest_date))
+        if not exp_df.empty:
+            _today = datetime.now().date()
+            _dtf = (4 - _today.weekday()) % 7
+            _this_fri = _today + timedelta(days=_dtf)
+            _next_fri = _this_fri + timedelta(days=7)
+            _bk_tw = chr(0x26a1) + " THIS WEEK"
+            _bk_nw = chr(0x1f4c5) + " NEXT WEEK"
+            _bk_lt = chr(0x1f52d) + " LATER"
+            _bk = {_bk_tw: [], _bk_nw: [], _bk_lt: []}
+            for _, er in exp_df.iterrows():
+                try:
+                    _edt = datetime.strptime(str(er["expiry_date"]), "%m-%d-%Y").date()
+                    if _edt <= _this_fri:   _bk[_bk_tw].append(er)
+                    elif _edt <= _next_fri: _bk[_bk_nw].append(er)
+                    else:                   _bk[_bk_lt].append(er)
+                except Exception:
+                    _bk[_bk_lt].append(er)
+            exp_parts = ["\n<b>Expiry Breakdown:</b>"]
+            for _lbl, _rows in _bk.items():
+                if not _rows: continue
+                tbl_lines = ["{:<8} {:>6} {:>6} {:>4}".format("Expiry","CdOI","PdOI","PCR")]
+                tbl_lines.append("-" * 27)
+                for er in _rows:
+                    cc2 = float(er["cc"] or 0); pp2 = float(er["pp"] or 0)
+                    ep2 = float(er["po"] or 0) / max(float(er["co"] or 0), 1)
+                    tbl_lines.append("{:<8} {:>6} {:>6} {:>4.1f}".format(
+                        str(er["expiry_date"])[:8], _fk(cc2), _fk(pp2), min(ep2,9.9)))
+                exp_parts.append(f"\n<b>{_lbl}</b>\n{mono(chr(10).join(tbl_lines))}")
+            parts.append("\n".join(exp_parts))
+    except Exception as _ex_e:
+        log.warning(f"signal_ticker_detail expiry {tk}: {_ex_e}")
+
+    # Calendar spreads
+    try:
+        _cal = [r for r in analyze_oi_rolls(tk, conn) if r["type"] == "CALENDAR_ROLL"]
+        if _cal:
+            cal_lines = ["\n<b>🗓 Calendar Spreads:</b>"]
+            for cr in _cal[:3]:
+                cal_lines.append(
+                    f"📆 {cr['option']} <b>${cr['strike']:.0f}</b>  "
+                    f"{str(cr['near_expiry'])[:8]}→{str(cr['far_expiry'])[:8]}  ~{cr['qty']:,}c\n"
+                    f"   <i>Duration extended — same direction, more time.</i>"
+                )
+            parts.append("\n".join(cal_lines))
+    except Exception: pass
+
+    # Spot + strike breakdown
+    spot = 0.0
+    try:
+        _sd = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
+            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1""",
+            conn, params=(tk,))
+        if not _sd.empty: spot = float(_sd["close"].iloc[0])
+    except Exception: pass
+
+    bd = _oi_strike_breakdown(tk, conn, spot, latest_date)
+    if bd: parts.append(f"\n<b>🔍 Strike Activity:</b>\n{bd}")
+
+    trend = _oi_trend_summary(tk, conn, latest_date)
+    if trend: parts.append(f"\n<b>📅 OI Trend (1W/1M):</b>\n{trend}")
+
+    # Volume analysis
+    try:
+        _vm = _classify_stock_move(tk, call_chg, put_chg)
+        if _vm and _vm.get("signal") not in ("NEUTRAL", "MIXED"):
+            _vi = {"REAL_BUY":"🟢","DELTA_HEDGE":"🔵","SHORT_COVER":"🟡",
+                    "SPEC_CALL":"⚡","REAL_SELL":"🔴","EVENT_STRADDLE":"⚡"}.get(_vm["signal"],"⚪")
+            parts.append(
+                f"\n<b>📊 Move Classification</b>\n"
+                f"{_vi} <b>{_vm['signal'].replace('_',' ')}</b>  [{_vm['confidence']}]\n"
+                + mono(f"Vol {_vm['vol_ratio']:.2f}x  Price {_vm['price_chg']:+.2f}%")
+                + f"\n<i>{_vm['explanation'][:100]}</i>"
+            )
+    except Exception: pass
+
+    conn.close()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 OI Rolls",     callback_data=f"oi_roll_{tk}"),
+         InlineKeyboardButton("📡 Inst Signals", callback_data=f"inst_sig_{tk}")],
+        [InlineKeyboardButton("📈 Mean Rev",     callback_data=f"mean_rev_{tk}"),
+         InlineKeyboardButton("🔄 Refresh",      callback_data=f"sigtk_{tk}")],
+        [InlineKeyboardButton("🔥 Back to Signals", callback_data="menu_signals"), BACK_BTN],
+    ])
+    try: await _loading.delete()
+    except Exception: pass
+    await query.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=kb)
+
 #  7) INSIDER / CONGRESS — table format
 # ═══════════════════════════════════════════════════════════
 async def insider_menu(query):
@@ -19206,12 +19528,17 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
                 for tk in tickers:
                     try:
                         today_ymd = datetime.now().strftime("%Y%m%d")
-                        # Get live spot price
+                        # Get live spot + HV for option pricing
                         spot_tk = 0.0
+                        hv_tk = 0.25  # default IV proxy
                         try:
-                            _th = yf.Ticker(tk).history(period="2d")
+                            _th = yf.Ticker(tk).history(period="30d")
                             if len(_th) >= 1:
                                 spot_tk = float(_th["Close"].iloc[-1])
+                            if len(_th) >= 5:
+                                _rets = _th["Close"].pct_change().dropna()
+                                hv_tk = float(_rets.std() * (252 ** 0.5))
+                                hv_tk = max(0.10, min(hv_tk, 2.0))
                         except Exception:
                             pass
 
@@ -19231,6 +19558,13 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
                             c    = float(r["c_chg"] or 0)
                             p    = float(r["p_chg"] or 0)
                             exp  = str(r["expiry_date"])[:5]
+                            # Days to expiry for option price estimation
+                            try:
+                                from datetime import datetime as _dtx
+                                _exp_d = _dtx.strptime(str(r["expiry_date"]), "%m-%d-%Y")
+                                exp_dte = max(1, (_exp_d - _dtx.now()).days)
+                            except Exception:
+                                exp_dte = 30
                             bias = "BULL" if c > abs(p)*1.1 else ("BEAR" if p > abs(c)*1.1 else "FLAT")
                             st   = "[B]" if bias=="BULL" else ("[S]" if bias=="BEAR" else "[ ]")
                             _oi_data.append([st, tk, exp, _fk2(c), _fk2(p)])
@@ -19289,6 +19623,27 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
                                     # Is it unusual? Compare to total standing OI
                                     standing_oi = c_oi_now if opt_type_s == "CALL" else p_oi_now
                                     unusual = standing_oi > 0 and abs(dominant_chg) / standing_oi > 0.15
+
+                                    # Option price estimate (BS, HV20 as IV proxy)
+                                    _T_yr = max(exp_dte, 1) / 365
+                                    try:
+                                        _c_px = bs_greeks(spot_tk, s_strike, _T_yr, 0.045, hv_tk, "call")["price"] if spot_tk > 0 else 0.0
+                                        _p_px = bs_greeks(spot_tk, s_strike, _T_yr, 0.045, hv_tk, "put")["price"] if spot_tk > 0 else 0.0
+                                    except Exception:
+                                        _c_px = _p_px = 0.0
+                                    _dom_px = _c_px if opt_type_s == "CALL" else _p_px
+                                    _bet = abs(dominant_chg) * _dom_px * 100
+                                    _lev = notional / _bet if _bet > 0 else 0
+                                    def _fmm(x):
+                                        if x >= 1e9: return f"${x/1e9:.2f}B"
+                                        if x >= 1e6: return f"${x/1e6:.1f}M"
+                                        if x >= 1e3: return f"${x/1e3:.0f}K"
+                                        return f"${x:.0f}"
+                                    _bet_s = _fmm(_bet) if _bet > 0 else "~"
+                                    _lev_s = f"{_lev:.0f}x" if _lev > 0 else "~"
+                                    _risk = _bet if dominant_chg > 0 else notional
+                                    _risk_lbl = "buyer" if dominant_chg > 0 else "seller"
+                                    _risk_s = _fmm(_risk) if _risk > 0 else "~"
 
                                     # Both-side flow analysis
                                     unusual_tag = " ⚠️ <b>UNUSUAL SIZE</b>" if unusual else ""
@@ -19402,9 +19757,12 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
                                     strike_lines.append(
                                         f"\n🔹 <b>${s_strike:.0f}</b> [{zone}]{my_flag}{unusual_tag}\n"
                                         f"   {pattern_tag}  {hedge_lbl}\n"
-                                        f"<pre>Calls: {c2_disp:>7}  {c_not_s}\n"
-                                        f"Puts:  {p2_disp:>7}  {p_not_s}</pre>"
-                                        f"   💰 Notional: {notional_exp}\n"
+                                        f"<pre>       Contracts   Notional\n"
+                                        f"Calls: {c2_disp:>7}  {c_not_s}\n"
+                                        f"Puts:  {p2_disp:>7}  {p_not_s}\n"
+                                        f"Bet:   {_bet_s:>7}  Lev:{_lev_s}\n"
+                                        f"Risk:  {_risk_s:>7}  ({_risk_lbl})</pre>"
+                                        f"   💰 {notional_exp}\n"
                                         f"   <i>{pattern_txt}</i>{spread_line}{pos_tag}"
                                     )
 
@@ -19845,6 +20203,114 @@ async def quick_quote(query, ticker):
 # ═══════════════════════════════════════════════════════════
 
 # Downstream cascade relationships (static knowledge map)
+
+def _oi_key_levels(ticker: str, conn, trade_date: str = None) -> dict:
+    """OI walls: call_wall, put_wall, max_pain, gamma_walls from options_change."""
+    tk = str(ticker).upper()
+    try:
+        # Get latest trade date if not provided
+        if not trade_date:
+            r = pd.read_sql("""SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
+                ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+                LIMIT 1""", conn, params=(tk,))
+            if r.empty: return {}
+            trade_date = r["trade_date_now"].iloc[0]
+        # Aggregate by strike across nearest future expiry
+        df = pd.read_sql("""
+            SELECT strike, expiry_date,
+                   SUM(openInt_Call_now) as call_oi, SUM(openInt_Put_now) as put_oi
+            FROM options_change WHERE ticker=? AND trade_date_now=?
+            GROUP BY strike, expiry_date
+        """, conn, params=(tk, trade_date))
+        if df.empty: return {}
+        df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+        df["call_oi"] = pd.to_numeric(df["call_oi"], errors="coerce").fillna(0)
+        df["put_oi"]  = pd.to_numeric(df["put_oi"],  errors="coerce").fillna(0)
+        # Use nearest future expiry
+        today_s = datetime.now().strftime("%Y%m%d")
+        def _exp_sort(e):
+            s = str(e)
+            return s[6:10]+s[0:2]+s[3:5] if len(s)>=10 else s
+        df["_es"] = df["expiry_date"].apply(_exp_sort)
+        future = df[df["_es"] >= today_s]
+        if future.empty: future = df
+        near_exp = future["_es"].min()
+        near_df = future[future["_es"] == near_exp].copy()
+        near_agg = near_df.groupby("strike").agg({"call_oi":"sum","put_oi":"sum"}).reset_index()
+        # Call wall = strike with max call OI
+        call_wall_row = near_agg.loc[near_agg["call_oi"].idxmax()]
+        put_wall_row  = near_agg.loc[near_agg["put_oi"].idxmax()]
+        call_wall = float(call_wall_row["strike"])
+        put_wall  = float(put_wall_row["strike"])
+        # Max pain = strike minimizing sum of ITM losses
+        strikes = sorted(near_agg["strike"].tolist())
+        min_pain = float("inf"); max_pain_strike = strikes[0]
+        for test in strikes:
+            pain = sum(max(0, test - s) * float(near_agg.loc[near_agg["strike"]==s,"call_oi"].iloc[0]) for s in strikes if near_agg.loc[near_agg["strike"]==s,"call_oi"].iloc[0] > 0)
+            pain += sum(max(0, s - test) * float(near_agg.loc[near_agg["strike"]==s,"put_oi"].iloc[0]) for s in strikes if near_agg.loc[near_agg["strike"]==s,"put_oi"].iloc[0] > 0)
+            if pain < min_pain:
+                min_pain = pain; max_pain_strike = test
+        # Gamma walls = strikes where call+put OI >= 2x mean
+        near_agg["total"] = near_agg["call_oi"] + near_agg["put_oi"]
+        mean_oi = near_agg["total"].mean()
+        gamma_walls = sorted(near_agg[near_agg["total"] >= 2 * mean_oi]["strike"].tolist())
+        near_exp_str = near_df["expiry_date"].iloc[0] if not near_df.empty else ""
+        return {"call_wall": call_wall, "put_wall": put_wall, "max_pain": max_pain_strike,
+                "gamma_walls": gamma_walls, "expiry": near_exp_str}
+    except Exception as e:
+        return {}
+
+
+def _classify_stock_move(ticker: str, net_call_chg: float, net_put_chg: float) -> dict:
+    """Classify if price move is real stock buying vs MM delta hedging vs short cover."""
+    tk = str(ticker).upper()
+    try:
+        h = yf.Ticker(tk).history(period="30d")
+        if len(h) < 5: return {}
+        today_vol  = float(h["Volume"].iloc[-1])
+        avg_vol    = float(h["Volume"].iloc[-21:-1].mean()) if len(h) >= 21 else float(h["Volume"].mean())
+        vol_ratio  = today_vol / avg_vol if avg_vol > 0 else 1.0
+        price_now  = float(h["Close"].iloc[-1])
+        price_prev = float(h["Close"].iloc[-2])
+        price_chg  = (price_now - price_prev) / price_prev * 100 if price_prev > 0 else 0.0
+        # Classification
+        signal = "NEUTRAL"
+        confidence = "LOW"
+        explanation = ""
+        net_call = float(net_call_chg or 0)
+        net_put  = float(net_put_chg or 0)
+        if price_chg > 1.0 and vol_ratio > 1.4 and net_call > 0:
+            signal = "REAL_BUY"; confidence = "HIGH"
+            explanation = "Price up + high volume + call OI building = real institutional buying confirmed by options flow."
+        elif price_chg > 0.5 and vol_ratio < 0.8 and net_call > 0:
+            signal = "DELTA_HEDGE"; confidence = "MEDIUM"
+            explanation = "Price up on low volume + call OI rising = MMs delta-hedging sold calls; not genuine buying pressure."
+        elif price_chg > 1.0 and vol_ratio > 1.4 and net_call < 0:
+            signal = "SHORT_COVER"; confidence = "HIGH"
+            explanation = "Price up + high volume + calls closing = short squeeze / short covering. Caution - may not sustain."
+        elif abs(price_chg) < 0.5 and net_call > abs(net_put) * 1.5 and vol_ratio < 1.2:
+            signal = "SPEC_CALL"; confidence = "MEDIUM"
+            explanation = "Price flat + call OI up without stock volume = speculative option bet. Watch for confirmation."
+        elif price_chg < -1.0 and vol_ratio > 1.4 and net_put > 0:
+            signal = "REAL_SELL"; confidence = "HIGH"
+            explanation = "Price down + high volume + put OI building = real selling / institutional exit confirmed."
+        elif price_chg < -0.5 and vol_ratio < 0.8 and net_put > 0:
+            signal = "DELTA_HEDGE"; confidence = "MEDIUM"
+            explanation = "Price down on low volume + put OI rising = MMs hedging; not outright selling."
+        elif net_call > 0 and net_put > 0 and min(net_call, net_put) > abs(net_call - net_put) * 0.4:
+            signal = "EVENT_STRADDLE"; confidence = "MEDIUM"
+            explanation = "Both call + put OI rising together = market pricing an event/volatility expansion."
+        else:
+            signal = "MIXED"; confidence = "LOW"
+            explanation = "Mixed signals - volume and OI diverge. Await stronger confirmation."
+        _vol_lbl = "HIGH" if vol_ratio > 1.4 else ("LOW" if vol_ratio < 0.7 else "AVG")
+        return {"signal": signal, "confidence": confidence, "explanation": explanation,
+                "vol_ratio": round(vol_ratio, 2), "vol_label": _vol_lbl,
+                "price_chg": round(price_chg, 2), "today_vol": int(today_vol), "avg_vol": int(avg_vol)}
+    except Exception:
+        return {}
+
+
 _DOWNSTREAM_MAP = {
     "NVDA":  {"up": ["TSM","ASML","AMAT"],       "down": ["SMCI","ANET","AMD","MSFT","AMZN"],
               "theme": "AI capex multiplier — GPU demand drives cloud build-out"},
@@ -19930,8 +20396,8 @@ def _score_ticker_full(ticker: str, conn, vix_val: float = 20.0) -> dict:
         oi_bear = False
         try:
             mr      = analyze_mean_reversion(tk, conn)
-            pcr_z   = float(mr.get("PCR_z",    0) or 0)
-            comp    = float(mr.get("Composite", 0) or 0)
+            pcr_z   = float(mr.get("pcr_z",    {}).get("z", 0) or 0)
+            comp    = float(mr.get("composite", {}).get("score", 0) or 0)
             if pcr_z > 2:    oi_score += 8
             elif pcr_z > 1:  oi_score += 4
             elif pcr_z < -2: oi_score -= 7
@@ -20224,8 +20690,12 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await exit_planner_menu(query)
         elif data == "exit_batch_all":
             await exit_batch_all(query)
+        elif data == "exit_batch_all_cards":
+            await exit_batch_all_cards(query)
         elif data.startswith("exit_batch_tk|"):
             await exit_batch_ticker(query, data.split("|", 1)[1])
+        elif data.startswith("exit_tk_cards|"):
+            await exit_ticker_cards(query, data.split("|", 1)[1])
         elif data.startswith("exitmc|"):
             # exitmc|TICKER|type|strike|entry|expiry[|qty]
             parts_mc = data.split("|", 6)
@@ -20751,6 +21221,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await group_detail(query, gid)
         elif data == "menu_signals":
             await signal_scanner(query)
+        elif data.startswith("sigtk_"):
+            await signal_ticker_detail(query, data.replace("sigtk_", ""))
         elif data == "menu_insider":
             await insider_menu(query)
         elif data == "menu_more":

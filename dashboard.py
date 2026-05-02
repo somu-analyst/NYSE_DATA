@@ -4828,7 +4828,7 @@ elif page == "🔮 Live Position Predictor":
                     f"Vol: {'Bull' if vol_signal > 0 else 'Bear' if vol_signal < 0 else 'Neut'} | "
                     f"Futures: {'▲' if futures_signal > 0 else '▼' if futures_signal < 0 else '—'} | "
                     f"VIX: {'Low' if vix_signal > 0 else 'High' if vix_signal < 0 else 'Norm'}<br>"
-                    f"<small style='color:#666'>Price: {_spot_src_lbl}</small>"
+                    f"<small>Price: {_spot_src_lbl}</small>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
