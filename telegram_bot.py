@@ -1,4 +1,4 @@
-async def group_stock_detail(query, ticker):
+﻿async def group_stock_detail(query, ticker):
     """Show all open option positions for a stock with per-leg advice (close vs keep)."""
     conn = get_conn()
     try:
