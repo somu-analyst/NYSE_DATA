@@ -3675,6 +3675,296 @@ def _explain_oi_flow(call_chg: float, put_chg: float,
     return "\n".join(parts)
 
 
+def _oi_expiry_flow_table(ticker: str, conn, latest_date: str) -> str:
+    """<pre> table of call/put OI delta per expiry for latest date. Skips expired."""
+    try:
+        edf = pd.read_sql("""
+            SELECT expiry_date,
+                   SUM(change_OI_Call) as c_chg,
+                   SUM(change_OI_Put)  as p_chg
+            FROM options_change
+            WHERE ticker=? AND trade_date_now=?
+            GROUP BY expiry_date
+            ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
+        """, conn, params=(ticker, latest_date))
+    except Exception:
+        return ""
+    if edf.empty:
+        return ""
+    _today = datetime.now().date()
+    def _fk(n):
+        n = float(n or 0); s = "+" if n >= 0 else ""; a = abs(n)
+        if a >= 1_000: return f"{s}{a/1_000:.0f}K"
+        return f"{s}{n:.0f}"
+    def _bias(c, p):
+        c, p = float(c or 0), float(p or 0)
+        if c > 300 and p > 300:       return "STRD"
+        if c > abs(p)*1.5 and c > 0:  return "BULL"
+        if p > abs(c)*1.5 and p > 0:  return "BEAR"
+        if c < -200 and p < -200:     return "UNWD"
+        return "FLAT"
+    rows = []
+    for _, r in edf.iterrows():
+        try:
+            if datetime.strptime(str(r["expiry_date"]), "%m-%d-%Y").date() < _today:
+                continue
+        except Exception:
+            pass
+        exp_s = str(r["expiry_date"])[:5]
+        rows.append("{:<5} {:>6} {:>6}  {:<4}".format(
+            exp_s, _fk(r["c_chg"]), _fk(r["p_chg"]), _bias(r["c_chg"], r["p_chg"])))
+    if not rows:
+        return ""
+    hdr_l = "{:<5} {:>6} {:>6}  {:<4}".format("Exp","CΔ","PΔ","Bias")
+    return "<pre>" + "\n".join([hdr_l, "-"*26] + rows[:6]) + "</pre>"
+
+
+def _oi_opportunity_table(ticker: str, conn, df, spot: float) -> str:
+    """
+    Buy/sell opportunity tables from strike OI data.
+    Returns formatted HTML string or empty string.
+    """
+    if df.empty or spot <= 0:
+        return ""
+    # HV20 from stock_daily
+    hv = 0.30
+    try:
+        _hsd = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
+            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
+            LIMIT 25""", conn, params=(ticker,))
+        if len(_hsd) >= 10:
+            _rets = _hsd["close"].astype(float).pct_change().dropna()
+            hv = float(_rets.std() * (252**0.5))
+            hv = max(0.10, min(hv, 2.0))
+    except Exception:
+        pass
+    # Nearest DTE from options_change expiry data
+    dte = 21
+    try:
+        _edt = pd.read_sql("""SELECT DISTINCT expiry_date FROM options_change WHERE ticker=?
+            AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) >= ?
+            ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) LIMIT 1""",
+            conn, params=(ticker, datetime.now().strftime("%Y%m%d")))
+        if not _edt.empty:
+            _exp_s = _edt["expiry_date"].iloc[0]
+            dte = max(1, (datetime.strptime(str(_exp_s), "%m-%d-%Y") - datetime.now()).days)
+    except Exception:
+        pass
+    T = max(dte, 1) / 365.0
+    r = 0.045
+    sigma = max(hv, 0.15)
+
+    buy_opps = []   # (strat, strike, pwin_int, rr_str, tag)
+    sell_opps = []
+
+    for _, row in df.iterrows():
+        strike = float(row["strike"])
+        c_chg  = float(row.get("call_chg", 0) or 0)
+        p_chg  = float(row.get("put_chg",  0) or 0)
+        c_oi   = float(row.get("call_oi",  0) or 0)
+        p_oi   = float(row.get("put_oi",   0) or 0)
+        pct    = (strike - spot) / spot * 100 if spot > 0 else 0
+        try:
+            g = bs_greeks(spot, strike, T, r, sigma, "call")
+            delta_c = float(g["delta"])
+            g2 = bs_greeks(spot, strike, T, r, sigma, "put")
+            delta_p = abs(float(g2["delta"]))
+        except Exception:
+            delta_c = 0.5; delta_p = 0.5
+        pw_c = int(delta_c * 100)
+        pw_p = int(delta_p * 100)
+
+        # ── BUY opportunities ──────────────────────────────────────
+        if c_chg > 500 and pct > -8:
+            rr_c = f"{max(1, int(1/(max(delta_c,0.1))))}:1"
+            buy_opps.append(("BUY CALL", strike, pw_c, rr_c))
+        if p_chg > 500 and pct < 8:
+            rr_p = f"{max(1, int(1/(max(delta_p,0.1))))}:1"
+            buy_opps.append(("BUY PUT ", strike, pw_p, rr_p))
+        if c_chg > 300 and p_chg > 300:
+            buy_opps.append(("STRADDLE", strike, 55, "2:1"))
+
+        # ── SELL / Income opportunities ─────────────────────────────
+        if p_oi > 2000 and abs(pct) > 5 and p_chg >= -300:
+            sell_opps.append(("SELL PUT ", strike, int((1-delta_p)*100), "1:3"))
+        if c_oi > 2000 and pct > 5:
+            sell_opps.append(("SELL CALL", strike, int((1-delta_c)*100), "1:3"))
+        if c_chg > 300 and p_chg > 300 and abs(pct) > 2:
+            sell_opps.append(("IRON COND", strike, max(55, int((1-delta_c)*100)), "1:2"))
+
+    def _dedup(lst):
+        seen = set(); out = []
+        for item in lst:
+            k = (item[0][:6], int(item[1]))
+            if k not in seen:
+                seen.add(k); out.append(item)
+        return out
+
+    buy_opps  = sorted(_dedup(buy_opps),  key=lambda x: -x[2])[:4]
+    sell_opps = sorted(_dedup(sell_opps), key=lambda x: -x[2])[:4]
+
+    if not buy_opps and not sell_opps:
+        return ""
+
+    lines = []
+    hdr_b = "{:<8} {:>5} {:>4} {:>4}".format("Strat","Stk","P(W)","R:R")
+    sep   = "-" * 24
+    if buy_opps:
+        lines.append("\n<b>📈 BUY Opportunities</b>")
+        rows_b = ["{:<8} ${:<4.0f} {:>3}% {:>4}".format(
+            op[0][:8], op[1], op[2], op[3]) for op in buy_opps]
+        lines.append("<pre>" + "\n".join([hdr_b, sep] + rows_b) + "</pre>")
+    if sell_opps:
+        lines.append("\n<b>💰 SELL / Income Opps</b>")
+        rows_s = ["{:<8} ${:<4.0f} {:>3}% {:>4}".format(
+            op[0][:8], op[1], op[2], op[3]) for op in sell_opps]
+        lines.append("<pre>" + "\n".join([hdr_b, sep] + rows_s) + "</pre>")
+    lines.append("<i>P(W)=prob ITM at expiry·R:R=approx·verify prices before trading</i>")
+    return "\n".join(lines)
+
+
+def _oi_money_flow_chart(ticker: str, conn, spot: float, latest_date: str):
+    """
+    Money flow chart: call/put notional per strike (buyers vs sellers/closers).
+    Returns BytesIO PNG or None.
+    """
+    try:
+        df = pd.read_sql("""
+            SELECT strike,
+                   SUM(change_OI_Call) AS call_chg,
+                   SUM(change_OI_Put)  AS put_chg
+            FROM options_change
+            WHERE ticker=? AND trade_date_now=?
+            GROUP BY strike
+            HAVING ABS(SUM(change_OI_Call)) + ABS(SUM(change_OI_Put)) > 100
+            ORDER BY ABS(strike - ?) ASC
+            LIMIT 30
+        """, conn, params=(ticker, latest_date, spot))
+    except Exception:
+        return None
+    if df.empty or spot <= 0:
+        return None
+    df = df[(df["strike"] >= spot * 0.80) & (df["strike"] <= spot * 1.20)].copy()
+    if df.empty:
+        return None
+    df["_act"] = df["call_chg"].abs() + df["put_chg"].abs()
+    df = df.nlargest(12, "_act").sort_values("strike").reset_index(drop=True)
+    if df.empty:
+        return None
+
+    df["call_not"] = df["call_chg"] * df["strike"] * 100 / 1e6   # $M
+    df["put_not"]  = df["put_chg"]  * df["strike"] * 100 / 1e6
+    df["net_not"]  = df["call_not"] - df["put_not"]
+
+    # Key levels
+    try:
+        _conn_kl = get_conn()
+        _kl = _oi_key_levels(ticker, _conn_kl)
+        _conn_kl.close()
+    except Exception:
+        _kl = {}
+    call_wall = _kl.get("call_wall", 0)
+    put_wall  = _kl.get("put_wall",  0)
+    max_pain  = _kl.get("max_pain",  0)
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8),
+                                    gridspec_kw={"height_ratios": [3, 1.2]},
+                                    facecolor="#0D1117")
+    for ax in [ax1, ax2]:
+        ax.set_facecolor("#161B22")
+        ax.tick_params(colors="#8B949E", labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_color("#30363D")
+
+    strikes = df["strike"].values
+    x       = list(range(len(strikes)))
+    labels  = [f"${int(s)}" for s in strikes]
+    bw      = 0.38
+
+    # Separate buyers (chg>0) from closers/sellers (chg<0)
+    c_buy  = df["call_not"].clip(lower=0).values
+    c_sell = df["call_not"].clip(upper=0).values     # negative, shown as downward lighter bar
+    p_buy  = (-df["put_not"].clip(lower=0)).values   # flip: put buyers shown below x-axis
+    p_sell = (-df["put_not"].clip(upper=0)).values   # put closers shown above x-axis
+
+    # Call bars
+    ax1.bar([i - bw/2 for i in x], c_buy,  bw*0.9, color="#3FB950", alpha=0.88, label="Call Buyers")
+    ax1.bar([i - bw/2 for i in x], c_sell, bw*0.9, color="#3FB950", alpha=0.30, hatch="//",  label="Call Close")
+    # Put bars
+    ax1.bar([i + bw/2 for i in x], p_buy,  bw*0.9, color="#F85149", alpha=0.88, label="Put Buyers")
+    ax1.bar([i + bw/2 for i in x], p_sell, bw*0.9, color="#F85149", alpha=0.30, hatch="\\\\", label="Put Close")
+
+    # Zero line
+    ax1.axhline(0, color="#8B949E", linewidth=0.8, alpha=0.5)
+
+    # Spot + wall lines
+    def _strike_to_x(sv):
+        if sv <= 0:
+            return None
+        dists = [(abs(strikes[i] - sv), i) for i in range(len(strikes))]
+        _, idx = min(dists)
+        return float(idx)
+
+    spot_x = _strike_to_x(spot)
+    if spot_x is not None:
+        ax1.axvline(spot_x, color="#FFFFFF", linestyle="--", linewidth=1.2, alpha=0.7)
+        ax1.text(spot_x + 0.1, ax1.get_ylim()[1] * 0.02 if ax1.get_ylim()[1] else 0.1,
+                 f" ${spot:.0f}", color="#FFFFFF", fontsize=7)
+    for wall_v, col, lbl in [(call_wall, "#58A6FF", "CWall"), (put_wall, "#FF7B00", "PWall"),
+                              (max_pain, "#FFD700", "MaxPain")]:
+        wx = _strike_to_x(wall_v)
+        if wx is not None:
+            ax1.axvline(wx, color=col, linestyle=":", linewidth=1.3, alpha=0.85, label=lbl)
+
+    # Signal annotations
+    sig_map = {}
+    for _, r in df.iterrows():
+        c = float(r["call_chg"]); p = float(r["put_chg"])
+        if c > 300 and p > 300:    sig_map[float(r["strike"])] = ("STRD", "#BB86FC")
+        elif c > 500 and p <= 100: sig_map[float(r["strike"])] = ("BULL", "#3FB950")
+        elif p > 500 and c <= 100: sig_map[float(r["strike"])] = ("BEAR", "#F85149")
+        elif c < -300 or p < -300: sig_map[float(r["strike"])] = ("UNWD", "#8B949E")
+    for i, s in enumerate(strikes):
+        if s in sig_map:
+            lbl, col = sig_map[s]
+            ymax = ax1.get_ylim()[1] if ax1.get_ylim()[1] else 0.5
+            ax1.text(i, ymax * 0.85, lbl, color=col, fontsize=6, ha="center",
+                     fontweight="bold",
+                     bbox=dict(boxstyle="round,pad=0.1", facecolor="#1C2128", alpha=0.7, edgecolor=col))
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    ax1.set_ylabel("Notional $M", color="#8B949E", fontsize=8)
+    ax1.set_title(f"\U0001f4b0 {ticker} Money Flow by Strike  ({latest_date})",
+                  color="#FFFFFF", fontsize=10, pad=8)
+    ax1.legend(loc="upper left", fontsize=6, ncol=3,
+               facecolor="#1C2128", edgecolor="#30363D", labelcolor="#C9D1D9")
+
+    # Bottom panel: net flow
+    net  = df["net_not"].values
+    cols = ["#3FB950" if n >= 0 else "#F85149" for n in net]
+    ax2.bar(x, net, width=0.6, color=cols, alpha=0.82)
+    ax2.axhline(0, color="#8B949E", linewidth=0.8, alpha=0.5)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    ax2.set_ylabel("Net $M", color="#8B949E", fontsize=8)
+    ax2.set_title("Net Flow (Call$ − Put$)  ▲=Bull bias  ▼=Bear bias",
+                  color="#8B949E", fontsize=8, pad=3)
+
+    plt.tight_layout(pad=0.9)
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=110, bbox_inches="tight",
+                facecolor="#0D1117", edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
                          n_strikes: int = 20) -> str:
     """
@@ -3831,7 +4121,25 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
     ]
     summary_str = "\n".join(summary_lines)
 
-    return f"{table_str}\n\n" + "\n".join(bullets) + summary_str
+    # ── Expiry-level flow table ──────────────────────────────────────
+    try:
+        _exp_tbl = _oi_expiry_flow_table(ticker, conn, latest_date)
+    except Exception:
+        _exp_tbl = ""
+
+    # ── Opportunity table ────────────────────────────────────────────
+    try:
+        _opp_tbl = _oi_opportunity_table(ticker, conn, df, spot)
+    except Exception:
+        _opp_tbl = ""
+
+    extra = ""
+    if _exp_tbl:
+        extra += f"\n\n<b>📅 By Expiry:</b>\n{_exp_tbl}"
+    if _opp_tbl:
+        extra += f"\n\n{_opp_tbl}"
+
+    return f"{table_str}\n\n" + "\n".join(bullets) + summary_str + extra
 
 
 def _oi_trend_summary(ticker: str, conn, latest_date: str) -> str:
@@ -17307,6 +17615,7 @@ async def oi_detail(query, ticker):
                 )
     except Exception: pass
 
+    # Send text message
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 OI Build",      callback_data=f"oi_build_{ticker}"),
          InlineKeyboardButton("📊 OI Change Chart", callback_data=f"oi_change_{ticker}")],
@@ -17322,6 +17631,32 @@ async def oi_detail(query, ticker):
             await query.message.reply_text(msg[:2000], parse_mode=H, reply_markup=kb)
         except Exception:
             await query.message.reply_text(f"OI data loaded for {ticker}.", reply_markup=kb)
+
+    # Money flow chart — send after text
+    try:
+        _conn_mf = get_conn()
+        _mf_date = pd.read_sql("""SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
+            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            LIMIT 1""", _conn_mf, params=(str(ticker).upper(),))
+        _mf_latest = _mf_date["trade_date_now"].iloc[0] if not _mf_date.empty else ""
+        _mf_sd = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
+            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
+            LIMIT 1""", _conn_mf, params=(str(ticker).upper(),))
+        _mf_spot = float(_mf_sd["close"].iloc[0]) if not _mf_sd.empty else 0.0
+        if _mf_latest and _mf_spot > 0:
+            _chart_buf = _oi_money_flow_chart(str(ticker).upper(), _conn_mf, _mf_spot, _mf_latest)
+            if _chart_buf:
+                await query.message.reply_photo(
+                    _chart_buf,
+                    caption=(
+                        f"\U0001f4b0 {ticker} Money Flow by Strike\n"
+                        f"Green=Call buyers  Red=Put buyers\n"
+                        f"Hatched=Closers/sellers  Net=Bottom panel"
+                    )
+                )
+        _conn_mf.close()
+    except Exception as _mf_e:
+        log.warning(f"oi_detail money flow chart failed: {_mf_e}")
 
 
 async def oi_compare_select_expiry(query, ctx, step=1):
