@@ -3809,14 +3809,23 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
         best_strike = int(df.nlargest(1, "call_chg")["strike"].iloc[0]) if total_call_build > total_put_build else int(df.nlargest(1, "put_chg")["strike"].iloc[0])
         trade_idea = f"${best_strike:.0f} highest-activity strike — wait for confirmation"
 
+    def _fk_k(n):
+        a = abs(float(n or 0))
+        if a >= 1e9: return f"{a/1e9:.1f}B"
+        if a >= 1e6: return f"{a/1e6:.0f}M"
+        if a >= 1e3: return f"{a/1e3:.0f}K"
+        return f"{a:.0f}"
+    _net_dir = "BULL" if net_flow >= 0 else "BEAR"
     summary_lines = [
         "",
-        f"<b>📋 Summary: {theme}</b>",
-        f"<pre>",
-        f"Bull flow : {_fmt_notional(call_notional):>8}  (+{total_call_build:,.0f}c)",
-        f"Bear flow : {_fmt_notional(put_notional):>8}  (+{total_put_build:,.0f}p)",
-        f"Net flow  : {_fmt_notional(abs(net_flow)):>8}  {'BULL' if net_flow>=0 else 'BEAR'}",
-        f"</pre>",
+        f"<b>📋 {theme}</b>",
+        "<pre>",
+        "{:<5} {:>7} {:>7}".format("Side","Amount","Ctrs"),
+        "-" * 22,
+        "{:<5} {:>7} {:>7}".format("Bull", _fmt_notional(call_notional), f"+{_fk_k(total_call_build)}c"),
+        "{:<5} {:>7} {:>7}".format("Bear", _fmt_notional(put_notional),  f"+{_fk_k(total_put_build)}p"),
+        "{:<5} {:>7} {:>7}".format("Net", _fmt_notional(abs(net_flow)),  _net_dir),
+        "</pre>",
         f"<i>{theme_detail}</i>",
         f"\n💡 <b>Idea:</b> {trade_idea}",
     ]
@@ -3880,12 +3889,24 @@ def _oi_trend_summary(ticker: str, conn, latest_date: str) -> str:
         if a >= 1_000:     return f"{s}{a/1_000:.0f}K"
         return f"{s}{n:.0f}"
 
-    lines = []
+    def _trend_short(c, p):
+        if c > 0 and p > 0:   return "STRD/VOL"
+        if c > abs(p) * 1.5:  return "CALL-DOM"
+        if p > abs(c) * 1.5:  return "PUT-DOM"
+        if c > 0:              return "MIXED-C"
+        return "MIXED-P"
+
+    rows = []
     if len(week_dates) >= 2:
-        lines.append(f"  1W: {_trend(wc, wp)} [C:{_fk_static(wc)} P:{_fk_static(wp)}]")
+        rows.append(("1W", _fk_static(wc), _fk_static(wp), _trend_short(wc, wp)))
     if len(month_dates) >= 5:
-        lines.append(f"  1M: {_trend(mc, mp)} [C:{_fk_static(mc)} P:{_fk_static(mp)}]")
-    return "\n".join(lines)
+        rows.append(("1M", _fk_static(mc), _fk_static(mp), _trend_short(mc, mp)))
+    if not rows:
+        return ""
+    hdr_line = "{:<3} {:>6} {:>6}  {:<8}".format("Per","Call","Put","Signal")
+    sep      = "-" * 27
+    data_lines = ["{:<3} {:>6} {:>6}  {:<8}".format(*r) for r in rows]
+    return "<pre>" + "\n".join([hdr_line, sep] + data_lines) + "</pre>"
 
 
 
@@ -6171,7 +6192,7 @@ async def oi_detail(query, ticker):
 
             iv_vs_hv = ""
             cheap_signal = ""
-            if iv_pct:
+            if iv_pct is not None:
                 diff = iv_pct - hv20
                 if diff < -5:
                     iv_vs_hv = "🟢 IV < HV — options CHEAP"
@@ -16957,15 +16978,7 @@ async def oi_menu(query, expiry=None):
     for i in range(0, len(exp_btns), 3):
         exp_rows.append(exp_btns[i:i+3])
 
-    if expired_dates:
-        exp_rows.append([InlineKeyboardButton("── Expired ──", callback_data="noop")])
-        old_btns = []
-        for d in expired_dates[:4]:
-            label = f">{d}" if d == chosen_expiry else d
-            old_btns.append(InlineKeyboardButton(label, callback_data=f"oi_expiry_{d}"))
-        for i in range(0, len(old_btns), 3):
-            exp_rows.append(old_btns[i:i+3])
-
+    # Expired expiry buttons hidden -- only future expiries shown
     # Ticker buttons
     tickers = sorted(df["ticker"].dropna().astype(str).str.upper().unique().tolist())
     paged = _paged_ticker_keyboard("oi_detail", tickers, page=0, per_page=12, cols=3, include_back=False)
@@ -17081,6 +17094,7 @@ async def oi_detail(query, ticker):
             for _, er in exp_df.iterrows():
                 try:
                     _edt = datetime.strptime(str(er["expiry_date"]), "%m-%d-%Y").date()
+                    if _edt < _today: continue  # skip expired
                     if _edt <= _this_fri:   _buckets[_bk_tw].append(er)
                     elif _edt <= _next_fri: _buckets[_bk_nw].append(er)
                     else:                   _buckets[_bk_lt].append(er)
@@ -17129,7 +17143,7 @@ async def oi_detail(query, ticker):
 
             iv_vs_hv = ""
             cheap_signal = ""
-            if iv_pct:
+            if iv_pct is not None:
                 diff = iv_pct - hv20
                 if diff < -5:
                     iv_vs_hv = "🟢 IV < HV — options CHEAP"
@@ -17456,15 +17470,15 @@ def _generate_oi_change_chart(ticker, today_date, prev_date):
     conn = get_conn()
     try:
         from datetime import datetime as _dt_exp
-        _today_dt = _dt_exp.now()
+        _actual_today = _dt_exp.now().strftime("%m-%d-%Y")
         expiries_df = pd.read_sql("""
             SELECT DISTINCT expiry_date FROM options_daily
             WHERE ticker = ? AND trade_date = ?
             AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
                 > substr(?,7,4)||substr(?,1,2)||substr(?,4,2)
             ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
-        """, conn, params=(ticker.upper(), today_date, today_date, today_date))
-        all_expiries = expiries_df["expiry_date"].tolist()[:3]
+        """, conn, params=(ticker.upper(), today_date, _actual_today, _actual_today, _actual_today))
+        all_expiries = expiries_df["expiry_date"].tolist()[:2]
     except Exception as e:
         log.warning(f"Failed to fetch expiries for {ticker}: {e}")
         conn.close()
@@ -17639,7 +17653,7 @@ def _generate_oi_change_chart(ticker, today_date, prev_date):
             mpatches.Patch(color="#58A6FF", label="Spot"),
         ] + wall_handles
         ax_bot.legend(handles=_bot_handles,
-            loc="upper right", fontsize=6, ncol=4, framealpha=0.85,
+            loc="upper left", fontsize=8, ncol=2, framealpha=0.85,
             facecolor="#21262D", edgecolor="#30363D", labelcolor="#E6EDF3")
     fig.patch.set_facecolor("#0D1117")
     plt.tight_layout(pad=1.2)
@@ -17697,9 +17711,10 @@ async def oi_change_chart_view(query, ticker):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 EOD vs EOD (Historical)", callback_data=f"oi_change_eod_{ticker}")],
         [InlineKeyboardButton("🔴 Live vs Last EOD", callback_data=f"oi_change_live_{ticker}")],
+        [InlineKeyboardButton("📋 OI Detail", callback_data=f"oi_detail_{ticker}")],
         [InlineKeyboardButton("⬅️ Back to Tickers", callback_data="oi_change_menu"), BACK_BTN]
     ])
-    
+
     await query.message.reply_text(
         f"{hdr(f'📊 {ticker} OI CHANGE CHART')}\n\n"
         "Select comparison type:\n\n"
@@ -17708,7 +17723,6 @@ async def oi_change_chart_view(query, ticker):
         parse_mode=H,
         reply_markup=kb
     )
-
 
 
 
@@ -17793,13 +17807,13 @@ def _oi_multiday_conviction_text(ticker, n_days=7):
     lines_out = [f"<b>📈 {ticker} {n_days}d OI BUILD</b>", ""]
     lines_out.append("<pre>")
     lines_out.append("Stk  Dir Scr Str")
-    lines_out.append("─" * 17)
+    lines_out.append("-" * 17)
     for _, r in strike_agg.head(6).iterrows():
         sk = int(r["strike"])
         d = str(r["direction"])
         sc = f"{r['conviction']:.1f}"
         st_days = f"{int(r['streak'])}d"
-        arrow = "▲" if d == "BUL" else ("▼" if d == "BEA" else "─")
+        arrow = "^" if d == "BUL" else ("v" if d == "BEA" else "-")
         lines_out.append(f"{sk:<5}{d} {sc:<4}{st_days}{arrow}")
     lines_out.append("</pre>")
     lines_out.append("")
@@ -17866,30 +17880,43 @@ async def oi_change_chart_eod_view(query, ticker):
         except Exception: pass
         return
     
-    # Send chart
+    # Send chart — photo send in its own try block
     try:
         await query.message.reply_photo(
             photo=chart_buf,
-            caption=f"📊 <b>{ticker} OI Change Analysis (EOD)</b>\n{prev_date} → {today_date}\n\n🟦 Blue=Calls above 0 · 🟥 Red=Puts below 0\nTaller bars = more contracts. Call OI rising = bullish flow. Put OI rising = bearish/hedge flow.",
-            parse_mode=H
+            caption=f"📊 {ticker} OI Change Analysis (EOD)\n{prev_date} to {today_date}\n\nBlue=Calls above 0  Red=Puts below 0\nTaller bars = more contracts added.",
         )
-        # Multi-day OI conviction insights
+    except Exception as _photo_e:
+        log.error(f"Failed to send OI chart photo for {ticker}: {_photo_e}")
+        await query.message.reply_text(f"❌ Chart send failed for {ticker}.", reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
+        try: await _loading.delete()
+        except Exception: pass
+        return
+
+    # Multi-day OI conviction insights — separate block so photo failure doesn't kill it
+    try:
         _md_txt = _oi_multiday_conviction_text(ticker)
+        print(f"[EOD] multiday_txt {ticker} len={len(_md_txt) if _md_txt else 0}", flush=True)
+        log.info(f"multiday_txt for {ticker}: len={len(_md_txt) if _md_txt else 0}")
         if _md_txt:
             try:
-                await query.message.reply_text(_md_txt, parse_mode=H)
-            except Exception:
-                pass
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔴 Try Live vs EOD", callback_data=f"oi_change_live_{ticker}")],
-            [InlineKeyboardButton("📊 Other Ticker", callback_data="oi_change_menu")],
-            [InlineKeyboardButton("📊 OI Menu", callback_data="menu_oi"), BACK_BTN]
-        ])
-        await query.message.reply_text("Select another action:", parse_mode=H, reply_markup=kb)
-    except Exception as e:
-        log.error(f"Failed to send OI chart: {e}")
-        await query.message.reply_text(f"❌ Failed to send chart: {e}", reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
-    
+                await query.message.reply_text(_md_txt[:3000], parse_mode=H)
+            except Exception as _html_e:
+                log.warning(f"HTML send failed for multiday {ticker}: {_html_e}")
+                _plain = _md_txt.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","").replace("<pre>","").replace("</pre>","")
+                await query.message.reply_text(_plain[:3000])
+    except Exception as _md_e:
+        print(f"[EOD] multiday error {ticker}: {_md_e}", flush=True)
+        log.warning(f"multiday failed for {ticker}: {_md_e}")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔴 Try Live vs EOD", callback_data=f"oi_change_live_{ticker}"),
+         InlineKeyboardButton("📋 OI Detail", callback_data=f"oi_detail_{ticker}")],
+        [InlineKeyboardButton("📊 Other Ticker", callback_data="oi_change_menu")],
+        [InlineKeyboardButton("📊 OI Menu", callback_data="menu_oi"), BACK_BTN]
+    ])
+    await query.message.reply_text("Select another action:", reply_markup=kb)
+
     try: await _loading.delete()
     except Exception: pass
 
@@ -18198,13 +18225,19 @@ async def oi_change_chart_live_view(query, ticker):
         )
         # Multi-day OI conviction insights
         _md_txt = _oi_multiday_conviction_text(ticker)
+        log.info(f"multiday_txt live for {ticker}: len={len(_md_txt) if _md_txt else 0}")
         if _md_txt:
             try:
                 await query.message.reply_text(_md_txt, parse_mode=H)
-            except Exception:
-                pass
+            except Exception as _md_e:
+                log.warning(f"multiday HTML send failed live ({ticker}): {_md_e}")
+                try:
+                    await query.message.reply_text(_md_txt.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","").replace("<pre>","").replace("</pre>",""), parse_mode=None)
+                except Exception:
+                    pass
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh Live Data", callback_data=f"oi_change_live_{ticker}")],
+            [InlineKeyboardButton("🔄 Refresh Live Data", callback_data=f"oi_change_live_{ticker}"),
+             InlineKeyboardButton("📋 OI Detail", callback_data=f"oi_detail_{ticker}")],
             [InlineKeyboardButton("📊 See EOD vs EOD", callback_data=f"oi_change_eod_{ticker}")],
             [InlineKeyboardButton("📊 Other Ticker", callback_data="oi_change_menu")],
             [InlineKeyboardButton("📊 OI Menu", callback_data="menu_oi"), BACK_BTN]
@@ -18213,7 +18246,7 @@ async def oi_change_chart_live_view(query, ticker):
     except Exception as e:
         log.error(f"Failed to send live OI chart: {e}")
         await query.message.reply_text(f"❌ Failed to send chart: {e}", reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
-    
+
     try: await _loading.delete()
     except Exception: pass
 
