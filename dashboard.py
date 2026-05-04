@@ -290,23 +290,29 @@ def _get_ah_price(ticker: str) -> dict:
             reg = float(getattr(fi, "regular_market_previous_close", 0) or 0)
         result["spot_reg"] = reg
 
-        post = float(getattr(fi, "post_market_price", 0) or 0)
-        pre  = float(getattr(fi, "pre_market_price", 0) or 0)
+        post = 0.0; pre = 0.0
+        try:
+            _di = yf.Ticker(ticker).info
+            post = float(_di.get("postMarketPrice") or 0)
+            pre  = float(_di.get("preMarketPrice") or 0)
+        except Exception:
+            pass
         last = float(getattr(fi, "last_price", 0) or 0)
 
         if post > 0:
-            result["spot_ah"]      = post
-            result["is_extended"]  = True
-            result["label"]        = "AH"
+            result["spot_ah"]     = post
+            result["is_extended"] = True
+            result["label"]       = "AH"
         elif pre > 0:
-            result["spot_ah"]      = pre
-            result["is_extended"]  = True
-            result["label"]        = "PM"
-        elif last > 0:
-            result["spot_ah"]      = last
-            result["label"]        = "Live"
+            result["spot_ah"]     = pre
+            result["is_extended"] = True
+            result["label"]       = "PM"
+        elif last > 0 and reg > 0 and abs(last - reg) / reg > 0.0005:
+            result["spot_ah"]     = last
+            result["is_extended"] = True
+            result["label"]       = "Live"
         else:
-            result["spot_ah"]      = reg
+            result["spot_ah"]     = reg
 
         if reg > 0:
             result["ah_chg_pct"] = (result["spot_ah"] - reg) / reg * 100
@@ -7788,7 +7794,7 @@ reveals where smart money is building or liquidating positions.
             f"Hedge %: {_hedge_pct}%"
         )
         fig.add_annotation(
-            xref="x1 domain", yref="y1 domain", x=0.01, y=0.02,
+            xref="x domain", yref="y domain", x=0.01, y=0.02,
             text=_oi_box, showarrow=False,
             font=dict(size=8, color="#1a2332"),
             bgcolor="rgba(255,245,180,0.92)", bordercolor="#aaa", borderwidth=1,

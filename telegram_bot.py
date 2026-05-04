@@ -1,4 +1,4 @@
-﻿async def group_stock_detail(query, ticker):
+async def group_stock_detail(query, ticker):
     """Show all open option positions for a stock with per-leg advice (close vs keep)."""
     conn = get_conn()
     try:
@@ -12687,31 +12687,38 @@ def _get_spot_with_ah(ticker: str) -> dict:
     """
     result = {"spot_reg": 0.0, "spot_ext": 0.0, "ext_src": "EOD", "ext_chg_pct": 0.0, "is_extended": False}
     try:
-        tkr = yf.Ticker(ticker)
-        fi = tkr.fast_info
-        reg = float(fi.get("regularMarketPrice") or fi.get("lastPrice") or 0)
-        post = float(fi.get("postMarketPrice") or 0)
-        pre  = float(fi.get("preMarketPrice") or 0)
+        tkr  = yf.Ticker(ticker)
+        fi   = tkr.fast_info
+        # fast_info has no pre/post market — use fast_info for reg, info for AH
+        reg  = float(getattr(fi, "regular_market_previous_close", 0) or
+                     getattr(fi, "last_price", 0) or 0)
         if reg <= 0:
             h = tkr.history(period="5d")
             reg = float(h["Close"].iloc[-1]) if len(h) >= 1 else 0.0
         result["spot_reg"] = reg
+        # Get post/pre market from info (camelCase keys)
+        try:
+            info = tkr.info
+            post = float(info.get("postMarketPrice") or 0)
+            pre  = float(info.get("preMarketPrice") or 0)
+        except Exception:
+            post = pre = 0.0
         if post > 0:
             result["spot_ext"] = post
-            result["ext_src"] = "Post-mkt"
+            result["ext_src"]  = "Post-mkt"
             result["is_extended"] = True
         elif pre > 0:
             result["spot_ext"] = pre
-            result["ext_src"] = "Pre-mkt"
+            result["ext_src"]  = "Pre-mkt"
             result["is_extended"] = True
         else:
             result["spot_ext"] = reg
-            result["ext_src"] = "EOD close"
+            result["ext_src"]  = "EOD close"
         if reg > 0:
             result["ext_chg_pct"] = (result["spot_ext"] - reg) / reg * 100
     except Exception:
         try:
-            h = yf.Ticker(ticker).history(period="5d", prepost=True)
+            h = yf.Ticker(ticker).history(period="5d")
             if len(h) >= 1:
                 result["spot_reg"] = float(h["Close"].iloc[-1])
                 result["spot_ext"] = result["spot_reg"]
@@ -16094,9 +16101,9 @@ async def mean_rev_detail(query, ticker):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Inst. Signals", callback_data=f"inst_sig_{tk}"),
          InlineKeyboardButton("OI Rolls",      callback_data=f"oi_roll_{tk}")],
-        [InlineKeyboardButton("📐 Tech",        callback_data=f"tech_sig_{tk}"),
+        [InlineKeyboardButton("📅 OI Build",   callback_data=f"oi_build_{tk}"),
          InlineKeyboardButton("MiroFish",       callback_data=f"miro_ticker_{tk}")],
-        [BACK_BTN],
+        [InlineKeyboardButton("📐 Tech",        callback_data=f"tech_sig_{tk}"), BACK_BTN],
     ])
     await query.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=kb)
 
@@ -17287,11 +17294,20 @@ async def oi_detail(query, ticker):
     except Exception: pass
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 OI Change Chart", callback_data=f"oi_change_{ticker}"),
-         InlineKeyboardButton("🤖 MiroFish", callback_data=f"miro_ticker_{ticker}")],
-        [InlineKeyboardButton("📊 OI Overview", callback_data="menu_oi"), BACK_BTN],
+        [InlineKeyboardButton("📅 OI Build",      callback_data=f"oi_build_{ticker}"),
+         InlineKeyboardButton("📊 OI Change Chart", callback_data=f"oi_change_{ticker}")],
+        [InlineKeyboardButton("🤖 MiroFish",      callback_data=f"miro_ticker_{ticker}"),
+         InlineKeyboardButton("📊 OI Overview",   callback_data="menu_oi")],
+        [BACK_BTN],
     ])
-    await query.message.reply_text(msg, parse_mode=H, reply_markup=kb)
+    try:
+        await query.message.reply_text(msg[:4000], parse_mode=H, reply_markup=kb)
+    except Exception as _e:
+        log.warning(f"oi_detail send failed: {_e}")
+        try:
+            await query.message.reply_text(msg[:2000], parse_mode=H, reply_markup=kb)
+        except Exception:
+            await query.message.reply_text(f"OI data loaded for {ticker}.", reply_markup=kb)
 
 
 async def oi_compare_select_expiry(query, ctx, step=1):
@@ -17436,216 +17452,203 @@ def _get_prev_trade_date(trade_date_str):
 
 
 def _generate_oi_change_chart(ticker, today_date, prev_date):
-    """Generate OI change chart for next 2 expiries comparing prev vs today"""
+    """EOD vs EOD OI chart — 2-panel per expiry: OI profile (top) + delta bars (bottom) + OI walls."""
     conn = get_conn()
-    
-    # Get next 2 expiries for this ticker
     try:
-        # Sort expiry_date chronologically (MM-DD-YYYY format)
+        from datetime import datetime as _dt_exp
+        _today_dt = _dt_exp.now()
         expiries_df = pd.read_sql("""
-            SELECT DISTINCT expiry_date FROM options_daily 
+            SELECT DISTINCT expiry_date FROM options_daily
             WHERE ticker = ? AND trade_date = ?
+            AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
+                > substr(?,7,4)||substr(?,1,2)||substr(?,4,2)
             ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
-        """, conn, params=(ticker.upper(), today_date))
-        all_expiries = expiries_df["expiry_date"].tolist()[:2]  # Only next 2
+        """, conn, params=(ticker.upper(), today_date, today_date, today_date))
+        all_expiries = expiries_df["expiry_date"].tolist()[:3]
     except Exception as e:
         log.warning(f"Failed to fetch expiries for {ticker}: {e}")
         conn.close()
         return None
-    
-    if len(all_expiries) < 1:
+
+    if not all_expiries:
         conn.close()
         return None
-    
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    import matplotlib.patches as mpatches
+
+    n = len(all_expiries)
+    fig = plt.figure(figsize=(12, 7 * n), facecolor="#0D1117")
+    outer_gs = gridspec.GridSpec(n, 1, figure=fig, hspace=0.50)
+
     try:
-        import matplotlib
-        matplotlib.use('Agg')  # Use non-interactive backend
-        import matplotlib.pyplot as plt
-        
-        fig, axes = plt.subplots(len(all_expiries), 1, figsize=(10, 5 * len(all_expiries)), squeeze=False)
-        
-        for idx, expiry in enumerate(all_expiries):
-            ax = axes[idx, 0]
-            
-            # Fetch today's OI
-            df_today = pd.read_sql("""
-                SELECT strike, openInt_Call, openInt_Put
-                FROM options_daily
-                WHERE ticker = ? AND trade_date = ? AND expiry_date = ?
-                ORDER BY strike
-            """, conn, params=(ticker.upper(), today_date, expiry))
-            
-            # Fetch yesterday's OI
-            df_prev = pd.read_sql("""
-                SELECT strike, openInt_Call AS openInt_Call_prev, openInt_Put AS openInt_Put_prev
-                FROM options_daily
-                WHERE ticker = ? AND trade_date = ? AND expiry_date = ?
-                ORDER BY strike
-            """, conn, params=(ticker.upper(), prev_date, expiry))
-            
-            if df_today.empty:
-                ax.text(0.5, 0.5, f"No data for {expiry}", ha='center', va='center')
-                ax.set_title(f"{expiry} - No Data")
-                continue
-            
-            # Merge and calculate changes
-            df = df_today.merge(df_prev, on="strike", how="left")
-            df["openInt_Call_prev"] = df["openInt_Call_prev"].fillna(0)
-            df["openInt_Put_prev"] = df["openInt_Put_prev"].fillna(0)
-            df["call_oi_change"] = df["openInt_Call"] - df["openInt_Call_prev"]
-            df["put_oi_change"] = df["openInt_Put"] - df["openInt_Put_prev"]
-            
-            # Plot
-            strikes = df["strike"].values
-            if len(strikes) < 2:
-                ax.text(0.5, 0.5, "Insufficient strike data", ha='center', va='center')
-                ax.set_title(f"{ticker} - Expiry: {expiry} - No Data")
-                continue
-            # Adaptive bar width — 40% of strike spacing so bars don't touch
-            width = float(strikes[1] - strikes[0]) * 0.40
+        _kl = _oi_key_levels(ticker, conn, today_date)
+    except Exception:
+        _kl = {}
 
-            # ── Bars: light = yesterday, dark = today ──────────────────
-            ax.bar(strikes,  df["openInt_Call_prev"], width=width, alpha=0.22,
-                   color='#43A047', label='Calls Yesterday')
-            ax.bar(strikes, -df["openInt_Put_prev"],  width=width, alpha=0.22,
-                   color='#E53935', label='Puts Yesterday')
-            ax.bar(strikes,  df["openInt_Call"],      width=width, alpha=0.80,
-                   color='#1B5E20', label='Calls Today')
-            ax.bar(strikes, -df["openInt_Put"],       width=width, alpha=0.80,
-                   color='#B71C1C', label='Puts Today')
+    try:
+        _spot = float(yf.Ticker(ticker).history(period="2d")["Close"].iloc[-1])
+    except Exception:
+        _spot = None
 
-            ax.axhline(y=0, color='#555', linestyle='-', linewidth=0.8)
+    for idx, expiry in enumerate(all_expiries):
+        inner_gs = gridspec.GridSpecFromSubplotSpec(
+            2, 1, subplot_spec=outer_gs[idx], height_ratios=[2.8, 1.2], hspace=0.06)
+        ax_top = fig.add_subplot(inner_gs[0])
+        ax_bot = fig.add_subplot(inner_gs[1])
 
-            # ── Legend explaining bar colors ──────────────────────────
-            ax.legend(loc='upper left', fontsize=7, ncol=2, framealpha=0.85,
-                      title="▐ Green=Calls  Red=Puts  Dark=Today  Faded=Yesterday",
-                      title_fontsize=6.5)
-            ax.grid(True, alpha=0.20, axis='y')
+        df_today = pd.read_sql("""SELECT strike, openInt_Call, openInt_Put FROM options_daily
+            WHERE ticker=? AND trade_date=? AND expiry_date=? ORDER BY strike""",
+            conn, params=(ticker.upper(), today_date, expiry))
+        df_prev = pd.read_sql("""SELECT strike, openInt_Call AS call_prev, openInt_Put AS put_prev
+            FROM options_daily WHERE ticker=? AND trade_date=? AND expiry_date=? ORDER BY strike""",
+            conn, params=(ticker.upper(), prev_date, expiry))
 
-            # ── Metrics ───────────────────────────────────────────────
-            total_call_chg = df["call_oi_change"].sum()
-            total_put_chg  = df["put_oi_change"].sum()
-            total_call_oi  = df["openInt_Call"].sum()
-            total_put_oi   = df["openInt_Put"].sum()
-            call_pct_chg = (total_call_chg / df["openInt_Call_prev"].sum() * 100) if df["openInt_Call_prev"].sum() > 0 else 0
-            put_pct_chg  = (total_put_chg  / df["openInt_Put_prev"].sum()  * 100) if df["openInt_Put_prev"].sum()  > 0 else 0
-            pcr_today = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0
+        for ax in [ax_top, ax_bot]:
+            ax.set_facecolor("#161B22")
+            ax.tick_params(colors="#8B949E")
+            for sp in ax.spines.values():
+                sp.set_color("#30363D")
 
-            # ── Intent signal ──────────────────────────────────────────
-            try:
-                _spot = float(yf.Ticker(ticker).history(period="2d")["Close"].iloc[-1])
-            except Exception:
-                _spot = None
+        if df_today.empty:
+            ax_top.text(0.5, 0.5, f"No data for {expiry}", ha="center", va="center", color="white")
+            ax_bot.set_visible(False)
+            continue
 
-            if _spot and len(df) >= 2:
-                df["call_oi_change"] = df["call_oi_change"]
-                df["put_oi_change"]  = df["put_oi_change"]
-                _, _isig, _isc, _idesc, _idet = _oi_intent_algo(df, _spot)
-                hedge_pct = _idet.get("hedge_pct", 0)
-            else:
-                _isig, _isc = _oi_signal_light(total_call_chg, total_put_chg, pcr_today)
-                _idesc = ""
-                hedge_pct = 0
+        df = df_today.merge(df_prev, on="strike", how="left")
+        for col in ["call_prev", "put_prev", "openInt_Call", "openInt_Put"]:
+            df[col] = pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0)
+        df["call_delta"] = df["openInt_Call"] - df["call_prev"]
+        df["put_delta"]  = df["openInt_Put"]  - df["put_prev"]
 
-            # Plain-English signal descriptions
-            _signal_plain = {
-                "BULLISH":       "Buyers are adding call positions — bullish bet on a price rise.",
-                "MILD BULL":     "Slightly more calls than puts — modest bullish lean, not aggressive.",
-                "BEARISH":       "Puts being added near current price — traders betting on a drop.",
-                "MILD BEAR":     "Slight put bias — watch for more selling to confirm.",
-                "HEDGED BULL":   "Institutions buying calls AND deep puts — they own the stock and are protecting it. Not a bearish signal.",
-                "STRADDLE":      "Both calls and puts growing at ATM — traders expect a BIG move but don't know which direction (could be earnings/event).",
-                "COVERED_CALL":  "Far-OTM calls being written — likely stock owners selling covered calls for income. Capped upside.",
-                "BULLISH_BREAK": "OTM call build — traders speculating on a breakout above current price.",
-                "NEAR_BEARISH":  "Near-OTM puts accumulating — directional shorts positioning for a modest drop.",
-                "HEDGE":         "Deep-OTM puts added — institutional portfolio protection. This is NOT a directional short bet.",
-                "HEDGE_UNWIND":  "Deep put hedges being removed — institutions feel less need for protection. Mildly bullish signal.",
-                "UNWIND":        "Both calls and puts declining — positions being closed, low conviction on either side.",
-                "QUIET":         "Very little OI change — market has no strong view on this expiry.",
-                "NEUTRAL":       "Activity is balanced — no clear directional edge from options market.",
-            }
-            plain_desc = _signal_plain.get(_isig, _idesc or _isig)
+        strikes = df["strike"].values
+        if len(strikes) < 2:
+            ax_top.text(0.5, 0.5, "Insufficient data", ha="center", va="center", color="white")
+            ax_bot.set_visible(False)
+            continue
+        wd = float(strikes[1] - strikes[0]) * 0.38
 
-            # ── Title ──────────────────────────────────────────────────
-            ax.set_title(
-                f"{ticker}  |  Expiry: {expiry}  |  Spot: ${_spot:.2f}" if _spot else f"{ticker}  |  Expiry: {expiry}",
-                fontsize=10, fontweight="bold"
-            )
-            ax.set_ylabel("Open Interest  (↑ Calls, ↓ Puts)")
+        # TOP: OI profile
+        ax_top.bar(strikes - wd*0.5, df["call_prev"],    wd*0.9, alpha=0.22, color="#3FB950", label=f"Calls {prev_date}")
+        ax_top.bar(strikes - wd*0.5, -df["put_prev"],    wd*0.9, alpha=0.22, color="#F85149", label=f"Puts {prev_date}")
+        ax_top.bar(strikes + wd*0.5, df["openInt_Call"], wd*0.9, alpha=0.82, color="#3FB950", label=f"Calls {today_date}")
+        ax_top.bar(strikes + wd*0.5, -df["openInt_Put"], wd*0.9, alpha=0.82, color="#F85149", label=f"Puts {today_date}")
+        ax_top.axhline(0, color="#484F58", linewidth=0.8)
 
-            # Strike labels on x-axis
-            _step = max(1, len(strikes) // 14)
-            ax.set_xticks(strikes[::_step])
-            ax.set_xticklabels([f"${s:.0f}" for s in strikes[::_step]],
-                               rotation=45, ha='right', fontsize=7)
-            ax.set_xlabel('Strike Price', fontsize=8)
-            ax.set_xlim(strikes[0] - width * 2.5, strikes[-1] + width * 2.5)
-            # Autoscale y-axis: data-driven min/max with 15% padding
-            _y_vals = list(df["openInt_Call"]) + list(df["openInt_Call_prev"]) + \
-                      list(-df["openInt_Put"]) + list(-df["openInt_Put_prev"])
-            _y_pos = max((v for v in _y_vals if v >= 0), default=1)
-            _y_neg = min((v for v in _y_vals if v <= 0), default=-1)
-            ax.set_ylim(_y_neg * 1.18, _y_pos * 1.18)
-            ax.yaxis.set_major_formatter(
-                plt.FuncFormatter(lambda x, _: f"{abs(x)/1000:.0f}K" if abs(x) >= 1000 else f"{x:.0f}"))
+        # OI Walls
+        wall_handles = []
+        if _kl:
+            cw = _kl.get("call_wall", 0); pw = _kl.get("put_wall", 0)
+            mp = _kl.get("max_pain", 0);  gws = _kl.get("gamma_walls", [])
+            for axw in [ax_top, ax_bot]:
+                if cw > 0: axw.axvline(cw, color="#3FB950", linewidth=1.5, linestyle=":",  alpha=0.9)
+                if pw > 0: axw.axvline(pw, color="#F85149", linewidth=1.5, linestyle=":",  alpha=0.9)
+                if mp > 0: axw.axvline(mp, color="#FFD700", linewidth=1.8, linestyle="--", alpha=0.9)
+                for gw in gws[:2]: axw.axvline(gw, color="#BB86FC", linewidth=1.1, linestyle="-.", alpha=0.7)
+            if cw > 0: wall_handles.append(mpatches.Patch(color="#3FB950", label=f"CWall ${cw:.0f}"))
+            if pw > 0: wall_handles.append(mpatches.Patch(color="#F85149", label=f"PWall ${pw:.0f}"))
+            if mp > 0: wall_handles.append(mpatches.Patch(color="#FFD700", label=f"MaxPain ${mp:.0f}"))
+            if gws:    wall_handles.append(mpatches.Patch(color="#BB86FC", label="Gamma Wall"))
 
-            # ── Bottom-left stats box ──────────────────────────────────
-            _c_arrow = "▲" if total_call_chg > 0 else ("▼" if total_call_chg < 0 else "→")
-            _p_arrow = "▲" if total_put_chg  > 0 else ("▼" if total_put_chg  < 0 else "→")
-            _pcr_note = "Bearish lean" if pcr_today > 1.3 else ("Bullish lean" if pcr_today < 0.7 else "Neutral")
-            _hedge_line = f"\nHedge flow: {hedge_pct:.0f}% of put OI" if hedge_pct > 20 else ""
-            ax.text(0.01, 0.02,
-                    f"TODAY vs YESTERDAY\n"
-                    f"Calls {_c_arrow} {total_call_chg:+,.0f}  ({call_pct_chg:+.1f}%)\n"
-                    f"Puts  {_p_arrow} {total_put_chg:+,.0f}  ({put_pct_chg:+.1f}%)\n"
-                    f"PCR: {pcr_today:.2f}  ({_pcr_note}){_hedge_line}",
-                    transform=ax.transAxes, va="bottom", fontsize=7.5,
-                    bbox=dict(boxstyle="round,pad=0.4", facecolor="#FFFDE7",
-                              edgecolor="#F9A825", alpha=0.92))
+        if _spot:
+            ax_top.axvline(_spot, color="#58A6FF", linewidth=1.8, linestyle="--", alpha=0.9, label=f"Spot ${_spot:.1f}")
+            ax_top.axvspan(_spot*0.97, _spot*1.03, alpha=0.07, color="#58A6FF")
+            ax_bot.axvline(_spot, color="#58A6FF", linewidth=1.4, linestyle="--", alpha=0.8)
+            ax_bot.axvspan(_spot*0.97, _spot*1.03, alpha=0.07, color="#58A6FF")
 
-            # ── Suggested strategy box (bottom-right) ─────────────────
-            _strat_map = {
-                "BULLISH":      "Strategies:\n• Long Call\n• Bull Call Spread\n• Sell Cash-Secured Put",
-                "MILD BULL":    "Strategies:\n• Bull Call Spread\n• Sell OTM Put\n• Covered Call write",
-                "BEARISH":      "Strategies:\n• Long Put\n• Bear Put Spread\n• Short Call (OTM)",
-                "MILD BEAR":    "Strategies:\n• Bear Put Spread\n• Sell OTM Call\n• Protective Put",
-                "HEDGED BULL":  "Strategies:\n• Hold with hedge\n• Sell covered call for income",
-                "STRADDLE":     "Strategies:\n• Long Straddle (ATM)\n• Long Strangle (OTM)\n• Calendar Spread",
-                "COVERED_CALL": "Strategies:\n• Covered Call write\n• Sell near-ATM call\n• Collar",
-                "BULLISH_BREAK":"Strategies:\n• OTM Call Debit Spread\n• Long Call (breakout bet)",
-                "NEAR_BEARISH": "Strategies:\n• Near-ATM Put\n• Bear Put Spread\n• Risk Reversal",
-                "HEDGE":        "Strategies:\n• Ignore put flow (hedge)\n• Stay with long bias\n• Sell puts for income",
-                "UNWIND":       "Strategies:\n• Wait for new direction\n• Small Iron Condor\n• Reduce size",
-                "NEUTRAL":      "Strategies:\n• Iron Condor\n• Butterfly\n• Calendar Spread",
-            }
-            _strat_txt = _strat_map.get(_isig, "Strategies:\n• Iron Condor\n• Butterfly")
-            ax.text(0.99, 0.02, _strat_txt,
-                    transform=ax.transAxes, va="bottom", ha="right",
-                    fontsize=7.0,
-                    bbox=dict(boxstyle="round,pad=0.4", facecolor="#E8F5E9",
-                              edgecolor="#388E3C", alpha=0.92))
+        # Signal
+        total_call_chg = df["call_delta"].sum(); total_put_chg = df["put_delta"].sum()
+        total_call_oi  = df["openInt_Call"].sum(); total_put_oi = df["openInt_Put"].sum()
+        pcr = total_put_oi / max(total_call_oi, 1)
+        if _spot and len(df) >= 2:
+            _df_sig = df.rename(columns={"call_delta": "call_oi_change", "put_delta": "put_oi_change"})
+            _, _sig, _sc, _sdesc, _dets = _oi_intent_algo(_df_sig, _spot)
+            hedge_pct = _dets.get("hedge_pct", 0)
+        else:
+            _sig, _sc = _oi_signal_light(total_call_chg, total_put_chg, pcr)
+            _sdesc = ""; hedge_pct = 0
+        _sig_plain = {
+            "BULLISH": "Call buyers dominating — bullish positioning.",
+            "MILD BULL": "Slightly more calls — modest bullish lean.",
+            "BEARISH": "Put buyers dominating — bearish/hedge positioning.",
+            "MILD BEAR": "Slight put bias — watch for confirmation.",
+            "HEDGED BULL": "Calls + deep puts — institutions protecting longs.",
+            "STRADDLE": "Both calls and puts rising — event vol play.",
+            "HEDGE": "Deep OTM put build — protective, not directional.",
+            "UNWIND": "Positions closing — wait for fresh signal.",
+        }
+        _sdesc = _sig_plain.get(_sig, _sdesc or _sig)
 
-            # ── Top-right signal box — plain English ───────────────────
-            ax.text(0.99, 0.98,
-                    f"SIGNAL: {_isig}\n{'─'*30}\n{plain_desc}",
-                    transform=ax.transAxes, va="top", ha="right",
-                    fontsize=7.5, fontweight="bold", color="white",
-                    wrap=True,
-                    bbox=dict(boxstyle="round,pad=0.5", facecolor=_isc,
-                              edgecolor="white", alpha=0.93))
+        ax_top.set_title(
+            f"{ticker}  |  {expiry}  |  {prev_date} → {today_date}"
+            + (f"  |  Spot ${_spot:.1f}" if _spot else ""),
+            fontsize=10, fontweight="bold", color="#E6EDF3", pad=5)
+        ax_top.set_ylabel("Open Interest", color="#8B949E", fontsize=8)
+        ax_top.set_xlim(strikes[0] - wd*3, strikes[-1] + wd*3)
+        _yv = list(df["openInt_Call"]) + list(df["call_prev"]) + list(-df["openInt_Put"]) + list(-df["put_prev"])
+        ax_top.set_ylim(min(_yv + [-1])*1.22, max(_yv + [1])*1.22)
+        ax_top.yaxis.set_major_formatter(plt.FuncFormatter(
+            lambda x, _: f"{abs(x)/1000:.0f}K" if abs(x) >= 1000 else f"{x:.0f}"))
+        ax_top.tick_params(labelbottom=False)
+        ax_top.grid(True, alpha=0.12, axis="y", color="#30363D")
 
-        plt.tight_layout()
-        buf = BytesIO()
-        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-        plt.close(fig)
-        buf.seek(0)
-        conn.close()
-        return buf
-        
-    except Exception as e:
-        log.error(f"OI chart generation error for {ticker}: {e}")
-        conn.close()
-        return None
+        _leg_h, _leg_l = ax_top.get_legend_handles_labels()
+        ax_top.legend(_leg_h + wall_handles, _leg_l + [h.get_label() for h in wall_handles],
+                      loc="upper left", fontsize=6, ncol=2, framealpha=0.85,
+                      facecolor="#21262D", edgecolor="#30363D", labelcolor="#E6EDF3")
+
+        c_prev = df["call_prev"].sum(); p_prev = df["put_prev"].sum()
+        c_pct = total_call_chg / max(c_prev, 1) * 100
+        p_pct = total_put_chg  / max(p_prev, 1) * 100
+        c_ar = "▲" if total_call_chg > 0 else "▼"
+        p_ar = "▲" if total_put_chg  > 0 else "▼"
+        ax_top.text(0.01, 0.03,
+            f"Call dOI {c_ar} {total_call_chg:+,.0f} ({c_pct:+.1f}%)\n"
+            f"Put  dOI {p_ar} {total_put_chg:+,.0f} ({p_pct:+.1f}%)\n"
+            f"PCR: {pcr:.2f}" + (f"  Hedge:{hedge_pct:.0f}%" if hedge_pct > 15 else ""),
+            transform=ax_top.transAxes, va="bottom", fontsize=7.5, color="#E6EDF3",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="#21262D", edgecolor="#F9A825", alpha=0.92))
+        ax_top.text(0.99, 0.97, f"SIGNAL: {_sig}\n{chr(8212)*22}\n{_sdesc[:60]}",
+            transform=ax_top.transAxes, va="top", ha="right",
+            fontsize=7.5, fontweight="bold", color="white",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor=_sc, edgecolor="white", alpha=0.93))
+
+        # BOTTOM: Delta bars
+        _cc = ["#3FB950" if v >= 0 else "#6E7681" for v in df["call_delta"]]
+        _pc = ["#F85149" if v >= 0 else "#6E7681" for v in df["put_delta"]]
+        ax_bot.bar(strikes - wd*0.5, df["call_delta"],  wd*0.9, color=_cc, alpha=0.85)
+        ax_bot.bar(strikes + wd*0.5, -df["put_delta"],  wd*0.9, color=_pc, alpha=0.85)
+        ax_bot.axhline(0, color="#484F58", linewidth=0.8)
+        ax_bot.set_xlabel("Strike Price", fontsize=8, color="#8B949E")
+        ax_bot.set_ylabel("dOI", fontsize=8, color="#8B949E")
+        ax_bot.set_xlim(strikes[0] - wd*3, strikes[-1] + wd*3)
+        ax_bot.yaxis.set_major_formatter(plt.FuncFormatter(
+            lambda x, _: f"{abs(x)/1000:.0f}K" if abs(x) >= 1000 else f"{x:.0f}"))
+        _step = max(1, len(strikes) // 14)
+        ax_bot.set_xticks(strikes[::_step])
+        ax_bot.set_xticklabels([f"${s:.0f}" for s in strikes[::_step]],
+                               rotation=45, ha="right", fontsize=7, color="#8B949E")
+        ax_bot.grid(True, alpha=0.12, axis="y", color="#30363D")
+        _bot_handles = [
+            mpatches.Patch(color="#3FB950", label="Call dOI+"),
+            mpatches.Patch(color="#F85149", label="Put dOI+"),
+            mpatches.Patch(color="#6E7681", label="OI Removed"),
+            mpatches.Patch(color="#58A6FF", label="Spot"),
+        ] + wall_handles
+        ax_bot.legend(handles=_bot_handles,
+            loc="upper right", fontsize=6, ncol=4, framealpha=0.85,
+            facecolor="#21262D", edgecolor="#30363D", labelcolor="#E6EDF3")
+    fig.patch.set_facecolor("#0D1117")
+    plt.tight_layout(pad=1.2)
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight", facecolor="#0D1117")
+    plt.close(fig)
+    buf.seek(0)
+    conn.close()
+    return buf
 
 
 async def oi_change_ticker_menu(query):
@@ -18010,10 +18013,34 @@ def _generate_live_vs_eod_chart(ticker, live_data_list, eod_date):
                 ax_main.axvline(spot, color="#FFD600", linewidth=1.4, linestyle="--", label=f"Spot ${spot:.1f}")
                 ax_main.axvspan(0, spot*0.90, alpha=0.04, color="#1565C0")
 
+            # OI Walls vertical lines
+            try:
+                _kl_lv = _oi_key_levels(ticker, conn, eod_date)
+                if _kl_lv:
+                    _cw2 = _kl_lv.get("call_wall", 0)
+                    _pw2 = _kl_lv.get("put_wall", 0)
+                    _mp2 = _kl_lv.get("max_pain", 0)
+                    _gw2 = _kl_lv.get("gamma_walls", [])
+                    if _cw2 > 0:
+                        ax_main.axvline(_cw2, color="#00C853", linewidth=1.5, linestyle=":", alpha=0.9, label=f"CWall ${_cw2:.0f}")
+                        ax_delta.axvline(_cw2, color="#00C853", linewidth=1.2, linestyle=":", alpha=0.8)
+                    if _pw2 > 0:
+                        ax_main.axvline(_pw2, color="#FF1744", linewidth=1.5, linestyle=":", alpha=0.9, label=f"PWall ${_pw2:.0f}")
+                        ax_delta.axvline(_pw2, color="#FF1744", linewidth=1.2, linestyle=":", alpha=0.8)
+                    if _mp2 > 0:
+                        ax_main.axvline(_mp2, color="#FFD600", linewidth=1.8, linestyle="--", alpha=0.9, label=f"MaxPain ${_mp2:.0f}")
+                        ax_delta.axvline(_mp2, color="#FFD600", linewidth=1.4, linestyle="--", alpha=0.8)
+                    for _gw in _gw2[:2]:
+                        ax_main.axvline(_gw, color="#BB86FC", linewidth=1.1, linestyle="-.", alpha=0.7)
+                        ax_delta.axvline(_gw, color="#BB86FC", linewidth=1.0, linestyle="-.", alpha=0.6)
+            except Exception:
+                pass
+
             ax_main.set_title(f"{ticker}  |  Expiry: {expiry}  |  LIVE vs EOD {eod_date}", fontsize=11, fontweight="bold")
             ax_main.set_ylabel("Open Interest")
             ax_main.set_xlim(strikes[0] - wd * 2.5, strikes[-1] + wd * 2.5)
-            ax_main.legend(loc="upper left", fontsize=7, ncol=2, framealpha=0.75)
+            ax_main.legend(loc="upper left", fontsize=7, ncol=2, framealpha=0.85,
+                           facecolor="#21262D", edgecolor="#30363D", labelcolor="#E6EDF3")
             ax_main.yaxis.set_major_formatter(
                 plt.FuncFormatter(lambda x, _: f"{abs(x)/1000:.0f}K" if abs(x) >= 1000 else f"{x:.0f}"))
             ax_main.grid(True, alpha=0.25, axis="y")
@@ -18064,9 +18091,18 @@ def _generate_live_vs_eod_chart(ticker, live_data_list, eod_date):
             ax_delta.grid(True, alpha=0.2, axis="y")
             _IC = {"BULLISH":"#2E7D32","BEARISH":"#C62828","HEDGE":"#1565C0",
                    "NEAR_BEARISH":"#BF360C","STRADDLE":"#6A1B9A",
-                   "COVERED_CALL":"#F57F17","BULLISH_BREAK":"#388E3C","UNWIND":"#757575"}
-            ax_delta.legend(handles=[mpatches.Patch(color=c, label=l) for l,c in _IC.items()],
-                            loc="lower right", fontsize=6, ncol=4, framealpha=0.8)
+                   "COVERED_CALL":"#F57F17","BULLISH_BREAK":"#388E3C","UNWIND":"#757575",
+                   "MILD BULL":"#43A047","MILD BEAR":"#E53935","HEDGED BULL":"#0288D1"}
+            # Add wall color patches
+            _wall_patches = [
+                mpatches.Patch(color="#00C853", linestyle=":", label="Call Wall"),
+                mpatches.Patch(color="#FF1744", linestyle=":", label="Put Wall"),
+                mpatches.Patch(color="#FFD600", linestyle="--", label="Max Pain"),
+            ]
+            ax_delta.legend(
+                handles=[mpatches.Patch(color=c, label=l) for l,c in _IC.items()] + _wall_patches,
+                loc="lower right", fontsize=6, ncol=4, framealpha=0.85,
+                facecolor="#21262D", edgecolor="#30363D", labelcolor="#E6EDF3")
 
         plt.tight_layout(pad=1.5)
         buf = BytesIO()
@@ -18662,14 +18698,104 @@ async def signal_ticker_detail(query, ticker):
         [InlineKeyboardButton("📊 OI Rolls",     callback_data=f"oi_roll_{tk}"),
          InlineKeyboardButton("📡 Inst Signals", callback_data=f"inst_sig_{tk}")],
         [InlineKeyboardButton("📈 Mean Rev",     callback_data=f"mean_rev_{tk}"),
-         InlineKeyboardButton("🔄 Refresh",      callback_data=f"sigtk_{tk}")],
-        [InlineKeyboardButton("🔥 Back to Signals", callback_data="menu_signals"), BACK_BTN],
+         InlineKeyboardButton("📅 OI Build",     callback_data=f"oi_build_{tk}")],
+        [InlineKeyboardButton("🔄 Refresh",      callback_data=f"sigtk_{tk}"),
+         InlineKeyboardButton("🔥 Signals",      callback_data="menu_signals")],
+        [BACK_BTN],
     ])
     try: await _loading.delete()
     except Exception: pass
     await query.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=kb)
 
 #  7) INSIDER / CONGRESS — table format
+
+async def oi_build_detail(query, ticker):
+    """Multi-day OI accumulation view: sparkline, persistence, conviction, hedge ratio."""
+    tk = str(ticker).upper()
+    _loading = await query.message.reply_text(f"⏳ Analysing {tk} OI buildup…", parse_mode=H)
+    conn = get_conn()
+    try:
+        res = _oi_build_analysis(tk, conn, n_days=20)
+    except Exception as _e:
+        res = {}
+        log.warning(f"oi_build_detail {tk}: {_e}")
+    conn.close()
+
+    if not res:
+        await query.message.reply_text(
+            f"No multi-day OI data for {tk}.",
+            reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
+        try: await _loading.delete()
+        except Exception: pass
+        return
+
+    def _fk(n):
+        n = float(n or 0); s = "+" if n >= 0 else ""
+        a = abs(n)
+        if a >= 1_000_000: return f"{s}{a/1_000_000:.1f}M"
+        if a >= 1_000:     return f"{s}{a/1_000:.0f}K"
+        return f"{s}{n:.0f}"
+
+    bias_em   = "🟢" if res["bias_5d"] == "BULL" else "🔴"
+    conv_lbl  = "HIGH" if res["conviction"] > 15 else ("MED" if res["conviction"] > 5 else "LOW")
+    pcr_em    = "📈" if res["pcr_trend"] == "FALLING" else ("📉" if res["pcr_trend"] == "RISING" else "➡️")
+
+    parts = [
+        hdr(f"📈 {tk} OI BUILD ({res['n_days']}d)"),
+        f"{bias_em} <b>{res['bias_5d']} Bias</b>  [{conv_lbl} conviction {res['conviction']:.1f}%]",
+        "\n<b>10-Day Net OI Flow</b>  <i>(left=old \u2192 right=new)</i>",
+        f"<pre>Net: {res['spark']}</pre>",
+        mono(
+            f"{'5d Call\u0394':<12} {_fk(res['cum5_call']):>9}\n"
+            f"{'5d Put\u0394':<12} {_fk(res['cum5_put']):>9}\n"
+            f"{'PCR 5d':<12} {res['pcr_5d']:>9.3f}\n"
+            f"{'PCR 20d':<12} {res['pcr_20d']:>9.3f}\n"
+            f"{'PCR Trend':<12} {res['pcr_trend']:>9}"
+        ),
+    ]
+
+    if res["conviction"] > 15:
+        parts.append(f"\n💪 <b>HIGH conviction</b> \u2014 {res['bias_5d']} bias, {res['conviction']:.1f}% of base OI moved in 5 days.")
+    elif res["conviction"] > 5:
+        parts.append(f"\n📊 Moderate conviction \u2014 {res['bias_5d']} lean, watch for follow-through.")
+    else:
+        parts.append("\n\u26a0\ufe0f Low conviction \u2014 OI changes are noise-level, no clear institutional direction.")
+
+    if res["hot_calls"]:
+        _hc = "  ".join(f"${sk:.0f}({d}d/{n})" for sk,d,n in res["hot_calls"][:4])
+        parts.append(f"\n<b>🟢 Hot Call Strikes</b>:\n<code>{_hc}</code>")
+    if res["hot_puts"]:
+        _hp = "  ".join(f"${sk:.0f}({d}d/{n})" for sk,d,n in res["hot_puts"][:4])
+        parts.append(f"\n<b>🔴 Hot Put Strikes</b>:\n<code>{_hp}</code>")
+    if not res["hot_calls"] and not res["hot_puts"]:
+        parts.append("\n<i>No persistent strike build \u2014 flow is rotating, not accumulating at fixed strikes.</i>")
+
+    h_lbl = "HIGH \u26a0\ufe0f" if res["hedge_ratio"] > 40 else ("ELEVATED" if res["hedge_ratio"] > 25 else "NORMAL \u2705")
+    _hedge_note = ("Institutions adding protection \u2014 shows strong long base." if res["hedge_ratio"] > 30
+                   else "Normal hedge levels \u2014 no panic hedging detected.")
+    parts.append(
+        f"\n<b>🛡 Hedge Ratio</b>: {res['hedge_ratio']:.1f}% OTM puts  [{h_lbl}]\n"
+        f"<i>{_hedge_note}</i>"
+    )
+
+    if res["daily"]:
+        tbl = [f"{'Date':<10} {'dCall':>7} {'dPut':>7} {'PCR':>5}"]
+        tbl.append("-" * 31)
+        for d in res["daily"][:5]:
+            tbl.append(f"{d['date']:<10} {_fk(d['call_chg']):>7} {_fk(d['put_chg']):>7} {d['pcr']:>5.2f}")
+        parts.append(f"\n<b>Daily OI Flow:</b>\n{mono(chr(10).join(tbl))}")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 OI Detail",    callback_data=f"oi_detail_{tk}"),
+         InlineKeyboardButton("📡 Inst Signals", callback_data=f"inst_sig_{tk}")],
+        [InlineKeyboardButton("🔄 Refresh",      callback_data=f"oi_build_{tk}"),
+         InlineKeyboardButton("📈 Mean Rev",     callback_data=f"mean_rev_{tk}")],
+        [BACK_BTN],
+    ])
+    try: await _loading.delete()
+    except Exception: pass
+    await query.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=kb)
+
 # ═══════════════════════════════════════════════════════════
 async def insider_menu(query):
     kb = InlineKeyboardMarkup([
@@ -20204,6 +20330,108 @@ async def quick_quote(query, ticker):
 
 # Downstream cascade relationships (static knowledge map)
 
+
+def _oi_build_analysis(ticker: str, conn, n_days: int = 20) -> dict:
+    """Multi-day OI accumulation analysis.
+    Returns: sparkline, conviction score, hot strikes (persistent build),
+             hedge ratio, PCR trend, daily flow table.
+    """
+    tk = str(ticker).upper()
+    try:
+        dates_df = pd.read_sql("""SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
+            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            LIMIT ?""", conn, params=(tk, n_days))
+        if len(dates_df) < 3:
+            return {}
+        dates = dates_df["trade_date_now"].tolist()
+
+        # Daily aggregates
+        daily = []
+        for dt in dates:
+            r = pd.read_sql("""SELECT SUM(change_OI_Call) as cc, SUM(change_OI_Put) as pp,
+                SUM(openInt_Call_now) as co, SUM(openInt_Put_now) as po
+                FROM options_change WHERE ticker=? AND trade_date_now=?""", conn, params=(tk, dt))
+            cc = float(r["cc"].iloc[0] or 0); pp = float(r["pp"].iloc[0] or 0)
+            co = float(r["co"].iloc[0] or 0); po = float(r["po"].iloc[0] or 0)
+            daily.append({"date": dt, "call_chg": cc, "put_chg": pp,
+                          "call_oi": co, "put_oi": po,
+                          "net": cc - pp, "pcr": po / max(co, 1)})
+
+        # Sparkline: 10-day net OI (calls-puts) as Unicode bar chart
+        nets = [d["net"] for d in daily]
+        mn, mx = min(nets), max(nets)
+        rng = max(mx - mn, 1)
+        _blocks = " ▁▂▃▄▅▆▇█"
+        spark = "".join(_blocks[max(0, min(8, int((v - mn) / rng * 8)))] for v in reversed(nets[:10]))
+
+        # 5-day conviction
+        base_oi   = daily[0]["call_oi"] + daily[0]["put_oi"]
+        cum5_call = sum(d["call_chg"] for d in daily[:5])
+        cum5_put  = sum(d["put_chg"]  for d in daily[:5])
+        conviction = abs(cum5_call - cum5_put) / max(base_oi, 1) * 100
+        bias_5d = "BULL" if cum5_call > cum5_put else "BEAR"
+
+        # Strike persistence — how many of last 10 days each strike built OI
+        qmarks = ",".join("?" * len(dates[:10]))
+        strike_df = pd.read_sql(f"""
+            SELECT trade_date_now, strike,
+                   SUM(change_OI_Call) as cc, SUM(change_OI_Put) as pp
+            FROM options_change WHERE ticker=? AND trade_date_now IN ({qmarks})
+            GROUP BY trade_date_now, strike""",
+            conn, params=[tk] + dates[:10])
+        strike_df["strike"] = pd.to_numeric(strike_df["strike"], errors="coerce")
+        strike_df["cc"] = pd.to_numeric(strike_df["cc"], errors="coerce").fillna(0)
+        strike_df["pp"] = pd.to_numeric(strike_df["pp"], errors="coerce").fillna(0)
+
+        hot_calls, hot_puts = [], []
+        for sk, grp in strike_df.groupby("strike"):
+            n = len(grp)
+            if n < 3: continue
+            pos_c = int((grp["cc"] > 0).sum())
+            pos_p = int((grp["pp"] > 0).sum())
+            if pos_c >= max(3, int(n * 0.6)): hot_calls.append((float(sk), pos_c, n))
+            if pos_p >= max(3, int(n * 0.6)): hot_puts.append((float(sk), pos_p, n))
+        hot_calls.sort(key=lambda x: -x[1])
+        hot_puts.sort(key=lambda x: -x[1])
+
+        # Hedge ratio: OTM put OI (>5% below spot) / total put OI
+        hedge_ratio = 0.0
+        try:
+            sp_df = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
+                ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1""",
+                conn, params=(tk,))
+            spot = float(sp_df["close"].iloc[0]) if not sp_df.empty else 0
+            if spot > 0:
+                latest = dates[0]
+                otm_df = pd.read_sql("""SELECT SUM(openInt_Put_now) as otm,
+                    (SELECT SUM(openInt_Put_now) FROM options_change WHERE ticker=? AND trade_date_now=?) as tot
+                    FROM options_change WHERE ticker=? AND trade_date_now=? AND CAST(strike AS REAL) < ?""",
+                    conn, params=[tk, latest, tk, latest, spot * 0.95])
+                tot = float(otm_df["tot"].iloc[0] or 0)
+                if tot > 0:
+                    hedge_ratio = float(otm_df["otm"].iloc[0] or 0) / tot * 100
+        except Exception:
+            pass
+
+        # PCR 5d vs 20d
+        pcr_5d  = sum(d["pcr"] for d in daily[:5])  / min(5,  len(daily))
+        pcr_20d = sum(d["pcr"] for d in daily[:20]) / min(20, len(daily))
+        pcr_trend = "RISING" if pcr_5d > pcr_20d * 1.10 else ("FALLING" if pcr_5d < pcr_20d * 0.90 else "STABLE")
+
+        return {
+            "daily": daily, "spark": spark,
+            "conviction": round(conviction, 1), "bias_5d": bias_5d,
+            "cum5_call": cum5_call, "cum5_put": cum5_put,
+            "hot_calls": hot_calls[:5], "hot_puts": hot_puts[:5],
+            "hedge_ratio": round(hedge_ratio, 1),
+            "pcr_5d": round(pcr_5d, 3), "pcr_20d": round(pcr_20d, 3),
+            "pcr_trend": pcr_trend, "n_days": len(dates),
+        }
+    except Exception as e:
+        log.debug(f"_oi_build_analysis {tk}: {e}")
+        return {}
+
+
 def _oi_key_levels(ticker: str, conn, trade_date: str = None) -> dict:
     """OI walls: call_wall, put_wall, max_pain, gamma_walls from options_change."""
     tk = str(ticker).upper()
@@ -20331,7 +20559,7 @@ _DOWNSTREAM_MAP = {
 }
 
 
-def _score_ticker_full(ticker: str, conn, vix_val: float = 20.0) -> dict:
+def _score_ticker_full(ticker: str, conn, vix_val: float = 20.0, fast: bool = False) -> dict:
     """Score ticker 0-100: tech(30) + OI(30) + fundamental(20) + short_interest(20) − VIX."""
     tk = str(ticker).upper()
     try:
@@ -20410,57 +20638,39 @@ def _score_ticker_full(ticker: str, conn, vix_val: float = 20.0) -> dict:
         except Exception:
             pass
 
-        # ── Fundamental score (0-20) ──────────────────────────
+        # ── Fundamental score — use fast_info to avoid slow yf.info call ──
         fund = 10
         try:
-            info = yf.Ticker(tk).info
-            sector_pe_map = {
-                "Technology": 30, "Healthcare": 25, "Financials": 15,
-                "Energy": 12, "Industrials": 20, "Consumer Discretionary": 25,
-                "Communication Services": 22, "Consumer Staples": 22,
-                "Utilities": 18, "Real Estate": 20,
-            }
-            s_pe   = sector_pe_map.get(info.get("sector", ""), 22)
-            fwd_pe = info.get("forwardPE") or 0
-            peg    = info.get("pegRatio")
-            eg     = info.get("earningsGrowth")
-            if fwd_pe > 0:
-                if fwd_pe < s_pe * 0.7:    fund += 10
-                elif fwd_pe < s_pe:        fund += 5
-                elif fwd_pe > s_pe * 1.5:  fund -= 5
-            if peg is not None:
-                if peg < 1:    fund += 8
-                elif peg < 2:  fund += 4
-                elif peg > 3:  fund -= 4
-            if eg is not None:
-                if eg > 0.20:   fund += 8
-                elif eg > 0.10: fund += 4
-                elif eg < 0:    fund -= 4
+            fi = yf.Ticker(tk).fast_info
+            mktcap = fi.get("market_cap") or fi.get("marketCap") or 0
+            if mktcap > 500e9:    fund += 4   # mega-cap premium
+            elif mktcap > 50e9:   fund += 2
+            elif mktcap < 1e9:    fund -= 2   # micro-cap risk
             fund = max(0, min(20, fund))
         except Exception:
             pass
 
-        # ── Short interest score (0-20) ───────────────────────
+        # ── Short interest score (0-20) ─────────────────────
         si_sc      = 5
         short_pct  = 0.0
         squeeze_sc = 0
         dtc        = 0.0
-        try:
-            sd         = _get_short_data(tk)
-            short_pct  = float(sd.get("short_pct_float") or 0)
-            squeeze_sc = int(sd.get("squeeze_score") or 0)
-            dtc        = float(sd.get("short_ratio") or 0)
-            if short_pct >= 20 and macd_bull and rsi < 55:
-                si_sc = 18  # classic squeeze setup
-            elif short_pct >= 10 and macd_bull:
-                si_sc = 12
-            elif short_pct < 3:
-                si_sc = 8   # clean float — no overhang
-            else:
-                si_sc = 5
-        except Exception:
-            pass
-
+        if not fast:
+            try:
+                sd         = _get_short_data(tk)
+                short_pct  = float(sd.get("short_pct_float") or 0)
+                squeeze_sc = int(sd.get("squeeze_score") or 0)
+                dtc        = float(sd.get("short_ratio") or 0)
+                if short_pct >= 20 and macd_bull and rsi < 55:
+                    si_sc = 18
+                elif short_pct >= 10 and macd_bull:
+                    si_sc = 12
+                elif short_pct < 3:
+                    si_sc = 8
+                else:
+                    si_sc = 5
+            except Exception:
+                pass
         # ── VIX environment adjustment ────────────────────────
         vix_adj = (5 if vix_val < 15 else
                    -10 if vix_val > 30 else
@@ -20537,16 +20747,27 @@ async def recommend_engine(query):
         except Exception:
             pass
 
-    # ── Score each ticker ────────────────────────────────────
+    # ── Score each ticker (limit 10 for speed) ──────────────
     scored = []
-    for tk in tickers[:18]:
+    for tk in tickers[:10]:
         try:
-            s = _score_ticker_full(tk, conn, vix_val)
+            s = _score_ticker_full(tk, conn, vix_val, fast=True)
             if s:
                 scored.append(s)
-        except Exception:
-            pass
+        except Exception as _sk_e:
+            log.debug(f"score_ticker {tk}: {_sk_e}")
     conn.close()
+
+    if not scored:
+        await query.message.reply_text(
+            f"{hdr('🎯 RECOMMENDATION ENGINE')}\n"
+            f"⚠️ Could not score any tickers. VIX: {vix_val:.1f}\n"
+            f"<i>Try again in a moment — data feeds may be slow.</i>",
+            parse_mode=H, reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Retry", callback_data="menu_recommend"), BACK_BTN]]))
+        try: await _loading.delete()
+        except Exception: pass
+        return
     scored.sort(key=lambda x: x["total"], reverse=True)
 
     vix_em = "🔴" if vix_val > 25 else ("🟡" if vix_val > 18 else "🟢")
@@ -20659,7 +20880,20 @@ async def recommend_engine(query):
         await _loading.delete()
     except Exception:
         pass
-    await query.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=kb)
+    try:
+        await query.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=kb)
+    except Exception as _send_e:
+        log.warning(f"recommend_engine send error: {_send_e}")
+        # Send truncated version
+        short_parts = parts[:8]
+        short_parts.append(f"\n<i>⚠️ Full output truncated — scored {len(scored)} tickers</i>")
+        try:
+            await query.message.reply_text("\n".join(short_parts), parse_mode=H, reply_markup=kb)
+        except Exception:
+            await query.message.reply_text(
+                f"🎯 Recommend Engine: Scored {len(scored)} tickers.\n"
+                f"Top: {', '.join(s['ticker'] for s in scored[:5])}",
+                reply_markup=kb)
 
 # ═══════════════════════════════════════════════════════════
 #  CALLBACK ROUTER
@@ -21223,6 +21457,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await signal_scanner(query)
         elif data.startswith("sigtk_"):
             await signal_ticker_detail(query, data.replace("sigtk_", ""))
+        elif data.startswith("oi_build_"):
+            await oi_build_detail(query, data.replace("oi_build_", ""))
         elif data == "menu_insider":
             await insider_menu(query)
         elif data == "menu_more":
