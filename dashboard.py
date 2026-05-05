@@ -1952,10 +1952,14 @@ if page == "🌍 Market Overview":
                 # Fetch live price for custom ticker
                 try:
                     _ct_data = yf.download(_inst_sym, period="2d", interval="1d", progress=False)
+                    # yfinance ≥0.2 returns MultiIndex columns for multi-ticker; squeeze to Series
+                    if isinstance(_ct_data.columns, pd.MultiIndex):
+                        _ct_data.columns = _ct_data.columns.get_level_values(0)
                     _ct_name = _inst_sym
                     if not _ct_data.empty:
-                        _ct_close = float(_ct_data["Close"].iloc[-1])
-                        _ct_prev  = float(_ct_data["Close"].iloc[-2]) if len(_ct_data) > 1 else _ct_close
+                        _close_col = _ct_data["Close"].squeeze()
+                        _ct_close = float(_close_col.iloc[-1])
+                        _ct_prev  = float(_close_col.iloc[-2]) if len(_ct_data) > 1 else _ct_close
                         _ct_chg   = (_ct_close - _ct_prev) / _ct_prev * 100 if _ct_prev > 0 else 0
                         _inst_row = pd.Series({"Name": _ct_name, "Price": _ct_close, "Pct": _ct_chg})
                     else:
