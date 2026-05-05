@@ -4007,10 +4007,9 @@ def _oi_opportunity_table(ticker: str, conn, df, spot: float) -> str:
 
 def _oi_week_heatmap(ticker: str, conn, spot: float, latest_date: str):
     """
-    5-day OI Buildup Heatmap — quick decision chart.
-    Left panel = Call OI (green), Right panel = Put OI (red).
-    Y-axis = strikes around ATM, X-axis = last 5 dates (oldest→newest).
-    Darker = more OI sitting there. Instantly shows accumulation, rolls, fades.
+    OI Heatmap: 5d / 10d / 30d timeframes × Calls / Puts = 6 panels.
+    Color = OI change direction: green=building(BUY), red=fading(SELL), gray=neutral.
+    Cell text = absolute OI (K/M). Gold dashed line = ATM.
     Returns BytesIO PNG or None.
     """
     try:
@@ -4023,19 +4022,34 @@ def _oi_week_heatmap(ticker: str, conn, spot: float, latest_date: str):
         BG    = "#0D1117"
         PANEL = "#161B22"
         TXT   = "#E6EDF3"
-        GRID  = "#21262D"
+        GRID  = "#30363D"
 
-        # ── 1. Get last 5 trade dates ─────────────────────────────────
+        # ── 1. Pull last 30 trade dates ────────────────────────────────
         _dates_df = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
             ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
-            LIMIT 5
+            LIMIT 30
         """, conn, params=(ticker,))
         if _dates_df.empty or len(_dates_df) < 2:
             return None
-        dates = list(reversed(_dates_df["trade_date_now"].tolist()))  # oldest first
+        all_dates = list(reversed(_dates_df["trade_date_now"].tolist()))  # oldest first
 
-        # ── 2. Top ±15% strikes with most activity ────────────────────
+        dates_5d  = all_dates[-5:]  if len(all_dates) >= 5  else all_dates
+        dates_10d = all_dates[-10:] if len(all_dates) >= 10 else all_dates
+
+        # 30d: bucket into ~6 weekly groups (label = newest date in bucket, MM-DD)
+        def _make_buckets(dates, n=6):
+            if len(dates) <= n:
+                return [(d[0:5], [d]) for d in dates]
+            chunk = max(1, len(dates) // n)
+            bkts = []
+            for i in range(0, len(dates), chunk):
+                grp = dates[i:i+chunk]
+                bkts.append((grp[-1][0:5], grp))
+            return bkts[-n:]
+        bkts_30 = _make_buckets(all_dates, n=6)
+
+        # ── 2. Active strikes: top 16 by total OI within ±15% of spot ─
         _top_stk = pd.read_sql("""
             SELECT strike,
                    SUM(openInt_Call_now) AS c_oi,
@@ -4049,9 +4063,13 @@ def _oi_week_heatmap(ticker: str, conn, spot: float, latest_date: str):
         """, conn, params=(ticker, latest_date, spot * 0.85, spot * 1.15))
         if _top_stk.empty:
             return None
-        strikes = sorted(_top_stk["strike"].tolist())
+        strikes    = sorted(_top_stk["strike"].tolist())
+        n_strikes  = len(strikes)
+        atm_idx    = min(range(n_strikes), key=lambda i: abs(strikes[i] - spot))
+        strike_lbl = [f"${s:.0f}" for s in strikes]
 
-        # ── 3. Pull OI for each date × strike ────────────────────────
+        # ── 3. Fetch all OI in one query ───────────────────────────────
+        all_needed = sorted(set(all_dates))
         _oi_df = pd.read_sql("""
             SELECT trade_date_now, strike,
                    SUM(openInt_Call_now) AS c_oi,
@@ -4059,107 +4077,138 @@ def _oi_week_heatmap(ticker: str, conn, spot: float, latest_date: str):
             FROM options_change
             WHERE ticker=? AND trade_date_now IN ({}) AND strike IN ({})
             GROUP BY trade_date_now, strike
-        """.format(",".join(["?"]*len(dates)), ",".join(["?"]*len(strikes))),
-        conn, params=([ticker] + dates + [float(s) for s in strikes]))
+        """.format(",".join(["?"]*len(all_needed)), ",".join(["?"]*len(strikes))),
+        conn, params=([ticker] + all_needed + [float(s) for s in strikes]))
 
-        # Build matrices: rows=strikes (low→high), cols=dates (old→new)
-        n_strikes = len(strikes)
-        n_dates   = len(dates)
-        c_mat = np.zeros((n_strikes, n_dates))
-        p_mat = np.zeros((n_strikes, n_dates))
-        for _, row in _oi_df.iterrows():
-            si = strikes.index(float(row["strike"])) if float(row["strike"]) in strikes else -1
-            di = dates.index(str(row["trade_date_now"])) if str(row["trade_date_now"]) in dates else -1
-            if si >= 0 and di >= 0:
-                c_mat[si, di] = float(row["c_oi"] or 0)
-                p_mat[si, di] = float(row["p_oi"] or 0)
+        # ── 4. Matrix builders ─────────────────────────────────────────
+        def _daily_matrix(date_list):
+            n_d = len(date_list)
+            cm = np.zeros((n_strikes, n_d))
+            pm = np.zeros((n_strikes, n_d))
+            sub = _oi_df[_oi_df["trade_date_now"].isin(date_list)]
+            for _, row in sub.iterrows():
+                d, s = str(row["trade_date_now"]), float(row["strike"])
+                if d in date_list and s in strikes:
+                    cm[strikes.index(s), date_list.index(d)] = float(row["c_oi"] or 0)
+                    pm[strikes.index(s), date_list.index(d)] = float(row["p_oi"] or 0)
+            return cm, pm
 
-        # Normalize each matrix to [0,1] for color intensity
-        def _norm(m):
-            mx = m.max()
-            return m / mx if mx > 0 else m
+        def _bucket_matrix(bkts):
+            n_b = len(bkts)
+            cm = np.zeros((n_strikes, n_b))
+            pm = np.zeros((n_strikes, n_b))
+            for bi, (lbl, date_grp) in enumerate(bkts):
+                sub = _oi_df[_oi_df["trade_date_now"].isin(date_grp)]
+                for _, row in sub.iterrows():
+                    s = float(row["strike"])
+                    if s in strikes:
+                        si = strikes.index(s)
+                        cm[si, bi] = max(cm[si, bi], float(row["c_oi"] or 0))
+                        pm[si, bi] = max(pm[si, bi], float(row["p_oi"] or 0))
+            return cm, pm
 
-        c_norm = _norm(c_mat)
-        p_norm = _norm(p_mat)
+        c5,  p5  = _daily_matrix(dates_5d)
+        c10, p10 = _daily_matrix(dates_10d)
+        c30, p30 = _bucket_matrix(bkts_30)
 
-        # ── 4. Delta matrix: today vs 5d ago (for arrow overlay) ─────
-        c_delta = c_mat[:, -1] - c_mat[:, 0]   # positive = building
-        p_delta = p_mat[:, -1] - p_mat[:, 0]
+        # ── 5. Change-based normalization (diverging) ──────────────────
+        # +1 = max OI build (green/BUY), -1 = max OI fade (red/SELL), 0 = neutral
+        def _chg_norm(mat):
+            if mat.shape[1] < 2:
+                return np.zeros_like(mat)
+            delta = np.diff(mat, axis=1)
+            delta = np.hstack([np.zeros((mat.shape[0], 1)), delta])
+            mx = np.abs(delta).max()
+            return delta / mx if mx > 0 else delta
 
-        # ── 5. Figure ─────────────────────────────────────────────────
-        fig, (ax_c, ax_p) = plt.subplots(1, 2, figsize=(10, max(5, n_strikes * 0.42 + 1.5)),
-                                          facecolor=BG, gridspec_kw={"wspace": 0.05})
+        # Diverging colormap: dark red -> gray -> dark green
+        cmap_div = mcolors.LinearSegmentedColormap.from_list(
+            "oi_sig", ["#8B0000", "#CC4444", "#3A3A4A", "#2D8B2D", "#006600"], N=256)
 
-        date_labels = [d[0:5] for d in dates]   # MM-DD
-        strike_labels = [f"${s:.0f}" for s in strikes]
-        atm_idx = min(range(n_strikes), key=lambda i: abs(strikes[i] - spot))
+        # ── 6. Figure: 2 rows (Call/Put) × 3 cols (5d/10d/30d) ────────
+        fig_h = max(7, n_strikes * 0.40 + 3.0)
+        fig, axes = plt.subplots(2, 3, figsize=(15, fig_h), facecolor=BG,
+                                 gridspec_kw={"wspace": 0.06, "hspace": 0.40})
 
-        def _draw_heatmap(ax, mat, norm_mat, delta, cmap_name, title, side):
+        timeframes = [
+            (c5,  p5,  [d[0:5] for d in dates_5d],   "5-DAY"),
+            (c10, p10, [d[0:5] for d in dates_10d],  "10-DAY"),
+            (c30, p30, [b[0]   for b in bkts_30],    "30-DAY (wk)"),
+        ]
+
+        def _draw_panel(ax, mat, col_labels, tf_title, side_label, show_yticks):
             ax.set_facecolor(PANEL)
-            im = ax.imshow(norm_mat, aspect="auto", cmap=cmap_name,
-                           vmin=0, vmax=1, interpolation="nearest",
-                           origin="lower")
-            # Cell text: OI in K/M
+            n_d = mat.shape[1]
+            chg  = _chg_norm(mat)           # in [-1, 1]
+            norm = (chg + 1) / 2            # map to [0, 1] for colormap
+            ax.imshow(norm, aspect="auto", cmap=cmap_div,
+                      vmin=0, vmax=1, interpolation="nearest", origin="lower")
+
+            # Cell text = absolute OI + grid lines
             for si in range(n_strikes):
-                for di in range(n_dates):
+                for di in range(n_d):
                     v = mat[si, di]
                     txt = (f"{v/1e6:.1f}M" if v >= 1e6 else
-                           f"{v/1e3:.0f}K" if v >= 1e3 else
-                           f"{v:.0f}" if v > 0 else "")
-                    brightness = norm_mat[si, di]
-                    fc = "#000000" if brightness > 0.55 else TXT
+                           f"{v/1e3:.0f}K"  if v >= 1e3 else
+                           f"{v:.0f}"        if v > 0   else "")
+                    # text contrast: white on dark, dark on light cells
+                    c_val = abs(chg[si, di])
+                    fc = TXT if c_val < 0.6 else ("#FFFFFF" if chg[si, di] > 0 else "#FFCCCC")
                     ax.text(di, si, txt, ha="center", va="center",
-                            fontsize=6.5, color=fc, fontweight="bold")
+                            fontsize=5.5, color=fc, fontweight="bold")
 
-            # ATM line
-            ax.axhline(atm_idx, color="#FFD700", linewidth=1.5, linestyle="--", alpha=0.8)
+            # Grid lines between cells (box effect)
+            for xi in range(n_d + 1):
+                ax.axvline(xi - 0.5, color=GRID, linewidth=0.6)
+            for yi in range(n_strikes + 1):
+                ax.axhline(yi - 0.5, color=GRID, linewidth=0.6)
 
-            # Week-change arrows on the right side
+            # ATM dashed line
+            ax.axhline(atm_idx, color="#FFD700", linewidth=1.8, linestyle="--", alpha=0.9)
+
+            # Buy/Sell/Neutral badge on right (based on last column change)
             for si in range(n_strikes):
-                d = delta[si]
-                if abs(d) < 100:
-                    continue
-                arrow = "▲" if d > 0 else "▼"
-                color = "#00ff88" if d > 0 else "#ff4444"
-                pct = d / max(mat[si, 0], 1) * 100
-                ax.text(n_dates - 0.3, si, f"{arrow}{abs(pct):.0f}%",
-                        ha="left", va="center", fontsize=6, color=color,
-                        fontweight="bold")
+                c_last = chg[si, -1]
+                if c_last > 0.25:
+                    mk, col = "BUY", "#00DD66"
+                elif c_last < -0.25:
+                    mk, col = "SEL", "#FF4444"
+                else:
+                    mk, col = "NEU", "#777777"
+                ax.text(n_d - 0.3, si, mk, ha="left", va="center",
+                        fontsize=5.5, color=col, fontweight="bold")
 
-            # Axes formatting
-            ax.set_xticks(range(n_dates))
-            ax.set_xticklabels(date_labels, fontsize=8, color=TXT, rotation=30)
+            ax.set_xticks(range(n_d))
+            ax.set_xticklabels(col_labels, fontsize=7, color=TXT, rotation=30)
             ax.tick_params(colors=TXT, length=0)
-            ax.set_title(title, color=TXT, fontsize=10, fontweight="bold", pad=6)
+            ax.set_title(f"{tf_title} — {side_label}", color=TXT,
+                         fontsize=9, fontweight="bold", pad=5)
             for spine in ax.spines.values():
                 spine.set_edgecolor(GRID)
 
-            if side == "left":
+            if show_yticks:
                 ax.set_yticks(range(n_strikes))
-                ax.set_yticklabels(strike_labels, fontsize=8, color=TXT)
-                ax.text(-0.8, atm_idx, "ATM→", va="center", ha="right",
+                ax.set_yticklabels(strike_lbl, fontsize=7.5, color=TXT)
+                ax.text(-0.65, atm_idx, "ATM>", va="center", ha="right",
                         fontsize=7, color="#FFD700", fontweight="bold")
             else:
                 ax.set_yticks([])
 
-        _draw_heatmap(ax_c, c_mat, c_norm, c_delta, "Greens",
-                      f"CALLS — {ticker}", "left")
-        _draw_heatmap(ax_p, p_mat, p_norm, p_delta, "Reds",
-                      f"PUTS  — {ticker}", "right")
+        for ci, (cm, pm, lbls, tft) in enumerate(timeframes):
+            _draw_panel(axes[0, ci], cm, lbls, tft, "CALLS", ci == 0)
+            _draw_panel(axes[1, ci], pm, lbls, tft, "PUTS",  ci == 0)
 
-        # Subtitle
-        fig.text(0.5, 0.96,
-                 f"OI Buildup 5-Day  ·  Spot ${spot:.1f}  ·  Darker=more OI  ·  Arrows=5d change",
-                 ha="center", va="top", fontsize=8, color="#8B949E")
-        fig.text(0.5, 0.005,
-                 "Wk▲=money building at strike  Wk▼=OI leaving (rolls/closing)",
+        # ── 7. Legend ─────────────────────────────────────────────────
+        fig.text(0.5, 0.995,
+                 f"{ticker}  OI Signal Heatmap  |  Spot ${spot:.1f}  |  Green=BUY  Red=SELL  Gray=NEU  Gold=ATM",
+                 ha="center", va="top", fontsize=9, color=TXT, fontweight="bold")
+        fig.text(0.5, 0.003,
+                 "Color=OI change vs prev session  |  Cell=total OI  |  BUY=accumulating  SEL=closing/rolling",
                  ha="center", va="bottom", fontsize=7, color="#8B949E")
 
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-
+        plt.tight_layout(rect=[0, 0.02, 1, 0.975])
         buf = BytesIO()
-        plt.savefig(buf, format="png", dpi=110, bbox_inches="tight",
-                    facecolor=BG)
+        plt.savefig(buf, format="png", dpi=105, bbox_inches="tight", facecolor=BG)
         plt.close(fig)
         buf.seek(0)
         return buf
@@ -4373,7 +4422,7 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
 
     # ── Helpers ───────────────────────────────────────────────────────
     def _fk2(n):
-        """Fixed-width OI change: always 5 chars, right-aligned."""
+        """OI change: right-aligned 5 chars."""
         if abs(n) < 10:   return "    -"
         if abs(n) >= 1e6: return f"{'+' if n>0 else '-'}{abs(n)/1e6:.1f}M"
         if abs(n) >= 1e3: return f"{'+' if n>0 else '-'}{abs(n)/1e3:.0f}K"
@@ -4387,7 +4436,7 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
         return f"{a:.0f}"
 
     def _px_fmt(p):
-        """Option price: fixed 4 chars (no $ — column header has $)."""
+        """Option price: 4-char fixed width ($ in column header)."""
         if p >= 100: return f"{p:4.0f}"
         if p >= 10:  return f"{p:4.1f}"
         return f"{p:4.2f}"
@@ -4413,95 +4462,100 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
         if c < -300:                                   return "UNWD", zone
         if p > 500 and zone == "ATM":                  return "SHRT", zone
         if p > 500 and pct < -7 and pcr > 1.5:        return "HEDG", zone
-        if p > 500:                                    return "PUT", zone
+        if p > 500:                                    return "PUT",  zone
         if p < -300:                                   return "HOFF", zone
         return "FLAT", zone
 
-    # ── Table A: OI change + signal (≤27 chars) ─────────────────────
-    # Stk(5) CChg(6) PChg(6) Sig(4)  = 5+1+6+1+6+1+4 = 24
-    _t1_hdr = "{:<5} {:>6} {:>6}  {:<4}".format("Stk", "C-Chg", "P-Chg", "Sig")
-    _t1_sep = "-" * 25
-    _t1_rows = [_t1_hdr, _t1_sep]
+    # ── Box-table helpers (pipe + plus borders, mobile-safe) ──────────
+    # All widths are fixed so every column starts at the same index.
+    #
+    # Table A: |Stk(5)|C-Chg(6)|P-Chg(6)|Sig(4)|  → 26 chars
+    _A_SEP = "+-----+------+------+----+"
+    _A_HDR = "|{:<5}|{:>6}|{:>6}|{:<4}|".format("Stk", "C-Chg", "P-Chg", "Sig")
+    _A_ROW = "|{:<5}|{:>6}|{:>6}|{:<4}|"
+    #
+    # Table B: |Stk(5)|Zone(4)|C-Px$(5)|P-Px$(5)|  → 24 chars
+    _B_SEP = "+-----+----+-----+-----+"
+    _B_HDR = "|{:<5}|{:<4}|{:>5}|{:>5}|".format("Stk", "Zone", "C-Px$", "P-Px$")
+    _B_ROW = "|{:<5}|{:<4}|{:>5}|{:>5}|"
+    #
+    # Table C: |Stk(5)|Pat(4)|C-$Paid(7)|P-$Paid(7)|  → 28 chars
+    _C_SEP = "+-----+----+-------+-------+"
+    _C_HDR = "|{:<5}|{:<4}|{:>7}|{:>7}|".format("Stk", "Pat", "C-$Paid", "P-$Paid")
+    _C_ROW = "|{:<5}|{:<4}|{:>7}|{:>7}|"
+
+    _t1_rows = [_A_SEP, _A_HDR, _A_SEP]
+    _t2_rows = [_B_SEP, _B_HDR, _B_SEP]
+    _t3_rows = [_C_SEP, _C_HDR, _C_SEP]
+
     for _, r in df.sort_values("strike").iterrows():
-        _c = float(r["call_chg"] or 0); _p = float(r["put_chg"] or 0)
-        _sk = float(r["strike"])
+        _c   = float(r["call_chg"] or 0)
+        _p   = float(r["put_chg"]  or 0)
+        _sk  = float(r["strike"])
+        _stk_lbl = f"${_sk:.0f}"
+
+        # Table A: OI change + signal
         _sig = _sig_short(_c, _p, spot, _sk, agg_pcr)
-        _t1_rows.append("{:<5} {:>6} {:>6}  {:<4}".format(
-            f"${_sk:.0f}", _fk2(_c), _fk2(_p), _sig))
-    # Signal legend (2 lines, ≤28 chars each)
-    _sig_legend = (
-        "<i>BULL=calls BEAR=puts STRD=straddle\n"
-        "SPEC=OTM-spec SHRT=ATM-short\n"
-        "UNWD=closing HEDG=hedge HOFF=hedge-off</i>"
-    )
-    table_str = "<pre>" + "\n".join(_t1_rows) + "</pre>\n" + _sig_legend
+        _t1_rows.append(_A_ROW.format(_stk_lbl, _fk2(_c), _fk2(_p), _sig))
 
-    # ── Table B: option prices (≤27 chars) ───────────────────────────
-    # Stk(5) Zone(4) C-Px$(5) P-Px$(5)  = 5+1+4+1+5+1+5 = 22
-    # $ in HEADER means column values are prices in dollars
-    _t2_hdr = "{:<5} {:<4} {:>5} {:>5}".format("Stk", "Zone", "C-Px$", "P-Px$")
-    _t2_sep = "-" * 22
-    _t2_rows = [_t2_hdr, _t2_sep]
-
-    # ── Table C: premium flow in $ (≤27 chars) ───────────────────────
-    # Stk(5) Pat(4) C-$Paid(7) P-$Paid(7)  = 5+1+4+1+7+1+7 = 26
-    _t3_hdr = "{:<5} {:<4} {:>7} {:>7}".format("Stk", "Pat", "C-$Paid", "P-$Paid")
-    _t3_sep = "-" * 26
-    _t3_rows = [_t3_hdr, _t3_sep]
-
-    for _, r in df.sort_values("strike").iterrows():
-        _c2    = float(r["call_chg"] or 0)
-        _p2    = float(r["put_chg"]  or 0)
-        _c_oi2 = float(r["call_oi"]  or 0)
-        _sk2   = float(r["strike"])
-        _pat2, _zone2 = _pat_short(_c2, _p2, _c_oi2, float(r["put_oi"] or 0), spot, _sk2, agg_pcr)
+        # BS option prices
         try:
-            _gc = bs_greeks(spot, _sk2, _T, 0.045, _hv, "call")
-            _gp = bs_greeks(spot, _sk2, _T, 0.045, _hv, "put")
+            _gc = bs_greeks(spot, _sk, _T, 0.045, _hv, "call")
+            _gp = bs_greeks(spot, _sk, _T, 0.045, _hv, "put")
             _cpx = float(_gc["price"]); _ppx = float(_gp["price"])
         except Exception:
-            _cpx = max(0.01, spot - _sk2) if spot > _sk2 else 0.01
-            _ppx = max(0.01, _sk2 - spot) if _sk2 > spot else 0.01
+            _cpx = max(0.01, spot - _sk) if spot > _sk else 0.01
+            _ppx = max(0.01, _sk - spot) if _sk > spot else 0.01
 
-        # Table B row: prices
-        _t2_rows.append("{:<5} {:<4} {:>5} {:>5}".format(
-            f"${_sk2:.0f}", _zone2, _px_fmt(_cpx), _px_fmt(_ppx)))
+        # Table B: prices
+        _pat, _zone = _pat_short(_c, _p, float(r["call_oi"] or 0),
+                                 float(r["put_oi"] or 0), spot, _sk, agg_pcr)
+        _t2_rows.append(_B_ROW.format(_stk_lbl, _zone, _px_fmt(_cpx), _px_fmt(_ppx)))
 
-        # Table C row: actual $ paid (premium flow)
-        # Positive = money ENTERING (new positions opened)
-        # Negative = money LEAVING (positions closed, OI decreased)
-        _c_prm = _c2 * _cpx * 100   # signed: + = bought, - = sold/closed
-        _p_prm = _p2 * _ppx * 100
+        # Table C: actual $ premium paid today
         def _prm_fmt(v):
             if abs(v) < 500: return "      -"
             sign = "+" if v >= 0 else "-"
             return f"{sign}${_fmn(abs(v)):>5}"
-        _t3_rows.append("{:<5} {:<4} {:>7} {:>7}".format(
-            f"${_sk2:.0f}", _pat2, _prm_fmt(_c_prm), _prm_fmt(_p_prm)))
+        _c_prm = _c * _cpx * 100
+        _p_prm = _p * _ppx * 100
+        _t3_rows.append(_C_ROW.format(_stk_lbl, _pat, _prm_fmt(_c_prm), _prm_fmt(_p_prm)))
+
+    # Close box borders
+    _t1_rows.append(_A_SEP)
+    _t2_rows.append(_B_SEP)
+    _t3_rows.append(_C_SEP)
+
+    _sig_legend = (
+        "<i>BULL=calls  BEAR=puts  STRD=straddle\n"
+        "SPEC=OTM-spec  SHRT=ATM-short\n"
+        "UNWD=closing  HEDG=hedge  HOFF=hedge-off</i>"
+    )
+    table_str = "<pre>" + "\n".join(_t1_rows) + "</pre>\n" + _sig_legend
 
     detail_tbl = (
         "\n<b>Option Prices (BS est.)</b>\n"
         "<pre>" + "\n".join(_t2_rows) + "</pre>"
         "\n<b>$ Paid Today (real premium)</b>\n"
         "<pre>" + "\n".join(_t3_rows) + "</pre>\n"
-        "<i>+$=new money IN  -$=money leaving  contracts x price x 100</i>"
+        "<i>+$=new money IN  -$=money leaving  qty x price x 100</i>"
     )
 
-    # ── Week trend: standing value over 5 trading days ────────────────
-    # Standing value = total open OI × today's option price × 100
-    # As option moves $3→$10, standing value rises even without new contracts.
-    # This shows whether money is BUILDING or LEAVING each strike over the week.
+    # ── OI Timeline: 5d / 10d / 30d per strike ─────────────────────
+    # Three timeframes let you see short/medium/long-term accumulation.
+    # Call table + Put table, each with aligned pipe-box columns.
+    # Sig column: BUY/SEL/UNW/NEU — based on 5d call+put direction.
+    # Emoji color line below tables: easy visual scan on mobile.
     week_tbl = ""
     try:
         _wk_dates = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
             ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
-            LIMIT 5
+            LIMIT 30
         """, conn, params=(ticker,))
         if len(_wk_dates) >= 2:
-            _wk_date_list = _wk_dates["trade_date_now"].tolist()
-            _first_date   = _wk_date_list[-1]  # oldest of the 5
-            _active_strikes = df["strike"].tolist()
+            _all_wk    = _wk_dates["trade_date_now"].tolist()
+            _active_sk = df["strike"].tolist()
             _wk_df = pd.read_sql("""
                 SELECT strike, trade_date_now,
                        SUM(openInt_Call_now) AS c_oi,
@@ -4511,67 +4565,96 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
                   AND strike IN ({})
                 GROUP BY strike, trade_date_now
             """.format(
-                ",".join(["?"]*len(_wk_date_list)),
-                ",".join(["?"]*len(_active_strikes))
-            ), conn, params=([ticker] + _wk_date_list + _active_strikes))
+                ",".join(["?"]*len(_all_wk)),
+                ",".join(["?"]*len(_active_sk))
+            ), conn, params=([ticker] + _all_wk + _active_sk))
 
             if not _wk_df.empty:
-                _spark = "▁▂▃▄▅▆▇█"  # 8-level sparkline chars
-                _wk_hdr = "{:<5} {:>5} {:>5} {:>4} {:>4} {:<6}".format(
-                    "Stk","C-Now","P-Now","CWk%","PWk%","Trend")
-                _wk_sep = "-" * 32
-                _wk_rows = [_wk_hdr, _wk_sep]
+                def _anch(dl, n):
+                    return dl[n-1] if len(dl) >= n else dl[-1]
+                _d5  = _anch(_all_wk, 5);  _d10 = _anch(_all_wk, 10)
+                _d30 = _anch(_all_wk, 30); _today = _all_wk[0]
 
-                for _sk3 in sorted(_active_strikes):
-                    _sk_data = _wk_df[_wk_df["strike"] == _sk3].sort_values("trade_date_now")
-                    if _sk_data.empty:
-                        continue
-                    try:
-                        _gc3 = bs_greeks(spot, _sk3, _T, 0.045, _hv, "call")
-                        _gp3 = bs_greeks(spot, _sk3, _T, 0.045, _hv, "put")
-                        _cpx3 = float(_gc3["price"]); _ppx3 = float(_gp3["price"])
-                    except Exception:
-                        _cpx3 = 0.01; _ppx3 = 0.01
+                def _pct(now, old):
+                    return (now - old) / max(old, 1) * 100
 
-                    # Today's standing value
-                    _today_row = _sk_data[_sk_data["trade_date_now"] == latest_date]
-                    if _today_row.empty:
-                        _today_row = _sk_data.iloc[[-1]]
-                    _c_oi_now3  = float(_today_row["c_oi"].iloc[0] or 0)
-                    _p_oi_now3  = float(_today_row["p_oi"].iloc[0] or 0)
-                    _c_val_now  = _c_oi_now3 * _cpx3 * 100   # total standing call value $
-                    _p_val_now  = _p_oi_now3 * _ppx3 * 100
+                def _ps4(v):
+                    if v == 0.0: return "   -"
+                    if abs(v) >= 999: return "+big" if v > 0 else "-big"
+                    s = f"{v:+.0f}%"
+                    return s[:4].rjust(4)
 
-                    # 5-day-ago standing value (use same price — approximation)
-                    _first_row  = _sk_data[_sk_data["trade_date_now"] == _first_date]
-                    if _first_row.empty:
-                        _first_row = _sk_data.iloc[[0]]
-                    _c_oi_wk3   = float(_first_row["c_oi"].iloc[0] or 0)
-                    _p_oi_wk3   = float(_first_row["p_oi"].iloc[0] or 0)
-                    # Note: ideally use old price, but we only have today's spot.
-                    # % change in OI alone shows accumulation/distribution trend.
-                    _c_wk_pct   = (_c_oi_now3 - _c_oi_wk3) / max(_c_oi_wk3, 1) * 100
-                    _p_wk_pct   = (_p_oi_now3 - _p_oi_wk3) / max(_p_oi_wk3, 1) * 100
+                def _ps5(v):
+                    if v == 0.0: return "    -"
+                    if abs(v) >= 9999: return "+BIG" if v > 0 else "-BIG"
+                    s = f"{v:+.0f}%"
+                    return s[:5].rjust(5)
 
-                    # Trend based on day-by-day c_oi values (sparkline)
-                    _c_series = _sk_data["c_oi"].fillna(0).tolist()
-                    if len(_c_series) >= 2 and max(_c_series) > min(_c_series):
-                        _mn = min(_c_series); _mx = max(_c_series) - _mn
-                        _sp = "".join(_spark[min(7, int((v - _mn) / _mx * 7))] for v in _c_series)
-                    else:
-                        _sp = "─" * len(_c_series)
+                def _sig3(c5, p5):
+                    if c5 > 20 and p5 > 20:  return "HDG"
+                    if c5 > 15:               return "BUY"
+                    if p5 > 15:               return "SEL"
+                    if c5 < -15 or p5 < -15: return "UNW"
+                    return "NEU"
 
-                    _c_wk_s = f"{_c_wk_pct:+.0f}%" if abs(_c_wk_pct) < 999 else ("+big" if _c_wk_pct > 0 else "-big")
-                    _p_wk_s = f"{_p_wk_pct:+.0f}%" if abs(_p_wk_pct) < 999 else ("+big" if _p_wk_pct > 0 else "-big")
-                    _c_now_s = _fmn(_c_val_now); _p_now_s = _fmn(_p_val_now)
-                    _wk_rows.append("{:<5} {:>5} {:>5} {:>4} {:>4} {}".format(
-                        f"${_sk3:.0f}", _c_now_s, _p_now_s, _c_wk_s, _p_wk_s, _sp))
+                def _trend3(sk_data, col):
+                    series = sk_data.sort_values("trade_date_now")[col].fillna(0).tolist()
+                    if len(series) < 2: return " -- "
+                    delta_5  = series[-1] - series[max(0, len(series)-5)]
+                    delta_all = series[-1] - series[0]
+                    if delta_5 > series[-1] * 0.10:  return " UP "
+                    if delta_5 < -series[-1] * 0.10: return " DN "
+                    if delta_all > series[0] * 0.20: return "~UP "
+                    if delta_all < -series[0]*0.20:  return "~DN "
+                    return " -- "
 
-                if len(_wk_rows) > 2:
+                # Table format: |Stk(5)|5d%(4)|10d%(5)|30d%(5)|Sig(3)|Trd(4)| = 1+5+1+4+1+5+1+5+1+3+1+4+1 = 32 too wide
+                # Split: Call table and Put table separately
+                # |Stk(5)|5d%(4)|10d%(5)|30d%(5)|Trd(3)| = 1+5+1+4+1+5+1+5+1+3+1 = 27 chars
+                _WT_SEP = "+-----+----+-----+-----+---+"
+                _WT_CHR = "|{:<5}|{:>4}|{:>5}|{:>5}|{:<3}|"
+                _WT_PHR = "|{:<5}|{:>4}|{:>5}|{:>5}|{:<3}|"
+                _WT_CHDR = _WT_CHR.format("Stk"," 5d%"," 10d%"," 30d%","Trd")
+                _WT_PHDR = _WT_PHR.format("Stk"," 5d%"," 10d%"," 30d%","Trd")
+
+                _c_rows = [_WT_SEP, _WT_CHDR, _WT_SEP]
+                _p_rows = [_WT_SEP, _WT_PHDR, _WT_SEP]
+                _sig_em_parts = []
+
+                for _sk3 in sorted(_active_sk):
+                    _sk_data = _wk_df[_wk_df["strike"] == _sk3]
+                    if _sk_data.empty: continue
+                    def _v(d, col):
+                        r = _sk_data[_sk_data["trade_date_now"] == d]
+                        return float(r[col].iloc[0] or 0) if not r.empty else 0.0
+                    _c_now = _v(_today,"c_oi"); _p_now = _v(_today,"p_oi")
+                    _c5  = _v(_d5,"c_oi");  _p5  = _v(_d5,"p_oi")
+                    _c10 = _v(_d10,"c_oi"); _p10 = _v(_d10,"p_oi")
+                    _c30 = _v(_d30,"c_oi"); _p30 = _v(_d30,"p_oi")
+                    _stk4 = (f"")[:5]
+                    _c5p = _pct(_c_now,_c5); _c10p = _pct(_c_now,_c10); _c30p = _pct(_c_now,_c30)
+                    _p5p = _pct(_p_now,_p5); _p10p = _pct(_p_now,_p10); _p30p = _pct(_p_now,_p30)
+                    _ct  = _trend3(_sk_data, "c_oi"); _pt  = _trend3(_sk_data, "p_oi")
+                    _sg3 = _sig3(_c5p, _p5p)
+                    _em  = {"BUY":"GRN","SEL":"RED","HDG":"YLW","UNW":"RED","NEU":"GRY"}.get(_sg3,"GRY")
+                    _c_rows.append(_WT_CHR.format(_stk4, _ps4(_c5p), _ps5(_c10p), _ps5(_c30p), _ct.strip()[:3]))
+                    _p_rows.append(_WT_PHR.format(_stk4, _ps4(_p5p), _ps5(_p10p), _ps5(_p30p), _pt.strip()[:3]))
+                    _sig_em_parts.append(f"{_em}:{_stk4}")
+
+                _c_rows.append(_WT_SEP); _p_rows.append(_WT_SEP)
+
+                _em_map = {"GRN":"Green","RED":"Red","YLW":"Yellow","GRY":"Gray"}
+                _em_line = "  ".join(_sig_em_parts)
+
+                if len(_c_rows) > 4:
                     week_tbl = (
-                        "\n\n<b>5-Day Standing Value</b>\n"
-                        "<i>C-Now/P-Now=total open value today  CWk/PWk%=5d OI change</i>\n"
-                        "<pre>" + "\n".join(_wk_rows) + "</pre>"
+                        chr(10) + chr(10) + "<b>CALL OI Timeline</b>" + chr(10)
+                        + "<i>5d/10d/30d % change  Trd=UP/DN/-- trend</i>" + chr(10)
+                        + "<pre>" + chr(10).join(_c_rows) + "</pre>"
+                        + chr(10) + "<b>PUT OI Timeline</b>" + chr(10)
+                        + "<pre>" + chr(10).join(_p_rows) + "</pre>"
+                        + chr(10) + "<i>GRN=calls up  RED=puts up  YLW=both  GRY=flat</i>" + chr(10)
+                        + "<b>Signal: </b>" + _em_line
                     )
     except Exception as _wk_e:
         pass  # week trend is optional
@@ -12550,6 +12633,34 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 import re
+import asyncio
+import functools
+from concurrent.futures import ThreadPoolExecutor
+
+# ── Async performance helpers ─────────────────────────────────────────────
+_EXECUTOR = ThreadPoolExecutor(max_workers=6)
+
+async def _bg(fn, *args, **kwargs):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_EXECUTOR, functools.partial(fn, *args, **kwargs))
+
+async def _send_result(loading_msg, text, parse_mode="HTML", reply_markup=None):
+    """Edit loading placeholder with result — 1 API call, no flicker."""
+    try:
+        await loading_msg.edit_text(text, parse_mode=parse_mode,
+                                    reply_markup=reply_markup,
+                                    disable_web_page_preview=True)
+    except Exception:
+        try:
+            await loading_msg.reply_text(text, parse_mode=parse_mode,
+                                         reply_markup=reply_markup,
+                                         disable_web_page_preview=True)
+        except Exception:
+            pass
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
 
 # ─── Config ───
 DATA_DIR  = r"C:\Users\srini\Options_chain_data"
@@ -16075,86 +16186,66 @@ async def mirofish_ticker_detail(query, ticker):
         parts.append(f"📌 Bias: {_sig_display}")
         parts.append(f"💡 <i>{rec}</i>")
 
-        # OI Walls
-        try:
-            _conn_kl = get_conn()
-            _kl = _oi_key_levels(tk, _conn_kl)
-            _conn_kl.close()
-            if _kl:
-                _cw = _kl.get("call_wall", 0); _pw = _kl.get("put_wall", 0)
-                _mp = _kl.get("max_pain", 0);  _gw = _kl.get("gamma_walls", [])
-                _gw_s = " / ".join(f"${g:.0f}" for g in _gw[:3]) if _gw else "—"
-                parts.append(
-                    f"\n<b>\U0001f9f1 OI Walls</b> ({_kl.get('expiry','')[:8]})\n"
-                    + mono(
-                        f"{'Call Wall':<10} ${_cw:.0f}\n"
-                        f"{'Put Wall':<10} ${_pw:.0f}\n"
-                        f"{'Max Pain':<10} ${_mp:.0f}\n"
-                        f"{'Gamma':<10} {_gw_s}"
-                    )
-                )
-        except Exception: pass
-
-        # Volume / delivery analysis
+        # Volume analysis (pure-compute, no extra DB call)
         try:
             _vm = _classify_stock_move(tk, total_call_chg, total_put_chg)
             if _vm:
                 _vs = _vm["signal"]; _vc = _vm["confidence"]; _vr = _vm["vol_ratio"]
-                _vpc = _vm["price_chg"]; _vl = _vm["vol_label"]
-                _sig_icons = {"REAL_BUY":"\U0001f7e2","DELTA_HEDGE":"\U0001f535","SHORT_COVER":"\U0001f7e1",
-                              "SPEC_CALL":"\u26a1","REAL_SELL":"\U0001f534","EVENT_STRADDLE":"\u26a1","MIXED":"\u26aa"}
-                _vi = _sig_icons.get(_vs, "\u26aa")
-                parts.append(
-                    f"\n<b>\U0001f4ca Volume Analysis</b>\n"
-                    f"{_vi} <b>{_vs.replace('_',' ')}</b>  [{_vc}]\n"
-                    + mono(
-                        f"{'Vol Ratio':<10} {_vr:.2f}x ({_vl})\n"
-                        f"{'Price Chg':<10} {_vpc:+.2f}%"
-                    )
-                    + f"\n<i>{_vm['explanation'][:120]}</i>"
-                )
+                _vpc = _vm["price_chg"]; _vl = _vm["vol_label"]; _expl = _vm.get("explanation","")
+                _sig_icons = {"REAL_BUY":"🟢","DELTA_HEDGE":"🔵","SHORT_COVER":"🟡",
+                              "SPEC_CALL":"⚡","REAL_SELL":"🔴","EVENT_STRADDLE":"⚡","MIXED":"⚪"}
+                _vi = _sig_icons.get(_vs, "⚪")
+                _vol_tbl = f"Vol Ratio  {_vr:.2f}x ({_vl})" + chr(10) + f"Price Chg  {_vpc:+.2f}%"
+                parts.append(f"<b>📊 Volume Analysis</b>" + chr(10)
+                             + f"{_vi} <b>{_vs.replace('_',' ')}</b>  [{_vc}]" + chr(10)
+                             + mono(_vol_tbl)
+                             + chr(10) + f"<i>{_expl[:120]}</i>")
         except Exception: pass
 
-        # ── GEX + Earnings ──────────────────────────────────────────────
-        try:
-            _conn_gx = get_conn()
-            _sd_gx = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
-                ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1""",
-                _conn_gx, params=(tk,))
-            _spot_gx = float(_sd_gx["close"].iloc[0]) if not _sd_gx.empty else 0.0
-            if _spot_gx > 0:
-                _gx     = _compute_gex(tk, _conn_gx, _spot_gx)
-                _gtm    = _gx.get("total_gex_m", 0.0)
-                _gsig   = _gx.get("gex_signal", "?")
-                _greg   = _gx.get("regime", "")
-                _gzero  = _gx.get("zero_gamma")
-                _gtop   = _gx.get("top_strikes", [])
-                _earn_dt = _get_earnings_dte(tk)
-                _eflag  = f"  EARN{_earn_dt}d" if _earn_dt is not None and 0 <= _earn_dt <= 14 else ""
-                _grow   = []
-                for _gs in _gtop[:4]:
-                    _sign = "+" if _gs["gex_m"] >= 0 else ""
-                    _grow.append(f"  ${_gs['strike']:.0f}  {_sign}{_gs['gex_m']:.1f}M")
-                _sign_str = "+" if _gtm >= 0 else ""
-                _zero_line = f"{'Zero-G':<10} ${_gzero:.1f}\n" if _gzero else ""
-                _gex_body = (
-                    f"{'Total GEX':<10} {_sign_str}{_gtm:.1f}M\n"
-                    + _zero_line
-                    + "\n".join(_grow)
-                )
-                parts.append(
-                    f"\n<b>GEX: {_gsig}</b>{_eflag}\n"
-                    + mono(_gex_body)
-                    + f"\n<i>{_greg[:60]}</i>"
-                )
-            _conn_gx.close()
-        except Exception as _gex_e:
-            log.warning(f"GEX inst_signals failed: {_gex_e}")
+        # OI Walls + GEX + Earnings — parallel via asyncio.gather
+        def _fetch_walls_mf():
+            try:
+                _c = get_conn(); _kl = _oi_key_levels(tk, _c); _c.close(); return _kl
+            except Exception: return None
 
-    try:
-        await _loading.delete()
-    except Exception:
-        pass
+        def _fetch_gex_mf(spot):
+            try:
+                _c = get_conn(); _gx = _compute_gex(tk, _c, spot); _c.close(); return _gx
+            except Exception: return None
+
+        _spot_mf = close if close > 0 else 0.0
+        _kl_mf, _gx_mf, _earn_mf = await asyncio.gather(
+            _bg(_fetch_walls_mf),
+            _bg(_fetch_gex_mf, _spot_mf),
+            _bg(_get_earnings_dte, tk),
+        )
+
+        if _kl_mf:
+            _cw = _kl_mf.get("call_wall", 0); _pw = _kl_mf.get("put_wall", 0)
+            _mp = _kl_mf.get("max_pain", 0);  _gw = _kl_mf.get("gamma_walls", [])
+            _gw_s = " / ".join(f"${g:.0f}" for g in _gw[:3]) if _gw else "—"
+            _exp_mf = _kl_mf.get("expiry","")[:8]
+            _walls_tbl = (f"Call Wall  ${_cw:.0f}" + chr(10)
+                        + f"Put Wall   ${_pw:.0f}" + chr(10)
+                        + f"Max Pain   ${_mp:.0f}" + chr(10)
+                        + f"Gamma      {_gw_s}")
+            parts.append(f"<b>🧱 OI Walls</b> ({_exp_mf})" + chr(10) + mono(_walls_tbl))
+
+        if _gx_mf and _spot_mf > 0:
+            _gtm  = _gx_mf.get("total_gex_m", 0.0); _gsig = _gx_mf.get("gex_signal", "?")
+            _greg = _gx_mf.get("regime", "");        _gzero = _gx_mf.get("zero_gamma")
+            _gtop = _gx_mf.get("top_strikes", [])
+            _eflag = f"  EARN{_earn_mf}d" if _earn_mf is not None and 0 <= _earn_mf <= 14 else ""
+            _grow  = []
+            for _gs in _gtop[:4]:
+                _gsign = "+" if _gs["gex_m"] >= 0 else ""
+                _grow.append(f"  ${_gs['strike']:.0f}  {_gsign}{_gs['gex_m']:.1f}M")
+            _zero_line = f"Zero-G     ${_gzero:.1f}" + chr(10) if _gzero else ""
+            _sign_str  = "+" if _gtm >= 0 else ""
+            _gex_body  = f"Total GEX  {_sign_str}{_gtm:.1f}M" + chr(10) + _zero_line + chr(10).join(_grow)
+            parts.append(f"<b>GEX: {_gsig}</b>{_eflag}" + chr(10) + mono(_gex_body)
+                         + chr(10) + f"<i>{_greg[:60]}</i>")
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🤖 All Signals", callback_data="menu_mirofish"),
          InlineKeyboardButton("📊 OI Detail", callback_data=f"oi_detail_{tk}")],
@@ -16164,8 +16255,7 @@ async def mirofish_ticker_detail(query, ticker):
          InlineKeyboardButton("📐 Tech",         callback_data=f"tech_sig_{tk}")],
         [BACK_BTN],
     ])
-    await query.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=kb)
-
+    await _send_result(_loading, chr(10).join(parts), parse_mode=H, reply_markup=kb)
 
 
 # ── OI Roll Detector ─────────────────────────────────────────
@@ -16345,10 +16435,10 @@ async def oi_roll_detail(query, ticker):
         parts.append("\n<i>No significant roll activity today.</i>")
         parts.append("<i>Rolls require min 300 contracts moved.</i>")
 
-    try:
-        await _loading.delete()
-    except Exception:
-        pass
+
+
+
+
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("MiroFish", callback_data=f"miro_ticker_{tk}"),
@@ -16710,10 +16800,10 @@ async def inst_signals_detail(query, ticker):
     except Exception as _inst_ex:
         log.warning(f"inst_signals OI trend failed: {_inst_ex}")
 
-    try:
-        await _loading.delete()
-    except Exception:
-        pass
+
+
+
+
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("MiroFish",    callback_data=f"miro_ticker_{tk}"),
@@ -16987,10 +17077,10 @@ async def mean_rev_detail(query, ticker):
     if not any_data:
         parts.append("\n<i>Not enough historical data for mean reversion analysis.</i>")
 
-    try:
-        await _loading.delete()
-    except Exception:
-        pass
+
+
+
+
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Inst. Signals", callback_data=f"inst_sig_{tk}"),
@@ -18261,9 +18351,9 @@ async def oi_detail(query, ticker):
                 await query.message.reply_photo(
                     _hm_buf,
                     caption=(
-                        f"📊 {ticker} OI 5-Day Buildup Heatmap\n"
-                        f"Darker=more OI  ▲=building  ▼=fading\n"
-                        f"Gold line=ATM  Left=Calls  Right=Puts"
+                        f"📊 {ticker} OI Signal Heatmap (5d / 10d / 30d)\n"
+                        f"Green=BUY(building)  Red=SELL(fading)  Gray=Neutral\n"
+                        f"Cell=total OI  Gold line=ATM  Top=Calls  Bottom=Puts"
                     )
                 )
         _conn_hm.close()
