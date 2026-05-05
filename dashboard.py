@@ -1998,9 +1998,7 @@ if page == "🌍 Market Overview":
                 )
                 _fig_stored.update_yaxes(range=[_st_ymin, _st_ymax])
                 st.plotly_chart(_fig_stored, use_container_width=True)
-                st.caption(f"📦 {len(_stored)} data points stored in DB · Earliest: {_stored['timestamp'].iloc[0].strftime('%Y-%m-%d %H:%M')} · Latest: {_stored['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M')}")
-            else:
-                st.info("📦 No stored history yet — data will accumulate as the dashboard refreshes.")
+                st.caption(f"📦 {len(_stored)} data points · Earliest: {_stored['timestamp'].iloc[0].strftime('%Y-%m-%d %H:%M')} · Latest: {_stored['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M')}")
 
             with st.spinner(f"Loading {_disp_name} data..."):
                 try:
