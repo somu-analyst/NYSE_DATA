@@ -3719,14 +3719,129 @@ def _oi_expiry_flow_table(ticker: str, conn, latest_date: str) -> str:
     return "<pre>" + "\n".join([hdr_l, "-"*26] + rows[:6]) + "</pre>"
 
 
+def _get_earnings_dte(ticker: str) -> "int | None":
+    """Returns days to next earnings, or None if unknown/past."""
+    try:
+        cal = yf.Ticker(ticker).calendar
+        ed = None
+        if isinstance(cal, dict):
+            ed = cal.get("Earnings Date")
+        elif hasattr(cal, "columns"):
+            row = cal.get("Earnings Date")
+            ed = row.iloc[0] if row is not None and not row.empty else None
+        if ed is None:
+            return None
+        if hasattr(ed, '__iter__') and not isinstance(ed, str):
+            ed = list(ed)[0]
+        import pandas as _pd
+        ed_dt = _pd.Timestamp(ed).date()
+        dte_e = (ed_dt - datetime.now().date()).days
+        return dte_e if dte_e >= 0 else None
+    except Exception:
+        return None
+
+
+def _compute_gex(ticker: str, conn, spot: float) -> dict:
+    """
+    Gamma Exposure (GEX) = Σ (gamma_call × call_OI - gamma_put × put_OI) × spot² × 0.01
+    Positive GEX: dealers long gamma → buy dips/sell rallies → suppress vol (pinning).
+    Negative GEX: dealers short gamma → amplify moves (trending/volatile).
+    Returns dict with keys: total_gex, zero_gamma, gex_signal, top_strikes, regime.
+    """
+    result = {"total_gex": 0.0, "zero_gamma": None, "gex_signal": "UNKNOWN",
+              "top_strikes": [], "regime": "UNKNOWN"}
+    try:
+        df = pd.read_sql("""
+            SELECT strike,
+                   SUM(openInt_Call_now) AS call_oi,
+                   SUM(openInt_Put_now)  AS put_oi
+            FROM options_change
+            WHERE ticker=?
+              AND trade_date_now=(SELECT trade_date_now FROM options_change WHERE ticker=?
+                  ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1)
+            GROUP BY strike ORDER BY strike
+        """, conn, params=(ticker, ticker))
+    except Exception:
+        return result
+    if df.empty or spot <= 0:
+        return result
+
+    # HV as IV proxy
+    hv = 0.30
+    try:
+        _hsd = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
+            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 25""",
+            conn, params=(ticker,))
+        if len(_hsd) >= 10:
+            _rets = _hsd["close"].astype(float).pct_change().dropna()
+            hv = float(_rets.std() * (252**0.5))
+            hv = max(0.10, min(hv, 2.0))
+    except Exception:
+        pass
+
+    T = 30 / 365.0  # assume 30-day average
+    r = 0.045
+    sigma = max(hv, 0.15)
+
+    gex_by_strike = []
+    for _, row in df.iterrows():
+        strike = float(row["strike"])
+        c_oi   = float(row["call_oi"] or 0)
+        p_oi   = float(row["put_oi"]  or 0)
+        try:
+            gc = bs_greeks(spot, strike, T, r, sigma, "call")["gamma"]
+            gp = bs_greeks(spot, strike, T, r, sigma, "put")["gamma"]
+        except Exception:
+            continue
+        # Dealer GEX: sold call → long gamma; sold put → long gamma too
+        # Net GEX = (call_oi × gamma_c - put_oi × gamma_p) × spot² × 100
+        gex_s = (gc * c_oi - gp * p_oi) * spot**2 * 0.01
+        gex_by_strike.append((strike, gex_s, gc * c_oi * spot**2 * 0.01, gp * p_oi * spot**2 * 0.01))
+
+    if not gex_by_strike:
+        return result
+
+    total_gex = sum(g[1] for g in gex_by_strike)
+    result["total_gex"] = total_gex
+
+    # Zero-gamma level: strike where cumulative GEX flips sign
+    cumulative = 0.0
+    zero_g = None
+    prev_s = None
+    for s, g, _, _ in sorted(gex_by_strike, key=lambda x: x[0]):
+        cumulative += g
+        if prev_s is not None and zero_g is None:
+            if (cumulative >= 0 and cumulative - g < 0) or (cumulative < 0 and cumulative - g >= 0):
+                zero_g = (prev_s + s) / 2
+        prev_s = s
+    result["zero_gamma"] = zero_g
+
+    # GEX signal
+    total_gex_b = total_gex / 1e6  # in $M for display
+    if total_gex > 0:
+        result["gex_signal"] = "PINNING"
+        result["regime"] = "Low vol — dealers suppress moves, mean revert"
+    else:
+        result["gex_signal"] = "TRENDING"
+        result["regime"] = "High vol — dealers amplify direction, trend follow"
+
+    # Top 5 strikes by absolute GEX
+    top = sorted(gex_by_strike, key=lambda x: -abs(x[1]))[:5]
+    result["top_strikes"] = [{"strike": s, "gex_m": g/1e6, "c_gex": cg/1e6, "p_gex": pg/1e6}
+                              for s, g, cg, pg in top]
+    result["total_gex_m"] = total_gex_b
+    return result
+
+
 def _oi_opportunity_table(ticker: str, conn, df, spot: float) -> str:
     """
-    Buy/sell opportunity tables from strike OI data.
-    Returns formatted HTML string or empty string.
+    Buy/sell opportunity cards with investment needed, P&L in $, time to monitor.
+    Each card is 2 lines to stay ≤28 chars on mobile.
     """
     if df.empty or spot <= 0:
         return ""
-    # HV20 from stock_daily
+
+    # ── HV20 ──────────────────────────────────────────────────────────
     hv = 0.30
     try:
         _hsd = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
@@ -3738,24 +3853,50 @@ def _oi_opportunity_table(ticker: str, conn, df, spot: float) -> str:
             hv = max(0.10, min(hv, 2.0))
     except Exception:
         pass
-    # Nearest DTE from options_change expiry data
+
+    # ── Nearest DTE ────────────────────────────────────────────────────
     dte = 21
+    exp_str = ""
     try:
         _edt = pd.read_sql("""SELECT DISTINCT expiry_date FROM options_change WHERE ticker=?
             AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) >= ?
             ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) LIMIT 1""",
             conn, params=(ticker, datetime.now().strftime("%Y%m%d")))
         if not _edt.empty:
-            _exp_s = _edt["expiry_date"].iloc[0]
-            dte = max(1, (datetime.strptime(str(_exp_s), "%m-%d-%Y") - datetime.now()).days)
+            exp_str = _edt["expiry_date"].iloc[0]
+            dte = max(1, (datetime.strptime(str(exp_str), "%m-%d-%Y") - datetime.now()).days)
     except Exception:
         pass
+
+    # ── Earnings flag ─────────────────────────────────────────────────
+    earn_dte = _get_earnings_dte(ticker)
+    earn_flag = ""
+    if earn_dte is not None and 0 <= earn_dte <= 14:
+        earn_flag = f" ⚡EARN{earn_dte}d"
+
     T = max(dte, 1) / 365.0
     r = 0.045
     sigma = max(hv, 0.15)
 
-    buy_opps = []   # (strat, strike, pwin_int, rr_str, tag)
+    # Monitor cadence based on DTE
+    if dte <= 7:
+        monitor = "daily — gamma burning"
+    elif dte <= 21:
+        monitor = "every 2-3d"
+    else:
+        monitor = "weekly"
+
+    def _fmt_d(n):
+        """Format dollar amount compactly."""
+        a = abs(float(n or 0))
+        if a >= 1_000_000: return f"${a/1e6:.1f}M"
+        if a >= 1_000:     return f"${a/1e3:.1f}K"
+        return f"${a:.0f}"
+
+    buy_opps  = []  # (strat, strike, pw, rr, invest$, max_profit$, max_loss$)
     sell_opps = []
+
+    spread_width = max(spot * 0.03, 2.0)   # ~3% of spot as spread width assumption
 
     for _, row in df.iterrows():
         strike = float(row["strike"])
@@ -3765,32 +3906,49 @@ def _oi_opportunity_table(ticker: str, conn, df, spot: float) -> str:
         p_oi   = float(row.get("put_oi",   0) or 0)
         pct    = (strike - spot) / spot * 100 if spot > 0 else 0
         try:
-            g = bs_greeks(spot, strike, T, r, sigma, "call")
-            delta_c = float(g["delta"])
-            g2 = bs_greeks(spot, strike, T, r, sigma, "put")
-            delta_p = abs(float(g2["delta"]))
+            g_c = bs_greeks(spot, strike, T, r, sigma, "call")
+            g_p = bs_greeks(spot, strike, T, r, sigma, "put")
+            px_c   = float(g_c["price"])
+            px_p   = float(g_p["price"])
+            delta_c = float(g_c["delta"])
+            delta_p = abs(float(g_p["delta"]))
         except Exception:
+            px_c = max(0, spot - strike) / 100; px_p = max(0, strike - spot) / 100
             delta_c = 0.5; delta_p = 0.5
         pw_c = int(delta_c * 100)
         pw_p = int(delta_p * 100)
+        inv_c = max(px_c * 100, 1.0)   # cost per 1 contract ($)
+        inv_p = max(px_p * 100, 1.0)
+        inv_strd = inv_c + inv_p
+        be_c = inv_c / 100   # break-even move needed on stock
+        be_p = inv_p / 100
 
-        # ── BUY opportunities ──────────────────────────────────────
+        # ── BUY opportunities ──────────────────────────────────────────
         if c_chg > 500 and pct > -8:
-            rr_c = f"{max(1, int(1/(max(delta_c,0.1))))}:1"
-            buy_opps.append(("BUY CALL", strike, pw_c, rr_c))
+            target_profit = inv_c * 2   # 2:1 R:R target
+            buy_opps.append(("BUY CALL", strike, pw_c, "2:1", inv_c, target_profit, inv_c))
         if p_chg > 500 and pct < 8:
-            rr_p = f"{max(1, int(1/(max(delta_p,0.1))))}:1"
-            buy_opps.append(("BUY PUT ", strike, pw_p, rr_p))
+            target_profit = inv_p * 2
+            buy_opps.append(("BUY PUT ", strike, pw_p, "2:1", inv_p, target_profit, inv_p))
         if c_chg > 300 and p_chg > 300:
-            buy_opps.append(("STRADDLE", strike, 55, "2:1"))
+            buy_opps.append(("STRADDLE", strike, 55, "2:1", inv_strd, inv_strd * 2, inv_strd))
 
-        # ── SELL / Income opportunities ─────────────────────────────
+        # ── SELL / Income opportunities ────────────────────────────────
         if p_oi > 2000 and abs(pct) > 5 and p_chg >= -300:
-            sell_opps.append(("SELL PUT ", strike, int((1-delta_p)*100), "1:3"))
+            # Sell put spread: receive premium, risk = spread_width - premium
+            rcv = px_p * 100
+            risk = max(spread_width * 100 - rcv, rcv * 0.5)
+            sell_opps.append(("SELL PUT", strike, int((1-delta_p)*100), "1:3", rcv, rcv, risk))
         if c_oi > 2000 and pct > 5:
-            sell_opps.append(("SELL CALL", strike, int((1-delta_c)*100), "1:3"))
+            rcv = px_c * 100
+            risk = max(spread_width * 100 - rcv, rcv * 0.5)
+            sell_opps.append(("SELL CALL", strike, int((1-delta_c)*100), "1:3", rcv, rcv, risk))
         if c_chg > 300 and p_chg > 300 and abs(pct) > 2:
-            sell_opps.append(("IRON COND", strike, max(55, int((1-delta_c)*100)), "1:2"))
+            # Iron condor: collect both premiums, risk = spread - collected
+            rcv_ic = (px_c + px_p) * 100 * 0.5   # rough: one side only
+            risk_ic = max(spread_width * 100 - rcv_ic, rcv_ic)
+            sell_opps.append(("IRON COND", strike, max(55, int((1-delta_c)*100)), "1:2",
+                              rcv_ic, rcv_ic, risk_ic))
 
     def _dedup(lst):
         seen = set(); out = []
@@ -3807,19 +3965,43 @@ def _oi_opportunity_table(ticker: str, conn, df, spot: float) -> str:
         return ""
 
     lines = []
-    hdr_b = "{:<8} {:>5} {:>4} {:>4}".format("Strat","Stk","P(W)","R:R")
-    sep   = "-" * 24
+    exp_label = f" exp {exp_str[:5]}" if exp_str else ""
+    lines.append(f"\n<b>Trade Ideas{exp_label}{earn_flag}</b>")
+    lines.append(f"<i>HV:{hv*100:.0f}%  DTE:{dte}d  Monitor:{monitor}</i>")
+
+    def _fk(n):
+        a = abs(float(n or 0))
+        if a >= 1_000_000: return f"{a/1e6:.1f}M"
+        if a >= 1_000:     return f"{a/1e3:.0f}K"
+        return f"{a:.0f}"
+
+    # ── BUY table ──────────────────────────────────────────────────
     if buy_opps:
-        lines.append("\n<b>📈 BUY Opportunities</b>")
-        rows_b = ["{:<8} ${:<4.0f} {:>3}% {:>4}".format(
-            op[0][:8], op[1], op[2], op[3]) for op in buy_opps]
-        lines.append("<pre>" + "\n".join([hdr_b, sep] + rows_b) + "</pre>")
+        # cols: Strat(4) Stk(4) Win(3) In$(5) P$(5) L$(5)  total=~28
+        _bh = "{:<5} {:>4} {:>3}%  {:>5} {:>5} {:>5}".format("Strat","Stk","Win","In$","P$","L$")
+        _bsep = "-" * 28
+        _brows = [_bh, _bsep]
+        for strat, strike, pw, rr, invest, profit, loss in buy_opps:
+            _s = strat.replace("BUY ","").replace("STRADDLE","STRD")[:5]
+            _brows.append("{:<5} {:>4} {:>3}%  {:>5} {:>5} {:>5}".format(
+                _s, f"{strike:.0f}", pw, _fk(invest), _fk(profit), _fk(loss)))
+        lines.append("\n<b>BUY (pay premium)</b>\n<pre>" + "\n".join(_brows) + "</pre>")
+
+    # ── SELL table ─────────────────────────────────────────────────
     if sell_opps:
-        lines.append("\n<b>💰 SELL / Income Opps</b>")
-        rows_s = ["{:<8} ${:<4.0f} {:>3}% {:>4}".format(
-            op[0][:8], op[1], op[2], op[3]) for op in sell_opps]
-        lines.append("<pre>" + "\n".join([hdr_b, sep] + rows_s) + "</pre>")
-    lines.append("<i>P(W)=prob ITM at expiry·R:R=approx·verify prices before trading</i>")
+        # cols: Strat(5) Stk(4) Win(3) Rcv$(5) Risk$(5)  total=~26
+        _sh = "{:<5} {:>4} {:>3}%  {:>5} {:>5}".format("Strat","Stk","Win","Rcv$","Risk")
+        _ssep = "-" * 26
+        _srows = [_sh, _ssep]
+        for strat, strike, pw, rr, invest, profit, loss in sell_opps:
+            _s = strat.replace("SELL ","S").replace("IRON COND","ICOND")[:5]
+            _srows.append("{:<5} {:>4} {:>3}%  {:>5} {:>5}".format(
+                _s, f"{strike:.0f}", pw, _fk(invest), _fk(loss)))
+        lines.append("\n<b>SELL (collect premium)</b>\n<pre>" + "\n".join(_srows) + "</pre>")
+
+    if earn_flag:
+        lines.append(f"<i>Earnings in {earn_dte}d — IV crush after event. Buy straddle before, sell spread after.</i>")
+    lines.append("<i>In=invest P=profit L=loss · 1 contract=100sh</i>")
     return "\n".join(lines)
 
 
@@ -4021,7 +4203,7 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
         if p < -300:                  return "HUPD"
         return "FLAT"
 
-    tbl_lines = ["<pre>", "Stk   CΔ    PΔ   Sig", "─" * 21]
+    tbl_lines = ["<pre>", "Stk   C-Chg  P-Chg Sig", "-" * 23]
     for _, r in df.sort_values("strike").iterrows():
         c = float(r["call_chg"] or 0)
         p = float(r["put_chg"] or 0)
@@ -15578,13 +15760,41 @@ async def mirofish_ticker_detail(query, ticker):
                 )
         except Exception: pass
 
-
-
-
-
-
-
-
+        # ── GEX + Earnings ──────────────────────────────────────────────
+        try:
+            _conn_gx = get_conn()
+            _sd_gx = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
+                ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1""",
+                _conn_gx, params=(tk,))
+            _spot_gx = float(_sd_gx["close"].iloc[0]) if not _sd_gx.empty else 0.0
+            if _spot_gx > 0:
+                _gx     = _compute_gex(tk, _conn_gx, _spot_gx)
+                _gtm    = _gx.get("total_gex_m", 0.0)
+                _gsig   = _gx.get("gex_signal", "?")
+                _greg   = _gx.get("regime", "")
+                _gzero  = _gx.get("zero_gamma")
+                _gtop   = _gx.get("top_strikes", [])
+                _earn_dt = _get_earnings_dte(tk)
+                _eflag  = f"  EARN{_earn_dt}d" if _earn_dt is not None and 0 <= _earn_dt <= 14 else ""
+                _grow   = []
+                for _gs in _gtop[:4]:
+                    _sign = "+" if _gs["gex_m"] >= 0 else ""
+                    _grow.append(f"  ${_gs['strike']:.0f}  {_sign}{_gs['gex_m']:.1f}M")
+                _sign_str = "+" if _gtm >= 0 else ""
+                _zero_line = f"{'Zero-G':<10} ${_gzero:.1f}\n" if _gzero else ""
+                _gex_body = (
+                    f"{'Total GEX':<10} {_sign_str}{_gtm:.1f}M\n"
+                    + _zero_line
+                    + "\n".join(_grow)
+                )
+                parts.append(
+                    f"\n<b>GEX: {_gsig}</b>{_eflag}\n"
+                    + mono(_gex_body)
+                    + f"\n<i>{_greg[:60]}</i>"
+                )
+            _conn_gx.close()
+        except Exception as _gex_e:
+            log.warning(f"GEX inst_signals failed: {_gex_e}")
 
     try:
         await _loading.delete()
@@ -17245,36 +17455,57 @@ async def oi_menu(query, expiry=None):
             parse_mode=H, reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
         return
 
-    parts = [hdr(f"📊 OI ANALYTICS · Exp {chosen_expiry}")]
-    parts.append(f"Data as of: <b>{latest_trade_date}</b> · <b>{len(df)} tickers</b>")
+    parts = [hdr(f"OI ANALYTICS · Exp {chosen_expiry}")]
+    parts.append(f"<i>Data: <b>{latest_trade_date}</b>  Tickers: <b>{len(df)}</b></i>")
 
-    # Top by total OI — dynamic column widths (NSE-style: measure data first, then render)
-    top_oi = df.head(8)
     def _fk_oi(n):
         n = float(n or 0)
-        if n >= 1_000_000_000: return f"{n/1_000_000_000:.1f}B"
-        if n >= 100_000_000:   return f"{n/1_000_000:.0f}M"
-        if n >= 10_000_000:    return f"{n/1_000_000:.1f}M"
-        if n >= 1_000_000:     return f"{n/1_000_000:.2f}M"
-        if n >= 1_000:         return f"{n/1_000:.0f}K"
+        if n >= 1_000_000_000: return f"{n/1e9:.1f}B"
+        if n >= 1_000_000:     return f"{n/1e6:.1f}M"
+        if n >= 1_000:         return f"{n/1e3:.0f}K"
         return f"{n:.0f}"
-    _oi_tbl_data = [
-        (str(r["ticker"]), _fk_oi(r["total_call_oi"]), _fk_oi(r["total_put_oi"]),
-         f"{min(float(r['pcr'] or 0), 9.99):.2f}")
-        for _, r in top_oi.iterrows()
-    ]
-    parts.append("\n<b>Top by Open Interest</b>\n"
-                 + _pipe_table(("Ticker", "Call OI", "Put OI", "PCR"), _oi_tbl_data, right_cols={1, 2, 3}))
 
-    # Highest PCR
+    def _pcr_bias(pcr):
+        if pcr > 1.3: return "BEAR"
+        if pcr < 0.7: return "BULL"
+        return "NEU"
+
+    # ── Market summary ────────────────────────────────────────────
+    try:
+        _tot_c = float(df["total_call_oi"].sum()); _tot_p = float(df["total_put_oi"].sum())
+        _mkt_pcr = _tot_p / _tot_c if _tot_c > 0 else 0
+        parts.append(
+            "<pre>"
+            + "{:<6} {:>6}  {:>6}  {:>4}  {:<4}".format("MARKET", _fk_oi(_tot_c), _fk_oi(_tot_p), f"{_mkt_pcr:.2f}", _pcr_bias(_mkt_pcr))
+            + "</pre>"
+        )
+    except Exception:
+        pass
+
+    # ── Top by Open Interest ──────────────────────────────────────
+    top_oi = df.head(8)
+    _oi_hdr = "{:<6} {:>6}  {:>6}  {:>4}  {:<4}".format("Tkr","Call","Put","PCR","Bias")
+    _oi_sep = "-" * 28
+    _oi_rows = [_oi_hdr, _oi_sep]
+    for _, r in top_oi.iterrows():
+        _pv = min(float(r["pcr"] or 0), 9.99)
+        _oi_rows.append("{:<6} {:>6}  {:>6}  {:>4}  {:<4}".format(
+            str(r["ticker"])[:6], _fk_oi(r["total_call_oi"]), _fk_oi(r["total_put_oi"]),
+            f"{_pv:.2f}", _pcr_bias(_pv)))
+    parts.append("\n<b>Top Open Interest</b>\n<pre>" + "\n".join(_oi_rows) + "</pre>")
+
+    # ── Highest PCR ───────────────────────────────────────────────
     high_pcr = df[df["pcr"] > 0].nlargest(5, "pcr")
     if not high_pcr.empty:
-        _pcr_tbl = []
+        _ph = "{:<6} {:>4}  {:<4}  {:<6}".format("Tkr","PCR","Bias","Signal")
+        _psep = "-" * 24
+        _prows = [_ph, _psep]
         for _, r in high_pcr.iterrows():
-            bias = "Bearish" if r["pcr"] > 1.3 else ("Bullish" if r["pcr"] < 0.7 else "Neutral")
-            _pcr_tbl.append((str(r["ticker"]), f"{min(float(r['pcr'] or 0), 9.99):.2f}", bias))
-        parts.append("\n<b>Highest Put/Call Ratio</b>\n"
-                     + _pipe_table(("Ticker", "PCR", "Bias"), _pcr_tbl, right_cols={1}))
+            _pv = min(float(r["pcr"] or 0), 9.99)
+            _pb = _pcr_bias(_pv)
+            _sig = "HEDGE" if _pv > 2 else ("BEAR" if _pb == "BEAR" else ("BULL" if _pb == "BULL" else "NEUT"))
+            _prows.append("{:<6} {:>4}  {:<4}  {:<6}".format(str(r["ticker"])[:6], f"{_pv:.2f}", _pb, _sig))
+        parts.append("\n<b>Put/Call Ratio Leaders</b>\n<pre>" + "\n".join(_prows) + "</pre>")
 
     # Build expiry selection buttons (expiry_date values)
     exp_btns = []
@@ -20296,6 +20527,103 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
         log.warning(f"intraday_alert OI query failed: {e}")
     finally:
         conn.close()
+
+    # ── Rolling P&L Tracker ───────────────────────────────────────
+    _pnl_conn = get_conn()
+    try:
+        _pt = pd.read_sql(
+            "SELECT trade_id, ticker, option_type, strike, entry_price, quantity, expiry "
+            "FROM trades WHERE status='OPEN' ORDER BY trade_id",
+            _pnl_conn)
+        if not _pt.empty:
+            _pnl_ld = pd.read_sql("""SELECT DISTINCT trade_date_now FROM options_change
+                ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1""",
+                _pnl_conn)
+            _pnl_latest = _pnl_ld["trade_date_now"].iloc[0] if not _pnl_ld.empty else ""
+
+            _pnl_rows  = []
+            _total_pnl = 0.0
+
+            for _, _tr in _pt.iterrows():
+                _tk2  = str(_tr["ticker"]).upper()
+                _ot   = str(_tr.get("option_type") or "call").upper()
+                _stk  = float(_tr.get("strike") or 0)
+                _entr = float(_tr.get("entry_price") or 0)
+                _qty  = int(_tr.get("quantity") or 1)
+                _exp2 = str(_tr.get("expiry") or "")
+
+                _dte2 = 21
+                try:
+                    _dte2 = max(1, (datetime.strptime(_exp2[:10], "%Y-%m-%d").date() - datetime.now().date()).days)
+                except Exception:
+                    try:
+                        _dte2 = max(1, (datetime.strptime(_exp2[:10], "%m-%d-%Y").date() - datetime.now().date()).days)
+                    except Exception:
+                        pass
+
+                _spot2 = 0.0
+                _hv2   = 0.25
+                try:
+                    _h2 = yf.Ticker(_tk2).history(period="5d")
+                    if not _h2.empty:
+                        _spot2 = float(_h2["Close"].iloc[-1])
+                    if len(_h2) >= 4:
+                        _r2 = _h2["Close"].pct_change().dropna()
+                        _hv2 = max(0.10, min(float(_r2.std() * (252**0.5)), 2.0))
+                except Exception:
+                    pass
+
+                _cur_px2 = _entr
+                try:
+                    if _spot2 > 0 and _stk > 0:
+                        _g2 = bs_greeks(_spot2, _stk, max(_dte2, 1) / 365, 0.045, _hv2, _ot.lower())
+                        if _g2["price"] > 0:
+                            _cur_px2 = _g2["price"]
+                except Exception:
+                    pass
+
+                _pnl2  = (_cur_px2 - _entr) * _qty * 100
+                _pct2  = (_pnl2 / abs(_entr * _qty * 100) * 100) if _entr > 0 else 0
+                _total_pnl += _pnl2
+
+                _oi_align2 = "?"
+                if _pnl_latest:
+                    try:
+                        _oif = pd.read_sql("""SELECT SUM(change_OI_Call) as cc, SUM(change_OI_Put) as pc
+                            FROM options_change WHERE ticker=? AND trade_date_now=?""",
+                            _pnl_conn, params=(_tk2, _pnl_latest))
+                        if not _oif.empty:
+                            _cc2 = float(_oif["cc"].iloc[0] or 0)
+                            _pc2 = float(_oif["pc"].iloc[0] or 0)
+                            _oi_dir2 = ("BULL" if _cc2 > abs(_pc2) * 1.1
+                                        else ("BEAR" if _pc2 > abs(_cc2) * 1.1 else "FLAT"))
+                            if (_ot == "CALL" and _oi_dir2 == "BULL") or (_ot == "PUT" and _oi_dir2 == "BEAR"):
+                                _oi_align2 = "OK"
+                            elif _oi_dir2 == "FLAT":
+                                _oi_align2 = "FLAT"
+                            else:
+                                _oi_align2 = "WARN"
+                    except Exception:
+                        pass
+
+                _pnl_s = (f"+${_pnl2:,.0f}" if _pnl2 >= 0 else f"-${abs(_pnl2):,.0f}")
+                _pnl_rows.append((_tk2[:4], _ot[:1], f"${_stk:.0f}", f"{_pct2:+.0f}%", _pnl_s[:7], _oi_align2))
+
+            if _pnl_rows:
+                _hdr28  = "{:<4} {:1} {:>5}  {:>5} {:>7}  {:<4}".format("Tkr","T","Stk","P%","P&L$","OI")
+                _sep28  = "-" * 28
+                _tlines = [_hdr28, _sep28]
+                for _r28 in _pnl_rows:
+                    _tlines.append("{:<4} {:1} {:>5}  {:>5} {:>7}  {:<4}".format(*_r28))
+                _tlines.append(_sep28)
+                _net_s = (f"+${_total_pnl:,.0f}" if _total_pnl >= 0 else f"-${abs(_total_pnl):,.0f}")
+                _tlines.append(f"Net: {_net_s}")
+                parts.append("\n<b>ROLLING P&L vs OI FLOW</b>\n<pre>" + "\n".join(_tlines) + "</pre>")
+    except Exception as _pnl_e:
+        log.warning(f"rolling_pnl_tracker failed: {_pnl_e}")
+    finally:
+        _pnl_conn.close()
+
 
     # ── Momentum scanner: top bull + bear signals ─────────────────
     try:
