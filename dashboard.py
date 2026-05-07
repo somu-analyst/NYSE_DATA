@@ -1699,6 +1699,7 @@ with st.sidebar:
         "⚡ Trade Risk Calculator",
         "🎯 Next-Day Exit Planner",
         "🚀 Live Momentum Scanner",
+        "🧠 High-Prob Engine",
     ], label_visibility="collapsed")
 
     st.markdown("---")
@@ -8673,3 +8674,234 @@ if page == "🚀 Live Momentum Scanner":
         st.plotly_chart(fig_scatter, use_container_width=True)
 
     st.caption("⚠️ All signals are algorithmic based on price momentum and volume. Always verify with OI data, news, and your own analysis before trading. Past momentum does not guarantee future returns.")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGE: HIGH-PROB ENGINE (22-model ensemble)
+# ═══════════════════════════════════════════════════════════════════════════
+if page == "🧠 High-Prob Engine":
+    import math as _hpmath
+    try:
+        from scipy.stats import norm as _hpnorm
+    except ImportError:
+        _hpnorm = None
+    import numpy as _hpnp
+
+    st.title("🧠 22-Model High-Probability Signal Engine")
+    st.caption("VRVP · VWAP · VRP · Put/Call Wall · IV Rank · GEX · PCR-Z · Left Skew · VRP · EM Breach")
+
+    # Import model functions from telegram_bot at runtime
+    @st.cache_resource(show_spinner=False)
+    def _load_hp_models():
+        import importlib.util, sys as _sys
+        spec = importlib.util.spec_from_file_location(
+            "telegram_bot",
+            r"C:\Users\srini\Options_chain_data\NYSE_DATA\telegram_bot.py")
+        mod = importlib.util.module_from_spec(spec)
+        # Prevent bot from starting
+        mod.__name__ = "_hp_import_only"
+        try:
+            spec.loader.exec_module(mod)
+        except SystemExit:
+            pass
+        except Exception:
+            pass
+        return mod
+
+    # Safer: extract only the HP functions via exec of the relevant slice
+    @st.cache_resource(show_spinner=False)
+    def _get_hp_ns():
+        import math as _m
+        try:
+            from scipy.stats import norm as _sn
+        except ImportError:
+            return None
+        import numpy as _np, pandas as _pd
+        from datetime import datetime as _dt, timezone as _tz
+        import logging
+        _log = logging.getLogger("hp_dash")
+        with open(r"C:\Users\srini\Options_chain_data\NYSE_DATA\telegram_bot.py", encoding="utf-8") as _f:
+            _src = _f.read()
+        _start = _src.find("def _bs_gamma_hp")
+        _end   = _src.find("\n\n\ndef main()")
+        _ns = {"_math": _m, "_spnorm": _sn, "np": _np, "pd": _pd,
+               "datetime": _dt, "timezone": _tz, "log": _log}
+        exec(_src[_start:_end], _ns)
+        return _ns
+
+    hp_ns = _get_hp_ns()
+
+    # Ticker selector
+    col_t, col_r = st.columns([3, 1])
+    with col_t:
+        all_tickers = sorted([r[0] for r in get_conn().execute(
+            "SELECT DISTINCT ticker FROM stock_daily ORDER BY ticker").fetchall()])
+        sel_ticker = st.selectbox("Select Ticker", all_tickers, index=all_tickers.index("SPY") if "SPY" in all_tickers else 0)
+    with col_r:
+        run_btn = st.button("🚀 Run Engine", type="primary", use_container_width=True)
+
+    # Also show open positions for quick access
+    open_pos_tickers = []
+    try:
+        _ot = get_conn().execute("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'").fetchall()
+        open_pos_tickers = [r[0] for r in _ot]
+    except Exception:
+        pass
+    if open_pos_tickers:
+        st.info(f"**Open positions:** {' · '.join(open_pos_tickers)} — click to analyze")
+        pos_cols = st.columns(min(len(open_pos_tickers), 6))
+        for ci, tk in enumerate(open_pos_tickers[:6]):
+            if pos_cols[ci].button(tk, key=f"hp_pos_{tk}"):
+                sel_ticker = tk
+                run_btn = True
+
+    if run_btn and hp_ns:
+        with st.spinner(f"Running 22 models for {sel_ticker}…"):
+            try:
+                conn_hp = get_conn()
+                # Get SPY context
+                try:
+                    _spy = conn_hp.execute(
+                        "SELECT close FROM stock_daily WHERE ticker='SPY'"
+                        " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 2"
+                    ).fetchall()
+                    spy_ret = (float(_spy[0][0]) / float(_spy[1][0]) - 1) * 100 if len(_spy) >= 2 else 0.0
+                except Exception:
+                    spy_ret = 0.0
+
+                res = hp_ns["high_prob_signals_engine"](sel_ticker, conn_hp, spy_ret)
+                conn_hp.close()
+
+                sig   = res["signal"]
+                prob  = res["prob"]
+                conf  = res["conf"]
+                spot  = res["spot"]
+                total_m = res.get("total_m", 22)
+
+                # Header metrics
+                sig_color = {"BULL": "green", "BEAR": "red", "SELL_PREMIUM": "orange", "NEUTRAL": "gray"}.get(sig, "gray")
+                sig_icon  = {"BULL": "🟢", "BEAR": "🔴", "SELL_PREMIUM": "💰", "NEUTRAL": "⚪"}.get(sig, "⚪")
+                conf_icon = {"HIGH": "🔥", "MEDIUM": "✅", "LOW": "⚠️"}.get(conf, "⚠️")
+
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Signal", f"{sig_icon} {sig}")
+                m2.metric("Probability", f"{prob:.0f}%")
+                m3.metric("Confidence", f"{conf_icon} {conf}")
+                m4.metric("Spot Price", f"${spot:.2f}")
+                m5.metric("Models", f"{res['bull_v']}🟢 {res['bear_v']}🔴 {res.get('sell_v',0)}💰 /{total_m}")
+
+                # Strategy box
+                warn = res.get("warn", "")
+                box_color = "#1a3a1a" if sig == "BULL" else ("#3a1a1a" if sig == "BEAR" else "#2a2a0a")
+                st.markdown(
+                    f"<div style='background:{box_color};padding:14px;border-radius:8px;"
+                    f"border-left:4px solid {'#4CAF50' if sig=='BULL' else '#f44336' if sig=='BEAR' else '#FFC107'}'>"
+                    f"<b>📋 Strategy:</b> {res['strategy']}<br>"
+                    + (f"⚠️ {warn}" if warn else "")
+                    + "</div>", unsafe_allow_html=True)
+                st.markdown("")
+
+                # VRVP Box section
+                vbox = res.get("vrvp_box", {})
+                wall = res["models"].get("put_call_wall", {})
+                if vbox.get("poc") or wall.get("put_wall"):
+                    vc1, vc2 = st.columns(2)
+                    if vbox.get("poc"):
+                        with vc1:
+                            st.markdown("#### 📦 Volume Profile (VRVP) Box")
+                            vdf = {
+                                "Level": ["POC (max vol)", "Value Area High", "Value Area Low",
+                                          "Premium Box HI", "Premium Box LO", "Current Spot"],
+                                "Price": [
+                                    f"${vbox.get('poc',0):.2f}",
+                                    f"${vbox.get('vah',0):.2f}",
+                                    f"${vbox.get('val',0):.2f}",
+                                    f"${vbox.get('hi',0):.2f}",
+                                    f"${vbox.get('lo',0):.2f}",
+                                    f"${spot:.2f}",
+                                ],
+                                "Role": ["Strongest magnet", "Sell call above",
+                                         "Sell put below", "Upper IC strike",
+                                         "Lower IC strike", "→ vs box"],
+                            }
+                            import pandas as _pdf
+                            st.dataframe(_pdf.DataFrame(vdf), hide_index=True, use_container_width=True)
+                            vrvp_r = res["models"].get("vrvp", {})
+                            if vrvp_r.get("reason"):
+                                st.caption(vrvp_r["reason"])
+
+                    if wall.get("put_wall"):
+                        with vc2:
+                            st.markdown("#### 🧱 Put / Call Walls")
+                            pw = wall.get("put_wall", 0)
+                            cw = wall.get("call_wall", 0)
+                            pw_str = wall.get("pw_str", 1)
+                            cw_str = wall.get("cw_str", 1)
+                            pw_dist = abs(spot - pw) / spot * 100
+                            cw_dist = abs(cw - spot) / spot * 100
+                            st.metric("Put Wall (Support)", f"${pw:.2f}",
+                                      delta=f"{pw_str:.1f}x OI avg · {pw_dist:.1f}% below")
+                            st.metric("Call Wall (Resistance)", f"${cw:.2f}",
+                                      delta=f"{cw_str:.1f}x OI avg · {cw_dist:.1f}% above")
+                            if wall.get("reason"):
+                                st.caption(wall["reason"])
+                    st.markdown("---")
+
+                # All 22 model results table
+                st.markdown("#### 📊 All 22 Model Outputs")
+                _ML_LABELS = {
+                    "gex": "GEX Regime", "pcr_z": "PCR Z-Score",
+                    "oi_momentum": "OI 3D Momentum", "gamma_pin": "Gamma Pin",
+                    "vol_flow": "Vol Flow", "iv_skew": "IV Skew",
+                    "rv_iv": "RV/IV Spread", "oi_term_struct": "OI Term Struct",
+                    "maxpain_vel": "Max Pain Velocity", "iv_rank": "IV Rank",
+                    "pcp_dev": "PCP Deviation", "vol_regime": "Vol Regime",
+                    "multi_expiry": "Multi-Expiry OI", "smart_uoa": "Smart Money UOA",
+                    "hhi_pin": "HHI Pin", "pcr_vel": "PCR Velocity",
+                    "vrvp": "VRVP (Vol Profile)", "vwap_dev": "VWAP Deviation",
+                    "expected_move": "Expected Move", "left_skew": "Left-Tail Skew",
+                    "vrp": "Vol Risk Premium", "put_call_wall": "Put/Call Wall",
+                }
+                tbl_rows = []
+                for nm, lbl in _ML_LABELS.items():
+                    r   = res["models"].get(nm, {})
+                    ms  = r.get("signal", "NEUTRAL")
+                    mp  = r.get("prob", 50)
+                    mw  = res["weights"].get(nm, 1.0)
+                    rsn = r.get("reason", "")[:80]
+                    em  = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪", "SELL_PREMIUM": "💰"}.get(ms, "⚪")
+                    tbl_rows.append({
+                        "Model": lbl, "Signal": f"{em} {ms}",
+                        "Prob%": mp, "Weight": round(mw, 2), "Reason": rsn,
+                    })
+                import pandas as _pdf2
+                tdf = _pdf2.DataFrame(tbl_rows)
+
+                def _highlight(row):
+                    sig_ = row["Signal"]
+                    if "BULL" in sig_:      return ["background-color:#1a3a1a"]*len(row)
+                    elif "BEAR" in sig_:    return ["background-color:#3a1a1a"]*len(row)
+                    elif "PREMIUM" in sig_: return ["background-color:#2a2a0a"]*len(row)
+                    return [""]*len(row)
+
+                st.dataframe(
+                    tdf.style.apply(_highlight, axis=1).bar(
+                        subset=["Prob%"], color=["#4CAF50", "#f44336"], vmin=40, vmax=90),
+                    hide_index=True, use_container_width=True, height=680)
+
+                # Premium sell signals summary
+                sell_models = [(nm, r) for nm, r in res["models"].items()
+                               if r.get("signal") == "SELL_PREMIUM" and r.get("prob", 0) >= 60]
+                if sell_models:
+                    st.markdown("#### 💰 Premium Collection Opportunities")
+                    for nm, r in sorted(sell_models, key=lambda x: -x[1].get("prob", 0)):
+                        lbl = _ML_LABELS.get(nm, nm)
+                        prob_ = r.get("prob", 0)
+                        rsn_  = r.get("reason", "")
+                        st.success(f"**{lbl}** — {prob_}% confidence\n\n{rsn_}")
+
+            except Exception as _e:
+                st.error(f"Engine error: {_e}")
+                import traceback
+                st.code(traceback.format_exc())
+    elif run_btn and not hp_ns:
+        st.error("Could not load model functions. Check that scipy is installed.")
