@@ -9272,27 +9272,54 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
     n_pos   = len(html_cards)
     footer  = f"\n{net_em} <b>Portfolio total: ${total_pnl:+,.0f}</b>  ({n_pos} open position{'s' if n_pos != 1 else ''})"
 
+    # ── High-Prob Engine output per position ticker ────────────────────
+    hp_section = ""
+    try:
+        conn_hp_pm = get_conn()
+        _hp_pm_lines = []
+        for _htk_pm in trades["ticker"].str.upper().unique().tolist()[:4]:
+            try:
+                _hr_pm = high_prob_signals_engine(_htk_pm, conn_hp_pm, 0.0)
+                _he_pm = {"BULL":"🟢","BEAR":"🔴","NEUTRAL":"⚪","SELL_PREMIUM":"💰"}.get(_hr_pm["signal"],"⚪")
+                _bv_pm=_hr_pm["bull_v"]; _rv_pm=_hr_pm["bear_v"]; _sv_pm=_hr_pm.get("sell_v",0)
+                _tm_pm=_hr_pm.get("total_m",22); _pb_pm=_hr_pm["prob"]
+                _hp_pm_lines.append(f"<b>{_htk_pm}</b> {_he_pm}{_hr_pm['signal']} {_pb_pm:.0f}% [🟢{_bv_pm}🔴{_rv_pm}💰{_sv_pm}/{_tm_pm}]")
+                _hp_pm_lines.append(f"  → {_hr_pm['strategy'][:55]}")
+                _vb_pm=_hr_pm.get("vrvp_box",{})
+                if _vb_pm.get("lo"):
+                    _hp_pm_lines.append(f"  📦 ${_vb_pm['lo']:.0f}-${_vb_pm['hi']:.0f} POC ${_vb_pm.get('poc',0):.0f}")
+                _wl_pm=_hr_pm["models"].get("put_call_wall",{})
+                if _wl_pm.get("put_wall") and _wl_pm.get("prob",0)>=66:
+                    _hp_pm_lines.append(f"  🧱 P${_wl_pm['put_wall']:.0f}/C${_wl_pm['call_wall']:.0f}")
+            except Exception as _e_pm: log.debug(f"pos_mon hp {_htk_pm}: {_e_pm}")
+        if _hp_pm_lines:
+            hp_section = "\n\n<b>🧠 22-Model Signals:</b>\n" + "\n".join(_hp_pm_lines)
+        conn_hp_pm.close()
+    except Exception as _e_hp_pm: log.debug(f"pos_mon hp block: {_e_hp_pm}")
+
     full_msg = (
         f"{hdr(f'💼 POSITIONS · {now_s}')}\n\n"
         + colour_section
         + urgent_section
+        + hp_section
         + footer
     )
 
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("💼 Positions", callback_data="menu_positions"),
         InlineKeyboardButton("🎯 Exit Plan", callback_data="menu_exit"),
+        InlineKeyboardButton("🧠 HP Engine", callback_data=f"high_prob_{_first_tk}"),
     ]])
     try:
         if len(full_msg) <= 4000:
             await ctx.bot.send_message(chat_id=int(chat_id), text=full_msg,
                                        parse_mode=H, reply_markup=kb)
         else:
-            # Split: header + cards, then urgent + footer
+            # Split: header + cards, then urgent + hp + footer
             header_cards = f"{hdr(f'💼 POSITIONS · {now_s}')}\n\n{colour_section}"
             await ctx.bot.send_message(chat_id=int(chat_id), text=header_cards, parse_mode=H)
             await ctx.bot.send_message(chat_id=int(chat_id),
-                                       text=urgent_section + footer,
+                                       text=urgent_section + hp_section + footer,
                                        parse_mode=H, reply_markup=kb)
     except Exception as e:
         log.warning(f"position_monitor send failed: {e}")
@@ -11028,6 +11055,33 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
             parts.append("<pre>" + "\n".join(_ml2) + "</pre>")
     except Exception as _mce:
         log.warning(f"morning macro section failed: {_mce}")
+
+    # ── High-Prob Engine per open position ───────────────────────────────
+    try:
+        conn_hp_ma = get_conn()
+        _hp_tks = pd.read_sql("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'", conn_hp_ma)
+        _hp_out = []
+        for _htk in _hp_tks["ticker"].tolist()[:5]:
+            try:
+                _hr = high_prob_signals_engine(str(_htk).upper(), conn_hp_ma, 0.0)
+                _he = {"BULL":"🟢","BEAR":"🔴","NEUTRAL":"⚪","SELL_PREMIUM":"💰"}.get(_hr["signal"],"⚪")
+                _hp_out.append(f"<b>{_htk}</b> {_he}{_hr['signal']} {_hr['prob']:.0f}% [🟢{_hr['bull_v']}🔴{_hr['bear_v']}💰{_hr.get('sell_v',0)}/{_hr.get('total_m',22)}]")
+                _hp_out.append(f"  <i>{_hr['strategy'][:60]}</i>")
+                _vb = _hr.get("vrvp_box", {})
+                if _vb.get("lo"):
+                    _hp_out.append(f"  📦 Box ${_vb['lo']:.0f}-${_vb['hi']:.0f} POC ${_vb.get('poc',0):.0f}")
+                _wl = _hr["models"].get("put_call_wall", {})
+                if _wl.get("put_wall") and _wl.get("prob",0) >= 66:
+                    _hp_out.append(f"  🧱 P${_wl['put_wall']:.0f}/C${_wl['call_wall']:.0f}")
+                if _hr.get("warn"):
+                    _hp_out.append(f"  ⚠️ {_hr['warn']}")
+                _hp_out.append("")
+            except Exception as _e_hp: log.debug(f"ma hp {_htk}: {_e_hp}")
+        if _hp_out:
+            parts.append("\n<b>🧠 HIGH-PROB ENGINE — Open Positions:</b>")
+            parts.extend(_hp_out)
+        conn_hp_ma.close()
+    except Exception as _e_hp_ma: log.debug(f"ma hp block: {_e_hp_ma}")
 
     parts.append(f"\n<i>Sent: {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>")
     parts.append("Tap /start for full menu")
@@ -20908,27 +20962,54 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
     n_pos   = len(html_cards)
     footer  = f"\n{net_em} <b>Portfolio total: ${total_pnl:+,.0f}</b>  ({n_pos} open position{'s' if n_pos != 1 else ''})"
 
+    # ── High-Prob Engine output per position ticker ────────────────────
+    hp_section = ""
+    try:
+        conn_hp_pm = get_conn()
+        _hp_pm_lines = []
+        for _htk_pm in trades["ticker"].str.upper().unique().tolist()[:4]:
+            try:
+                _hr_pm = high_prob_signals_engine(_htk_pm, conn_hp_pm, 0.0)
+                _he_pm = {"BULL":"🟢","BEAR":"🔴","NEUTRAL":"⚪","SELL_PREMIUM":"💰"}.get(_hr_pm["signal"],"⚪")
+                _bv_pm=_hr_pm["bull_v"]; _rv_pm=_hr_pm["bear_v"]; _sv_pm=_hr_pm.get("sell_v",0)
+                _tm_pm=_hr_pm.get("total_m",22); _pb_pm=_hr_pm["prob"]
+                _hp_pm_lines.append(f"<b>{_htk_pm}</b> {_he_pm}{_hr_pm['signal']} {_pb_pm:.0f}% [🟢{_bv_pm}🔴{_rv_pm}💰{_sv_pm}/{_tm_pm}]")
+                _hp_pm_lines.append(f"  → {_hr_pm['strategy'][:55]}")
+                _vb_pm=_hr_pm.get("vrvp_box",{})
+                if _vb_pm.get("lo"):
+                    _hp_pm_lines.append(f"  📦 ${_vb_pm['lo']:.0f}-${_vb_pm['hi']:.0f} POC ${_vb_pm.get('poc',0):.0f}")
+                _wl_pm=_hr_pm["models"].get("put_call_wall",{})
+                if _wl_pm.get("put_wall") and _wl_pm.get("prob",0)>=66:
+                    _hp_pm_lines.append(f"  🧱 P${_wl_pm['put_wall']:.0f}/C${_wl_pm['call_wall']:.0f}")
+            except Exception as _e_pm: log.debug(f"pos_mon hp {_htk_pm}: {_e_pm}")
+        if _hp_pm_lines:
+            hp_section = "\n\n<b>🧠 22-Model Signals:</b>\n" + "\n".join(_hp_pm_lines)
+        conn_hp_pm.close()
+    except Exception as _e_hp_pm: log.debug(f"pos_mon hp block: {_e_hp_pm}")
+
     full_msg = (
         f"{hdr(f'💼 POSITIONS · {now_s}')}\n\n"
         + colour_section
         + urgent_section
+        + hp_section
         + footer
     )
 
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("💼 Positions", callback_data="menu_positions"),
         InlineKeyboardButton("🎯 Exit Plan", callback_data="menu_exit"),
+        InlineKeyboardButton("🧠 HP Engine", callback_data=f"high_prob_{_first_tk}"),
     ]])
     try:
         if len(full_msg) <= 4000:
             await ctx.bot.send_message(chat_id=int(chat_id), text=full_msg,
                                        parse_mode=H, reply_markup=kb)
         else:
-            # Split: header + cards, then urgent + footer
+            # Split: header + cards, then urgent + hp + footer
             header_cards = f"{hdr(f'💼 POSITIONS · {now_s}')}\n\n{colour_section}"
             await ctx.bot.send_message(chat_id=int(chat_id), text=header_cards, parse_mode=H)
             await ctx.bot.send_message(chat_id=int(chat_id),
-                                       text=urgent_section + footer,
+                                       text=urgent_section + hp_section + footer,
                                        parse_mode=H, reply_markup=kb)
     except Exception as e:
         log.warning(f"position_monitor send failed: {e}")
@@ -23244,6 +23325,33 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
             parts.append("<pre>" + "\n".join(_ml2) + "</pre>")
     except Exception as _mce:
         log.warning(f"morning macro section failed: {_mce}")
+
+    # ── High-Prob Engine per open position ───────────────────────────────
+    try:
+        conn_hp_ma = get_conn()
+        _hp_tks = pd.read_sql("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'", conn_hp_ma)
+        _hp_out = []
+        for _htk in _hp_tks["ticker"].tolist()[:5]:
+            try:
+                _hr = high_prob_signals_engine(str(_htk).upper(), conn_hp_ma, 0.0)
+                _he = {"BULL":"🟢","BEAR":"🔴","NEUTRAL":"⚪","SELL_PREMIUM":"💰"}.get(_hr["signal"],"⚪")
+                _hp_out.append(f"<b>{_htk}</b> {_he}{_hr['signal']} {_hr['prob']:.0f}% [🟢{_hr['bull_v']}🔴{_hr['bear_v']}💰{_hr.get('sell_v',0)}/{_hr.get('total_m',22)}]")
+                _hp_out.append(f"  <i>{_hr['strategy'][:60]}</i>")
+                _vb = _hr.get("vrvp_box", {})
+                if _vb.get("lo"):
+                    _hp_out.append(f"  📦 Box ${_vb['lo']:.0f}-${_vb['hi']:.0f} POC ${_vb.get('poc',0):.0f}")
+                _wl = _hr["models"].get("put_call_wall", {})
+                if _wl.get("put_wall") and _wl.get("prob",0) >= 66:
+                    _hp_out.append(f"  🧱 P${_wl['put_wall']:.0f}/C${_wl['call_wall']:.0f}")
+                if _hr.get("warn"):
+                    _hp_out.append(f"  ⚠️ {_hr['warn']}")
+                _hp_out.append("")
+            except Exception as _e_hp: log.debug(f"ma hp {_htk}: {_e_hp}")
+        if _hp_out:
+            parts.append("\n<b>🧠 HIGH-PROB ENGINE — Open Positions:</b>")
+            parts.extend(_hp_out)
+        conn_hp_ma.close()
+    except Exception as _e_hp_ma: log.debug(f"ma hp block: {_e_hp_ma}")
 
     parts.append(f"\n<i>Sent: {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>")
     parts.append("Tap /start for full menu")
