@@ -1,0 +1,46 @@
+Total lines: 22424
+3315:             SELECT pcr_oi FROM stock_daily WHERE ticker = ?
+3320:             pcr = float(sd["pcr_oi"].iloc[0] or 0)
+3678: def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
+3814:         f"<b>📋 Summary: {theme}</b>",
+3828: def _oi_trend_summary(ticker: str, conn, latest_date: str) -> str:
+4038:             SELECT close, pcr_oi FROM stock_daily WHERE ticker = ?
+4059:         pcr = float(sd["pcr_oi"].iloc[0] or 0)
+4076:         pcr_for_expl = float(sd["pcr_oi"].iloc[0] or 1.0) if not sd.empty and "pcr_oi" in sd.columns else 1.0
+4711: async def inst_signals_detail(query, ticker):
+4896:             SELECT trade_date, close, pcr_oi FROM stock_daily WHERE ticker = ?
+4907:     sd["pcr_oi"] = pd.to_numeric(sd["pcr_oi"], errors="coerce")
+4908:     sd = sd.dropna(subset=["close", "pcr_oi"]).reset_index(drop=True)
+4914:         pcr_today = float(sd["pcr_oi"].iloc[0])
+4915:         pcr_hist  = sd["pcr_oi"].iloc[1:N + 1]
+4957:         pcr5_today = float(sd["pcr_oi"].iloc[0])
+4958:         pcr5_prior = float(sd["pcr_oi"].iloc[1:6].mean())
+4967:             "last5": [round(float(x), 2) for x in sd["pcr_oi"].iloc[:5].tolist()],
+5041: async def mean_rev_detail(query, ticker):
+6042: async def oi_detail(query, ticker):
+6142:             msg += f"\n\n<b>By Expiry:</b>\n{mono(chr(10).join(rows))}"
+6186:                     f"{'IV (ATM)':<12} {iv_pct:>6.1f}%\n"
+8411:                 "SELECT pcr_oi FROM stock_daily WHERE ticker=? ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+8413:             if not _p.empty and _p["pcr_oi"].iloc[0]:
+8414:                 df.at[idx, "pcr"] = float(_p["pcr_oi"].iloc[0])
+8549: async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
+14677:             SELECT pcr_oi FROM stock_daily WHERE ticker = ?
+14682:             pcr = float(sd["pcr_oi"].iloc[0] or 0)
+15113:             SELECT close, pcr_oi FROM stock_daily WHERE ticker = ?
+15134:         pcr = float(sd["pcr_oi"].iloc[0] or 0)
+15169:         pcr_sd = float(sd["pcr_oi"].iloc[0] or 1.0) if not sd.empty else 1.0
+15675: async def inst_signals_detail(query, ticker):
+15848:             SELECT trade_date, close, pcr_oi FROM stock_daily WHERE ticker = ?
+15859:     sd["pcr_oi"] = pd.to_numeric(sd["pcr_oi"], errors="coerce")
+15860:     sd = sd.dropna(subset=["close", "pcr_oi"]).reset_index(drop=True)
+15866:         pcr_today = float(sd["pcr_oi"].iloc[0])
+15867:         pcr_hist  = sd["pcr_oi"].iloc[1:N + 1]
+15909:         pcr5_today = float(sd["pcr_oi"].iloc[0])
+15910:         pcr5_prior = float(sd["pcr_oi"].iloc[1:6].mean())
+15919:             "last5": [round(float(x), 2) for x in sd["pcr_oi"].iloc[:5].tolist()],
+15993: async def mean_rev_detail(query, ticker):
+16970: async def oi_detail(query, ticker):
+17081:             exp_parts = ["\n\n<b>By Expiry:</b>"]
+17136:                     f"{'IV (ATM)':<12} {iv_pct:>6.1f}%\n"
+17707: def _oi_multiday_conviction_text(ticker, n_days=7):
+19547: async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):

@@ -1,0 +1,73 @@
+ASSISTANT: I see the issue now. The `reply_text` for multiday text is inside the SAME `try` block as `reply_photo`. If anything in that block raises an exception before the multiday text, it all fails silently. Also, Telegram HTML parse errors swallow the message with `pass`. Let me restructure both the EOD and check the **first copy** of `oi_change_chart_eod_view` to see if it's actually being called instead.
+---
+ASSISTANT: Let me see the rest of the first copy to compare keyboards.
+---
+ASSISTANT: Now I can see the key difference:
+
+- **First copy (line 6695)**: NO multiday text, NO "OI Detail" button in keyboard  
+- **Second copy (line 17821)**: HAS multiday text and OI Detail button
+
+The user sees neither → **the first copy at line 6695 is somehow being called instead of 17821** OR the second copy's multiday text is silently failing. Let me completely restructure the active function to fix both issues definitively.
+
+The key fix: separate the photo send from the multiday text, send multiday as plain text (no HTML parse errors), add print debug.
+---
+ASSISTANT: Now kill the current bot and restart it.
+---
+ASSISTANT: You've hit your limit · resets 12:40pm (America/New_York)
+---
+USER: Analyst_Somu_AI_bot:
+🔴 AMD · Advanced Micro Devices, Inc.
+◈ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💰 Price Action
+Last         $351.11  🔴▼ ...
+Change                $-9.43
+───────────────────────────
+Open                 $360.31
+High                 $361.85
+Low                  $346.52
+Close                $351.11
+───────────────────────────
+Volume                  9.4M
+Avg Vol                37.5M
+Vol █░░░░░░░░░ 0.2x avg
+
+📏 52-Week Range
+52W High     $362.79  (-3...
+52W Low      $96.88  (+26...
+Lo ├███████████████████░┤ Hi
+
+📊 Fundamentals
+Mkt Cap                $573B
+P/E (TTM)              135.1
+P/E (Fwd)               31.4
+EPS                    $2.60
+Div Yield                  —
+Beta                    2.40
+
+Updated 09:58:39
+
+◈ 📊 AMD OI · 05-01-2026
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Total Exp..
+---
+USER: This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+You've hit your limit · resets 12:40pm (America/New_York)
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\Users\srini\.claude\projects\c--Users-srini-Options-chain-data-NYSE-DATA\a2606663-1e67-4872-96ba-ddf39745223b.jsonl
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.
+---
+ASSISTANT: You've hit your limit · resets 12:40pm (America/New_York)
+---
+USER: continue and all the outputs where you are giving summaries create a android friendly tables summarizing the outputs one or multiple tables fine, deep think and create for all
+I couldn't read all the summary 
+
+if you have suggestions or better suggestions advise and fix
+
+also fix all the other pending tasks
+---
+ASSISTANT: Let me read the transcript to understand the pending tasks.
+---

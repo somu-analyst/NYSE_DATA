@@ -1,0 +1,156 @@
+
+async def signal_ticker_detail(query, ticker):
+    """Per-ticker OI signal detail with this-week/next-week expiry split, OI walls, volume analysis."""
+    tk = str(ticker).upper()
+    _loading = await query.message.reply_text(f"⏳ Loading {tk} signals...", parse_mode=H)
+    conn = get_conn()
+    try:
+        lr = pd.read_sql("""SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
+            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            LIMIT 1""", conn, params=(tk,))
+        if lr.empty:
+            await query.message.reply_text(f"No OI data for {tk}.", reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
+            conn.close(); return
+        latest_date = lr["trade_date_now"].iloc[0]
+        agg = pd.read_sql("""SELECT SUM(change_OI_Call) as cc, SUM(change_OI_Put) as pp,
+               SUM(openInt_Call_now) as co, SUM(openInt_Put_now) as po
+            FROM options_change WHERE ticker=? AND trade_date_now=?""", conn, params=(tk, latest_date))
+        call_chg = float(agg["cc"].iloc[0] or 0) if not agg.empty else 0
+        put_chg  = float(agg["pp"].iloc[0] or 0) if not agg.empty else 0
+        call_oi  = float(agg["co"].iloc[0] or 0) if not agg.empty else 0
+        put_oi   = float(agg["po"].iloc[0] or 0) if not agg.empty else 0
+        pcr = put_oi / call_oi if call_oi > 0 else 1.0
+    except Exception as _e:
+        log.warning(f"signal_ticker_detail {tk}: {_e}")
+        conn.close(); return
+
+    sig_lbl, sig_txt = _oi_signal_light(call_chg, put_chg, pcr)
+    sig_em = "🟢" if "BULL" in sig_lbl else ("🔴" if "BEAR" in sig_lbl else ("🔵" if "HEDGE" in sig_lbl else "🟡"))
+
+    def _fk(n):
+        n = float(n or 0); s = "+" if n >= 0 else ""
+        a = abs(n)
+        if a >= 1_000_000: return f"{s}{a/1_000_000:.1f}M"
+        if a >= 1_000:     return f"{s}{a/1_000:.0f}K"
+        return f"{s}{n:.0f}"
+
+    parts = [
+        hdr(f"📊 {tk} · {latest_date}"),
+        f"{sig_em} <b>{sig_lbl}</b>\n<i>{sig_txt}</i>",
+        mono(
+            f"{'Call dOI':<10} {_fk(call_chg):>8}\n"
+            f"{'Put  dOI':<10} {_fk(put_chg):>8}\n"
+            f"{'PCR':<10} {pcr:>8.2f}"
+        )
+    ]
+
+    # OI walls
+    try:
+        _kl = _oi_key_levels(tk, conn, latest_date)
+        if _kl:
+            _cws = _kl.get("call_wall",0); _pws = _kl.get("put_wall",0); _mps = _kl.get("max_pain",0)
+            _gws = " / ".join(f"${g:.0f}" for g in _kl.get("gamma_walls",[])[:3]) or "—"
+            parts.append(
+                f"\n<b>🧱 OI Walls ({_kl.get('expiry','')[:8]})</b>\n"
+                + mono(f"{'CWall':<8}${_cws:.0f}  {'PWall':<7}${_pws:.0f}\n"
+                      f"{'MaxPain':<8}${_mps:.0f}  Γ:{_gws}")
+            )
+    except Exception: pass
+
+    # Per-expiry: This Week / Next Week / Later
+    try:
+        exp_df = pd.read_sql("""
+            SELECT expiry_date,
+                   SUM(change_OI_Call) as cc, SUM(change_OI_Put) as pp,
+                   SUM(openInt_Call_now) as co, SUM(openInt_Put_now) as po
+            FROM options_change WHERE ticker=? AND trade_date_now=?
+            GROUP BY expiry_date
+            ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
+        """, conn, params=(tk, latest_date))
+        if not exp_df.empty:
+            _today = datetime.now().date()
+            _dtf = (4 - _today.weekday()) % 7
+            _this_fri = _today + timedelta(days=_dtf)
+            _next_fri = _this_fri + timedelta(days=7)
+            _bk_tw = chr(0x26a1) + " THIS WEEK"
+            _bk_nw = chr(0x1f4c5) + " NEXT WEEK"
+            _bk_lt = chr(0x1f52d) + " LATER"
+            _bk = {_bk_tw: [], _bk_nw: [], _bk_lt: []}
+            for _, er in exp_df.iterrows():
+                try:
+                    _edt = datetime.strptime(str(er["expiry_date"]), "%m-%d-%Y").date()
+                    if _edt <= _this_fri:   _bk[_bk_tw].append(er)
+                    elif _edt <= _next_fri: _bk[_bk_nw].append(er)
+                    else:                   _bk[_bk_lt].append(er)
+                except Exception:
+                    _bk[_bk_lt].append(er)
+            exp_parts = ["\n<b>Expiry Breakdown:</b>"]
+            for _lbl, _rows in _bk.items():
+                if not _rows: continue
+                tbl_lines = ["{:<8} {:>6} {:>6} {:>4}".format("Expiry","CdOI","PdOI","PCR")]
+                tbl_lines.append("-" * 27)
+                for er in _rows:
+                    cc2 = float(er["cc"] or 0); pp2 = float(er["pp"] or 0)
+                    ep2 = float(er["po"] or 0) / max(float(er["co"] or 0), 1)
+                    tbl_lines.append("{:<8} {:>6} {:>6} {:>4.1f}".format(
+                        str(er["expiry_date"])[:8], _fk(cc2), _fk(pp2), min(ep2,9.9)))
+                exp_parts.append(f"\n<b>{_lbl}</b>\n{mono(chr(10).join(tbl_lines))}")
+            parts.append("\n".join(exp_parts))
+    except Exception as _ex_e:
+        log.warning(f"signal_ticker_detail expiry {tk}: {_ex_e}")
+
+    # Calendar spreads
+    try:
+        _cal = [r for r in analyze_oi_rolls(tk, conn) if r["type"] == "CALENDAR_ROLL"]
+        if _cal:
+            cal_lines = ["\n<b>🗓 Calendar Spreads:</b>"]
+            for cr in _cal[:3]:
+                cal_lines.append(
+                    f"📆 {cr['option']} <b>${cr['strike']:.0f}</b>  "
+                    f"{str(cr['near_expiry'])[:8]}→{str(cr['far_expiry'])[:8]}  ~{cr['qty']:,}c\n"
+                    f"   <i>Duration extended — same direction, more time.</i>"
+                )
+            parts.append("\n".join(cal_lines))
+    except Exception: pass
+
+    # Spot + strike breakdown
+    spot = 0.0
+    try:
+        _sd = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
+            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1""",
+            conn, params=(tk,))
+        if not _sd.empty: spot = float(_sd["close"].iloc[0])
+    except Exception: pass
+
+    bd = _oi_strike_breakdown(tk, conn, spot, latest_date)
+    if bd: parts.append(f"\n<b>🔍 Strike Activity:</b>\n{bd}")
+
+    trend = _oi_trend_summary(tk, conn, latest_date)
+    if trend: parts.append(f"\n<b>📅 OI Trend (1W/1M):</b>\n{trend}")
+
+    # Volume analysis
+    try:
+        _vm = _classify_stock_move(tk, call_chg, put_chg)
+        if _vm and _vm.get("signal") not in ("NEUTRAL", "MIXED"):
+            _vi = {"REAL_BUY":"🟢","DELTA_HEDGE":"🔵","SHORT_COVER":"🟡",
+                    "SPEC_CALL":"⚡","REAL_SELL":"🔴","EVENT_STRADDLE":"⚡"}.get(_vm["signal"],"⚪")
+            parts.append(
+                f"\n<b>📊 Move Classification</b>\n"
+                f"{_vi} <b>{_vm['signal'].replace('_',' ')}</b>  [{_vm['confidence']}]\n"
+                + mono(f"Vol {_vm['vol_ratio']:.2f}x  Price {_vm['price_chg']:+.2f}%")
+                + f"\n<i>{_vm['explanation'][:100]}</i>"
+            )
+    except Exception: pass
+
+    conn.close()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 OI Rolls",     callback_data=f"oi_roll_{tk}"),
+         InlineKeyboardButton("📡 Inst Signals", callback_data=f"inst_sig_{tk}")],
+        [InlineKeyboardButton("📈 Mean Rev",     callback_data=f"mean_rev_{tk}"),
+         InlineKeyboardButton("🔄 Refresh",      callback_data=f"sigtk_{tk}")],
+        [InlineKeyboardButton("🔥 Back to Signals", callback_data="menu_signals"), BACK_BTN],
+    ])
+    try: await _loading.delete()
+    except Exception: pass
+    await query.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=kb)
+
