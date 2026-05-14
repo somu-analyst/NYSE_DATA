@@ -9,7 +9,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import yfinance as yf
 import pytz
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO  # for pd.read_html on HTML string
 import pandas_market_calendars as mcal  # NYSE calendar
 from curl_cffi import requests as curl_requests  # curl_cffi session
@@ -302,71 +302,136 @@ def get_eod_trading_day(max_back=10):
     return eastern.localize(datetime(use_day.year, use_day.month, use_day.day))
 
 
-# ============= ENRICHMENT WITH OHLC (THROTTLED) =============
+# ============= ENRICHMENT WITH OHLC (THROTTLED + SMART ATM FILTER) =============
+# Config: tune these to balance coverage vs speed
+OHLC_ATM_PCT      = 0.20   # only enrich contracts within +-20% of spot price
+OHLC_BASE_SLEEP   = 0.35   # base seconds between calls (increased from 0.2)
+OHLC_MAX_RETRIES  = 2      # retries per contract
+OHLC_BACKOFF_BASE = 2.0    # exponential backoff base (seconds * 2^attempt)
+OHLC_CIRCUIT_N    = 6      # consecutive rate-limit hits before circuit break
+OHLC_CIRCUIT_WAIT = 45     # seconds to sleep when circuit breaks
+
 def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
                                      call_symbol_col="contractSymbol_Call",
                                      put_symbol_col="contractSymbol_Put",
-                                     max_workers=1,
-                                     max_retries=1) -> pd.DataFrame:
+                                     max_retries=OHLC_MAX_RETRIES) -> pd.DataFrame:
+    # --- Build ATM-filtered symbol set ---
+    # Parse spot price from the contract symbols where possible,
+    # but use the dataframe's strike column as a proxy for ATM filtering.
     call_syms = df[call_symbol_col].dropna().astype(str).unique() if call_symbol_col in df.columns else []
-    put_syms = df[put_symbol_col].dropna().astype(str).unique() if put_symbol_col in df.columns else []
-    all_syms = np.unique(np.concatenate([call_syms, put_syms])) if len(call_syms) + len(put_syms) > 0 else []
-    print(f"Enriching {len(all_syms)} unique option contracts with OHLC snapshot...")
+    put_syms  = df[put_symbol_col].dropna().astype(str).unique()  if put_symbol_col  in df.columns else []
+    all_syms_full = list(np.unique(np.concatenate([call_syms, put_syms]))) if len(call_syms) + len(put_syms) > 0 else []
 
-    if len(all_syms) == 0:
+    if not all_syms_full:
+        return df
+
+    # ATM filter: decode strike from OCC symbol (format: ROOT + YYMMDD + C/P + 8-digit-strike)
+    # e.g. CRWD260529C00500000 -> strike = 500.000
+    def _occ_strike(sym):
+        try:
+            # last 8 chars before the option type digit block = strike * 1000
+            # OCC: root(variable) + 6-digit date + C/P + 8-digit strike (*1000)
+            cp_idx = max(sym.rfind("C"), sym.rfind("P"))
+            return int(sym[cp_idx + 1:]) / 1000.0
+        except Exception:
+            return None
+
+    # Get approximate current spot per ticker from df
+    spot_by_ticker = {}
+    if "ticker" in df.columns and "strike" in df.columns:
+        df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+        for tk, grp in df.groupby("ticker"):
+            spot_by_ticker[tk] = grp["strike"].median()  # median strike ~= ATM proxy
+
+    def _is_atm(sym):
+        """True if symbol is within ATM_PCT of spot (or no spot available)."""
+        k = _occ_strike(sym)
+        if k is None:
+            return True  # can't parse - include it
+        # find ticker prefix (everything before the 6-digit date)
+        for tk, spot in spot_by_ticker.items():
+            # match by prefix: sym starts with ticker (allow hyphens removed)
+            tk_clean = tk.replace("-", "")
+            if sym.upper().startswith(tk_clean.upper()):
+                return abs(k - spot) / spot <= OHLC_ATM_PCT if spot > 0 else True
+        return True  # no ticker match - include
+
+    all_syms = [s for s in all_syms_full if _is_atm(s)]
+    skipped_otm = len(all_syms_full) - len(all_syms)
+    print(f"\nOHLC enrichment: {len(all_syms_full)} contracts total -> "
+          f"{len(all_syms)} within +/-{OHLC_ATM_PCT*100:.0f}% of spot "
+          f"({skipped_otm} deep-OTM skipped, not needed for signals)")
+
+    if not all_syms:
         return df
 
     session = curl_requests.Session(impersonate="chrome")
+    consecutive_rl  = 0
+    adaptive_sleep  = OHLC_BASE_SLEEP
 
     def fetch_info(sym):
-        for attempt in range(max_retries + 1):
+        for attempt in range(OHLC_MAX_RETRIES + 1):
             try:
-                tk = yf.Ticker(sym, session=session)
+                tk   = yf.Ticker(sym, session=session)
                 info = tk.info
-                time.sleep(0.2)
                 return sym, {
-                    "open": info.get("regularMarketOpen"),
-                    "high": info.get("regularMarketDayHigh"),
-                    "low": info.get("regularMarketDayLow"),
-                    "close": info.get("regularMarketPrice"),
-                    "bid": info.get("bid"),
-                    "ask": info.get("ask"),
-                    "volume": info.get("regularMarketVolume"),
+                    "open":         info.get("regularMarketOpen"),
+                    "high":         info.get("regularMarketDayHigh"),
+                    "low":          info.get("regularMarketDayLow"),
+                    "close":        info.get("regularMarketPrice"),
+                    "bid":          info.get("bid"),
+                    "ask":          info.get("ask"),
+                    "volume":       info.get("regularMarketVolume"),
                     "openInterest": info.get("openInterest"),
                 }
-            except py_requests.exceptions.HTTPError as e:
-                msg = str(e)
-                if "Too Many Requests" in msg or "rate limit" in msg:
-                    print(f"\nRate limited on {sym}, skipping OHLC for this contract")
-                    return sym, None
-                if attempt >= max_retries:
-                    print(f"\nHTTP error on {sym} after retries, skipping: {e}")
-                    return sym, None
-                continue
             except Exception as e:
                 msg = str(e)
-                if "Too Many Requests" in msg or "rate limit" in msg:
-                    print(f"\nRate limited on {sym}, skipping OHLC")
-                else:
-                    print(f"\nError in OHLC for {sym}: {e}")
+                is_rl = "Too Many Requests" in msg or "429" in msg or "rate limit" in msg.lower()
+                if is_rl:
+                    wait = OHLC_BACKOFF_BASE ** (attempt + 1)
+                    time.sleep(wait)
+                    if attempt >= OHLC_MAX_RETRIES:
+                        return sym, "RATE_LIMITED"
+                    continue
                 return sym, None
+        return sym, None
 
     info_map = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(fetch_info, s): s for s in all_syms}
-        total = len(futures)
-        for i, fut in enumerate(as_completed(futures), 1):
-            sym, data = fut.result()
+    total = len(all_syms)
+    rl_count_total = 0
+
+    for i, sym in enumerate(all_syms, 1):
+        _, data = fetch_info(sym)
+
+        if data == "RATE_LIMITED":
+            consecutive_rl += 1
+            rl_count_total += 1
+            info_map[sym] = None
+            if consecutive_rl >= OHLC_CIRCUIT_N:
+                print(f"\n  [{i}/{total}] Circuit breaker: {consecutive_rl} consecutive rate limits. "
+                      f"Sleeping {OHLC_CIRCUIT_WAIT}s ...")
+                time.sleep(OHLC_CIRCUIT_WAIT)
+                adaptive_sleep = min(adaptive_sleep * 1.5, 3.0)
+                consecutive_rl = 0
+            else:
+                time.sleep(OHLC_BACKOFF_BASE * consecutive_rl)
+        else:
             info_map[sym] = data
-            print_progress_bar(i, total, prefix="OHLC Snapshots")
+            if consecutive_rl > 0:
+                consecutive_rl = max(0, consecutive_rl - 1)
+                adaptive_sleep = max(OHLC_BASE_SLEEP, adaptive_sleep * 0.9)
+
+        time.sleep(adaptive_sleep)
+        print_progress_bar(i, total, prefix="OHLC Snapshots")
+
+    print(f"\n  OHLC complete: {total - rl_count_total} fetched, "
+          f"{rl_count_total} rate-limited ({skipped_otm} deep-OTM pre-skipped)")
 
     new_cols = [
         "call_open", "call_high", "call_low", "call_close",
-        "call_bid_info", "call_ask_info",
-        "call_volume_info", "call_openInterest_info",
-        "put_open", "put_high", "put_low", "put_close",
-        "put_bid_info", "put_ask_info",
-        "put_volume_info", "put_openInterest_info",
+        "call_bid_info", "call_ask_info", "call_volume_info", "call_openInterest_info",
+        "put_open",  "put_high",  "put_low",  "put_close",
+        "put_bid_info",  "put_ask_info",  "put_volume_info",  "put_openInterest_info",
     ]
     for c in new_cols:
         if c not in df.columns:
@@ -375,29 +440,29 @@ def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
     if call_symbol_col in df.columns:
         for idx, cs in df[call_symbol_col].dropna().items():
             data = info_map.get(str(cs))
-            if not data:
+            if not data or not isinstance(data, dict):
                 continue
-            df.at[idx, "call_open"] = data["open"]
-            df.at[idx, "call_high"] = data["high"]
-            df.at[idx, "call_low"] = data["low"]
-            df.at[idx, "call_close"] = data["close"]
-            df.at[idx, "call_bid_info"] = data["bid"]
-            df.at[idx, "call_ask_info"] = data["ask"]
-            df.at[idx, "call_volume_info"] = data["volume"]
-            df.at[idx, "call_openInterest_info"] = data["openInterest"]
+            df.at[idx, "call_open"]             = data["open"]
+            df.at[idx, "call_high"]             = data["high"]
+            df.at[idx, "call_low"]              = data["low"]
+            df.at[idx, "call_close"]            = data["close"]
+            df.at[idx, "call_bid_info"]         = data["bid"]
+            df.at[idx, "call_ask_info"]         = data["ask"]
+            df.at[idx, "call_volume_info"]      = data["volume"]
+            df.at[idx, "call_openInterest_info"]= data["openInterest"]
 
     if put_symbol_col in df.columns:
         for idx, ps in df[put_symbol_col].dropna().items():
             data = info_map.get(str(ps))
-            if not data:
+            if not data or not isinstance(data, dict):
                 continue
-            df.at[idx, "put_open"] = data["open"]
-            df.at[idx, "put_high"] = data["high"]
-            df.at[idx, "put_low"] = data["low"]
-            df.at[idx, "put_close"] = data["close"]
-            df.at[idx, "put_bid_info"] = data["bid"]
-            df.at[idx, "put_ask_info"] = data["ask"]
-            df.at[idx, "put_volume_info"] = data["volume"]
+            df.at[idx, "put_open"]              = data["open"]
+            df.at[idx, "put_high"]              = data["high"]
+            df.at[idx, "put_low"]               = data["low"]
+            df.at[idx, "put_close"]             = data["close"]
+            df.at[idx, "put_bid_info"]          = data["bid"]
+            df.at[idx, "put_ask_info"]          = data["ask"]
+            df.at[idx, "put_volume_info"]       = data["volume"]
             df.at[idx, "put_openInterest_info"] = data["openInterest"]
 
     return df
@@ -486,7 +551,7 @@ def refresh_monthly_tables(conn):
         conn.commit()
 
 
-# ============= OPTIONS FETCH (YAHOO, ±20 STRIKES, NEXT 45 DAYS) =============
+# ============= OPTIONS FETCH (YAHOO, +/-20 STRIKES, NEXT 45 DAYS) =============
 def fetch_option_chain(ticker, company_name, asset_type, trade_day_str_db, trade_day_str_file):
     session = curl_requests.Session(impersonate="chrome")
     tk = yf.Ticker(ticker, session=session)
