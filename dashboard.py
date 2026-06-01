@@ -1696,6 +1696,7 @@ with st.sidebar:
         "📊 Backtest Lab",
         "🔮 Live Position Predictor",
         "📈 Insider / Congress / Whales",
+        "🏆 Legendary Investors (13F)",
         "📰 News & Calendar",
         "⚡ Trade Risk Calculator",
         "🎯 Next-Day Exit Planner",
@@ -2938,13 +2939,56 @@ elif page == "🔥 OI Analytics & Prediction":
         st.warning("No OI data in database.")
         st.stop()
 
-    col_a, col_b = st.columns([1, 2])
+    col_a, col_b, col_c = st.columns([1, 1, 1])
     with col_a:
-        sel_date = st.selectbox("Trade Date", dates, index=0)
+        sel_date = st.selectbox("📅 Trade Date (snapshot)", dates, index=0)
     with col_b:
         day_df = load_oi_for_date(sel_date)
         tickers_avail = sorted(day_df["ticker"].unique()) if not day_df.empty else []
-        sel_ticker = st.selectbox("Ticker", tickers_avail, index=0 if tickers_avail else None)
+        sel_ticker = st.selectbox("🎯 Ticker", tickers_avail, index=0 if tickers_avail else None)
+    with col_c:
+        # Future expiry dates for this ticker on this snapshot date
+        _oa_exp_raw = []
+        if sel_ticker and not day_df.empty:
+            _tk_exp = day_df[day_df["ticker"] == sel_ticker]["expiry_date"].dropna().unique().tolist()
+            _today_dt = None
+            try:
+                import datetime as _dt_mod
+                _today_dt = _dt_mod.datetime.strptime(sel_date, "%m-%d-%Y").date()
+            except Exception:
+                pass
+            def _oa_exp_sort(d):
+                try:
+                    p = d.split("-")
+                    return (int(p[2]), int(p[0]), int(p[1]))
+                except Exception:
+                    return (9999, 99, 99)
+            def _oa_is_future(d):
+                if _today_dt is None:
+                    return True
+                try:
+                    p = d.split("-")
+                    edt = _dt_mod.date(int(p[2]), int(p[0]), int(p[1]))
+                    return edt >= _today_dt
+                except Exception:
+                    return True
+            _future_exps = sorted([e for e in _tk_exp if _oa_is_future(e)], key=_oa_exp_sort)
+            _past_exps   = sorted([e for e in _tk_exp if not _oa_is_future(e)], key=_oa_exp_sort, reverse=True)
+            _oa_exp_raw  = _future_exps + _past_exps
+        _oa_exp_labels = (
+            [f"🟢 {e}" for e in _future_exps] +
+            [f"🔴 {e} (past)" for e in _past_exps]
+        ) if sel_ticker else []
+        _oa_exp_opts = ["All Expiries"] + _oa_exp_labels
+        _sel_oa_expiry_lbl = st.selectbox(
+            "📅 Filter by Expiry",
+            _oa_exp_opts, index=0, key="oa_expiry",
+            help="Filter all charts and tables to a single expiry cycle"
+        )
+        _sel_oa_expiry = None
+        if _sel_oa_expiry_lbl != "All Expiries":
+            # Strip the emoji prefix to get raw date
+            _sel_oa_expiry = _sel_oa_expiry_lbl.replace("🟢 ", "").replace("🔴 ", "").replace(" (past)", "")
 
     if day_df.empty:
         st.stop()
@@ -2973,6 +3017,14 @@ elif page == "🔥 OI Analytics & Prediction":
     if tk_df.empty:
         st.info("No data for this ticker on selected date.")
         st.stop()
+
+    # Apply expiry filter if selected
+    if _sel_oa_expiry:
+        tk_df = tk_df[tk_df["expiry_date"] == _sel_oa_expiry].copy()
+        if tk_df.empty:
+            st.info(f"No data for {sel_ticker} at expiry {_sel_oa_expiry} on {sel_date}.")
+            st.stop()
+        st.caption(f"📅 Filtered to expiry: **{_sel_oa_expiry}**  |  Snapshot: {sel_date}")
 
     # Apply pressure inference
     pressure_list = tk_df.apply(lambda r: pd.Series(infer_pressure(r)), axis=1)
@@ -3147,15 +3199,46 @@ elif page == "🔥 OI Analytics & Prediction":
         st.info(f"Not enough multi-day OI data for {sel_ticker} — need at least 3 trade dates.")
 
     # ── Expiry Breakdown ──
-    st.markdown("<div>📅 Expiry Breakdown</div>", unsafe_allow_html=True)
-    exp_agg = tk_df.groupby("expiry_date").agg(
+    st.markdown("<div>📅 Expiry Breakdown (Future Expiries)</div>", unsafe_allow_html=True)
+    # Reload full ticker data for the breakdown (ignore expiry filter here)
+    _tk_all = day_df[day_df["ticker"] == sel_ticker].copy()
+    exp_agg = _tk_all.groupby("expiry_date").agg(
         Call_OI_Chg=("change_OI_Call", "sum"),
         Put_OI_Chg=("change_OI_Put", "sum"),
         Call_OI=("openInt_Call_now", "sum"),
         Put_OI=("openInt_Put_now", "sum"),
     ).reset_index()
     exp_agg["PCR"] = np.where(exp_agg["Call_OI"] > 0, exp_agg["Put_OI"] / exp_agg["Call_OI"], 0).round(2)
-    st.dataframe(exp_agg, hide_index=True)
+    # Sort expiries chronologically and compute DTE
+    def _dte_from_exp(exp_str, ref=sel_date):
+        try:
+            ep = exp_str.split("-"); rp = ref.split("-")
+            import datetime as _dmod
+            ed = _dmod.date(int(ep[2]), int(ep[0]), int(ep[1]))
+            rd = _dmod.date(int(rp[2]), int(rp[0]), int(rp[1]))
+            return (ed - rd).days
+        except Exception:
+            return 9999
+    exp_agg["DTE"] = exp_agg["expiry_date"].apply(_dte_from_exp)
+    exp_agg["Status"] = exp_agg["DTE"].apply(lambda d: "🟢 Future" if d >= 0 else "🔴 Expired")
+    exp_agg = exp_agg.sort_values("DTE")
+    # Show future expiries first
+    exp_future = exp_agg[exp_agg["DTE"] >= 0]
+    exp_past   = exp_agg[exp_agg["DTE"] < 0]
+    st.markdown("**🟢 Future Expiries**")
+    if not exp_future.empty:
+        st.dataframe(
+            exp_future[["expiry_date","DTE","Call_OI_Chg","Put_OI_Chg","Call_OI","Put_OI","PCR"]].rename(
+                columns={"expiry_date":"Expiry","Call_OI_Chg":"Call OI Δ","Put_OI_Chg":"Put OI Δ",
+                         "Call_OI":"Call OI","Put_OI":"Put OI"}),
+            hide_index=True, use_container_width=True)
+    if not exp_past.empty:
+        with st.expander(f"🔴 Past / Expired ({len(exp_past)} expiries)"):
+            st.dataframe(
+                exp_past[["expiry_date","DTE","Call_OI_Chg","Put_OI_Chg","Call_OI","Put_OI","PCR"]].rename(
+                    columns={"expiry_date":"Expiry","Call_OI_Chg":"Call OI Δ","Put_OI_Chg":"Put OI Δ",
+                             "Call_OI":"Call OI","Put_OI":"Put OI"}),
+                hide_index=True, use_container_width=True)
 
     # ── Next-Day OI Prediction ──
     st.markdown("<div>🔮 OI-Based Next-Day Prediction</div>", unsafe_allow_html=True)
@@ -3607,32 +3690,86 @@ elif page == "🔥 OI Analytics & Prediction":
     # ── Weekly Strike Comparison ──
     st.markdown("<div>📈 Weekly OI Comparison (Same Strikes)</div>", unsafe_allow_html=True)
     if len(dates) >= 2:
-        wc1, wc2 = st.columns(2)
+        wc1, wc2, wc3 = st.columns(3)
         with wc1:
-            date_from = st.selectbox("From Date", dates[1:], index=0, key="wk_from")
+            date_from = st.selectbox("From Date (snapshot)", dates[1:], index=0, key="wk_from")
         with wc2:
-            date_to = st.selectbox("To Date", dates, index=0, key="wk_to")
+            date_to = st.selectbox("To Date (snapshot)", dates, index=0, key="wk_to")
+        with wc3:
+            # Load future expiry dates for the selected ticker from the latest snapshot
+            _latest_date = dates[0]
+            _expiry_raw = q(
+                "SELECT DISTINCT expiry_date FROM options_change "
+                "WHERE ticker=? AND trade_date_now=? ORDER BY expiry_date",
+                [sel_ticker, _latest_date]
+            )["expiry_date"].tolist() if sel_ticker else []
+
+            # Sort expiry dates chronologically (stored as MM-DD-YYYY)
+            def _exp_sort_key(d):
+                try:
+                    p = d.split("-")
+                    return (int(p[2]), int(p[0]), int(p[1]))
+                except Exception:
+                    return (9999, 99, 99)
+
+            _expiry_sorted = sorted(_expiry_raw, key=_exp_sort_key)
+            _expiry_opts = ["All Expiries"] + _expiry_sorted
+            _sel_expiry = st.selectbox("Filter by Expiry", _expiry_opts, index=0, key="wk_expiry")
 
         if date_from != date_to:
             weekly_df = oi_weekly_strike_analysis(sel_ticker, date_from, date_to)
             if not weekly_df.empty:
-                disp = weekly_df[["strike", "expiry_date", "c_oi_chg", "p_oi_chg",
-                                  "c_oi_pct", "p_oi_pct", "c_px_chg", "p_px_chg",
-                                  "classification", "escape_score", "escape_label"]].head(25).copy()
-                disp.columns = ["Strike", "Expiry", "Call OI Δ", "Put OI Δ",
-                                "Call OI %Δ", "Put OI %Δ", "Call Px Δ", "Put Px Δ",
-                                "Classification", "Escape Score", "Escape"]
-                st.dataframe(disp, hide_index=True)
+                # Apply expiry filter
+                if _sel_expiry != "All Expiries":
+                    weekly_df = weekly_df[weekly_df["expiry_date"] == _sel_expiry]
 
-                # Classification summary
-                class_counts = weekly_df["classification"].value_counts()
-                fig = px.pie(values=class_counts.values, names=class_counts.index,
-                             title="Activity Breakdown", hole=0.4,
-                             color_discrete_sequence=px.colors.qualitative.Set2)
-                fig.update_layout(template="plotly_white", height=350)
-                st.plotly_chart(fig)
+                if weekly_df.empty:
+                    st.info(f"No strikes found for expiry {_sel_expiry} between the selected dates.")
+                else:
+                    # Show expiry summary bar across top
+                    _exp_summary = weekly_df.groupby("expiry_date").agg(
+                        call_oi_chg=("c_oi_chg", "sum"),
+                        put_oi_chg=("p_oi_chg", "sum"),
+                    ).reset_index().sort_values("expiry_date")
+                    _exp_summary.columns = ["Expiry", "Net Call OI Δ", "Net Put OI Δ"]
+                    st.caption(f"📅 Expiry breakdown — trade dates: **{date_from}** → **{date_to}**")
+                    st.dataframe(_exp_summary, hide_index=True, use_container_width=True)
+
+                    disp = weekly_df[["strike", "expiry_date", "c_oi_chg", "p_oi_chg",
+                                      "c_oi_pct", "p_oi_pct", "c_px_chg", "p_px_chg",
+                                      "classification", "escape_score", "escape_label"]].head(40).copy()
+                    disp.columns = ["Strike", "Expiry", "Call OI Δ", "Put OI Δ",
+                                    "Call OI %Δ", "Put OI %Δ", "Call Px Δ", "Put Px Δ",
+                                    "Classification", "Escape Score", "Escape"]
+
+                    def _wk_color(row):
+                        cls = str(row.get("Classification", ""))
+                        if "ACCUMULATION" in cls or "ROLL → CALLS" in cls:
+                            return ["background-color:#1a4a1a; color:#e8ffe8"] * len(row)
+                        elif "LIQUIDATION" in cls or "ROLL → PUTS" in cls:
+                            return ["background-color:#4a1a1a; color:#ffe8e8"] * len(row)
+                        elif "WRITING" in cls:
+                            return ["background-color:#3a3a10; color:#fffff0"] * len(row)
+                        elif "HEDGE" in cls:
+                            return ["background-color:#1a2a4a; color:#e8f0ff"] * len(row)
+                        return [""] * len(row)
+
+                    st.dataframe(
+                        disp.style.apply(_wk_color, axis=1),
+                        hide_index=True, use_container_width=True
+                    )
+
+                    # Classification summary
+                    class_counts = weekly_df["classification"].value_counts()
+                    fig = px.pie(values=class_counts.values, names=class_counts.index,
+                                 title="Activity Breakdown", hole=0.4,
+                                 color_discrete_sequence=px.colors.qualitative.Set2)
+                    fig.update_layout(template="plotly_white", height=320)
+                    st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("No matching strikes between these dates.")
+    else:
+        st.info("Need at least 2 trade dates in the database to compare.")
 
 
 # ===================================================================
@@ -3654,18 +3791,55 @@ elif page == "🎯 Prop Trading Screen":
         st.warning("No data.")
         st.stop()
 
-    c1, c2 = st.columns([1, 1])
+    c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
-        prop_date = st.selectbox("Scan Date", dates, index=0)
+        prop_date = st.selectbox("📅 Scan Date (snapshot)", dates, index=0)
     with c2:
         min_z = st.slider("Min Z-Score", 1.0, 4.0, 1.5, 0.25)
+    with c3:
+        # Load all future expiry dates from this snapshot
+        _prop_exp_raw = q(
+            "SELECT DISTINCT expiry_date FROM options_change WHERE trade_date_now=?",
+            [prop_date]
+        )["expiry_date"].tolist() if prop_date else []
+        def _prop_exp_sort(d):
+            try:
+                p = d.split("-"); return (int(p[2]),int(p[0]),int(p[1]))
+            except Exception:
+                return (9999,99,99)
+        def _prop_is_future(d, ref=prop_date):
+            try:
+                import datetime as _dmod
+                ep = d.split("-"); rp = ref.split("-")
+                return _dmod.date(int(ep[2]),int(ep[0]),int(ep[1])) >= _dmod.date(int(rp[2]),int(rp[0]),int(rp[1]))
+            except Exception:
+                return True
+        _prop_future = sorted([e for e in _prop_exp_raw if _prop_is_future(e)], key=_prop_exp_sort)
+        _prop_past   = sorted([e for e in _prop_exp_raw if not _prop_is_future(e)], key=_prop_exp_sort, reverse=True)
+        _prop_exp_labels = [f"🟢 {e}" for e in _prop_future] + [f"🔴 {e} (past)" for e in _prop_past]
+        _prop_exp_opts = ["All Expiries"] + _prop_exp_labels
+        _sel_prop_exp_lbl = st.selectbox(
+            "📅 Filter by Expiry", _prop_exp_opts, index=0, key="prop_expiry",
+            help="Narrow prop scan to a specific expiry cycle"
+        )
+        _sel_prop_expiry = None
+        if _sel_prop_exp_lbl != "All Expiries":
+            _sel_prop_expiry = _sel_prop_exp_lbl.replace("🟢 ", "").replace("🔴 ", "").replace(" (past)", "")
 
     with st.spinner("Scanning for opportunities..."):
         opps = scan_prop_opportunities(prop_date, min_z)
 
+    # Apply expiry filter
+    if _sel_prop_expiry and not opps.empty:
+        if "expiry_date" in opps.columns:
+            opps = opps[opps["expiry_date"] == _sel_prop_expiry]
+        elif "expiry" in opps.columns:
+            opps = opps[opps["expiry"] == _sel_prop_expiry]
     if opps.empty:
-        st.info("No opportunities meeting criteria.")
+        st.info("No opportunities meeting criteria." + (f" (Expiry: {_sel_prop_expiry})" if _sel_prop_expiry else ""))
         st.stop()
+    if _sel_prop_expiry:
+        st.caption(f"📅 Filtered to expiry: **{_sel_prop_expiry}**")
 
     # Summary
     st.markdown(f"<div>Found {len(opps)} setups across {opps['Ticker'].nunique()} tickers</div>",
@@ -5522,7 +5696,7 @@ elif page == "📈 Insider / Congress / Whales":
         with st.popover("ℹ️"):
             st.markdown(_PAGE_HELP.get(page, ""))
 
-    tab1, tab2, tab3 = st.tabs(["👤 Insider Trades", "🏛️ Congress Trades", "🐋 Whale Holdings"])
+    tab1, tab2, tab3, tab4 = st.tabs(["👤 Insider Trades", "🏛️ Congress Trades", "🐋 Whale Holdings", "🏆 Legendary Investors (13F)"])
 
     with tab1:
         insiders = q("SELECT * FROM insider_trades ORDER BY transaction_date DESC")
@@ -5659,6 +5833,454 @@ elif page == "📈 Insider / Congress / Whales":
                                   title="Top Institutions by AUM ($B)")
                     fig2.update_layout(template="plotly_white", height=350, showlegend=False)
                     st.plotly_chart(fig2, use_container_width=True)
+
+    # ── Tab 4: Legendary Investors 13F ─────────────────────────────
+    with tab4:
+        _LEGENDS = {
+            "buffett":       {"name":"Warren Buffett",     "firm":"Berkshire Hathaway",   "aum":"$300B+",   "style":"Value / Long-term"},
+            "soros":         {"name":"George Soros",       "firm":"Soros Fund Mgmt",      "aum":"$9.1B",    "style":"Macro / Reflexivity"},
+            "rentec":        {"name":"Jim Simons",         "firm":"Renaissance Tech",      "aum":"$63.9B",   "style":"Quant / Stat Arb"},
+            "dalio":         {"name":"Ray Dalio",          "firm":"Bridgewater",           "aum":"$22.4B",   "style":"All-Weather"},
+            "tepper":        {"name":"David Tepper",       "firm":"Appaloosa",             "aum":"$5.9B",    "style":"Event-Driven"},
+            "ackman":        {"name":"Bill Ackman",        "firm":"Pershing Square",       "aum":"$13.7B",   "style":"Activist"},
+            "druckenmiller": {"name":"Stan Druckenmiller", "firm":"Duquesne",              "aum":"~$3-4B",   "style":"Macro"},
+            "loeb":          {"name":"Dan Loeb",           "firm":"Third Point",           "aum":"$2.1B",    "style":"Event-Driven"},
+            "cohen":         {"name":"Steve Cohen",        "firm":"Point72",               "aum":"$78B",     "style":"Multi-Strategy"},
+            "burry":         {"name":"Michael Burry",      "firm":"Scion",                 "aum":"$68M",     "style":"Contrarian Value"},
+            "coleman":       {"name":"Chase Coleman",      "firm":"Tiger Global",          "aum":"$22.8B",   "style":"Growth/Tech"},
+            "tudor":         {"name":"Paul Tudor Jones",   "firm":"Tudor",                 "aum":"$53.9B",   "style":"Macro/CTA"},
+            "aschenbrenner": {"name":"L. Aschenbrenner",  "firm":"Situational Awareness", "aum":"$13.7B",   "style":"AI Thesis"},
+            "gerstner":      {"name":"Brad Gerstner",      "firm":"Altimeter Capital",     "aum":"$6.7B",    "style":"Growth/AI"},
+            "laffont":       {"name":"Philippe Laffont",   "firm":"Coatue",                "aum":"$29B",     "style":"Growth/Tech"},
+            "wood":          {"name":"Cathie Wood",        "firm":"ARK Invest",            "aum":"$12.86B",  "style":"Disruptive"},
+            "chamath":       {"name":"Chamath Palihapitiya","firm":"Social Capital",       "aum":"$2.1B",    "style":"Contrarian VC"},
+            "einhorn":       {"name":"David Einhorn",      "firm":"Greenlight Capital",    "aum":"$3.2B",    "style":"Value/Short"},
+            "klarman":       {"name":"Seth Klarman",       "firm":"Baupost Group",         "aum":"$5.1B",    "style":"Deep Value"},
+            "griffin":       {"name":"Ken Griffin",        "firm":"Citadel Advisors",      "aum":"$618B",    "style":"Quant Multi-Strat"},
+        }
+        _LEGENDS_BUYS = {
+            "buffett":       [("GOOGL","Added","$16.6B","Large","+204% tripled"),("DAL","New","$2.6B","Mid","Delta 39.8M shares"),("NYT","Added","--","Mid","+199% media"),("LEN","Added","--","Mid","+43% homebuilder"),("M","New","$55M","Small","Macys $55M deep value")],
+            "soros":         [("NVDA","Added","--","Large","AI chipmaker"),("TSM","Added","--","Large","Taiwan Semi"),("EA","Added","--","Mid","Electronic Arts"),("BRK.B","New","--","Large","Berkshire position")],
+            "rentec":        [("AAPL","New","$781M","Large","New position"),("NVDA","Added","$278M","Large","AI chip"),("MU","Added","$520M","Large","+50% Micron"),("NEM","New","$278M","Mid","Newmont gold"),("AVGO","New","$245M","Large","Broadcom AI"),("GOLD","New","$227M","Small","Alamos Gold"),("UTHR","Hold","--","Mid","#1 rare disease")],
+            "dalio":         [("TSM","New","--","Large","Taiwan Semi"),("GOOGL","New","--","Large","Alphabet"),("NUE","New","--","Mid","Nucor steel"),("NVDA","Added","--","Large","GPU"),("MU","Added","--","Large","Micron")],
+            "tepper":        [("AMZN","Added","$470M","Large","Nearly doubled"),("MU","Added","--","Large","+6x Micron"),("UBER","Added","--","Large","+3x tripled"),("VST","Added","--","Mid","Vistra 2x"),("SAND","New","--","Small","SanDisk flash")],
+            "ackman":        [("MSFT","New","$2B+","Large","~15% of portfolio"),("AMZN","Added","--","Large","Cloud/AI")],
+            "druckenmiller": [("CRWV","Added","--","Mid","CoreWeave AI"),("TSM","Added","--","Large","Taiwan Semi")],
+            "loeb":          [("AMZN","Hold","--","Large","#1 19.4%"),("META","New","--","Large","New Meta AI"),("TDS","Hold","--","Small","#2 13.3% rural telecom"),("CRS","Hold","--","Small","#5 5.9% specialty alloys"),("HUT","New","--","Small","Hut 8 crypto miner")],
+            "cohen":         [("NVDA","Hold","--","Large","#1 holding"),("CRDO","Hold","--","Small","#5 AI interconnect"),("TDG","New","$336M","Mid","TransDigm aerospace"),("EQIX","Added","--","Large","Equinix data center")],
+            "burry":         [("MOH","New","--","Mid","35.1% Molina Healthcare"),("LULU","Added","--","Mid","Doubled Lululemon"),("SLM","New","--","Small","19.5% Sallie Mae"),("BRK","New","--","Small","19.3% Bruker Corp")],
+            "coleman":       [("GOOGL","Hold","--","Large","#1 13.4%"),("NVDA","Hold","--","Large","#2 9.2%"),("AMZN","Hold","--","Large","#3 9.1%"),("INTC","New","$180M","Large","Intel turnaround")],
+            "tudor":         [("GLD","Hold","--","ETF","Gold ETF"),("BTC","Added","--","Crypto","Bitcoin")],
+            "aschenbrenner": [("BE","Hold","$879M","Mid","#1 Bloom Energy power"),("CLSK","Added","--","Small","CleanSpark AI miner"),("RIOT","Added","--","Small","Riot BTC/AI"),("APLD","Added","--","Small","Applied Digital HPC"),("SNDK","New","--","Small","SanDisk + calls")],
+            "gerstner":      [("NVDA","Hold","$1.51B","Large","#1 AI chip"),("META","Hold","$1.22B","Large","#2 AI ads"),("CRWV","Added","$348M","Mid","CoreWeave AI"),("ARM","New","$259M","Large","ARM chip arch")],
+            "laffont":       [("ASML","New","$655M","Large","EUV monopoly"),("NFLX","Added","--","Large","Doubled +104%"),("NU","Hold","--","Mid","Nu Holdings LatAm")],
+            "wood":          [("AMD","Added","--","Large","AI GPU"),("CRSP","Added","--","Mid","CRISPR gene editing"),("TEM","Added","--","Mid","Tempus AI clinical"),("CRCL","Added","--","Small","Circle stablecoin"),("HOOD","Added","--","Mid","Robinhood +24.9%"),("RXRX","Hold","--","Small","Recursion +682% rev")],
+            "chamath":       [("COPX","Thesis","--","ETF","Copper ETF -- AI 5x copper"),("GROQ","Exit","~$1B","Private","NVIDIA $20B -- 3000% return")],
+            "einhorn":       [("GRBK","Hold","$611M","Small","#1 19.1% Green Brick homebuilder"),("FLR","Hold","$222M","Mid","#2 6.9% Fluor engineering"),("CNR","Hold","$195M","Mid","#3 6.1% Core Natural coal"),("BHF","Added","--","Small","#4 5.3% Brighthouse insurer")],
+            "klarman":       [("AMZN","Hold","$649M","Large","#1 12.7%"),("QSR","Added","$529M","Mid","#2 Doubled +4.2M shares"),("ELV","Added","$426M","Large","Doubled Elevance Health"),("WCC","Hold","$393M","Mid","#3 7.7% WESCO elec dist"),("UNP","Hold","$374M","Large","#4 7.3% Union Pacific")],
+            "griffin":       [("NVDA","CALL","--","Large","NVDA calls AI upside"),("TSLA","CALL","--","Large","TSLA calls EV/auto"),("SPY","CALL","--","ETF","SPY calls market long"),("AAPL","Hold","--","Large","Apple top equity")],
+        }
+        _LEGENDS_SELLS = {
+            "buffett":       [("V","Full exit"),("MA","Full exit"),("UNH","Full exit"),("AMZN","Full exit"),("BAC","Trimmed"),("CVX","Trimmed")],
+            "soros":         [("AMZN","Reduced"),("GOOGL","Trimmed"),("MSFT","Reduced"),("CRM","Trimmed")],
+            "rentec":        [("NFLX","-$673M"),("COST","-$578M"),("PLTR","-$542M"),("TSLA","-$534M"),("MSFT","-$329M"),("PG","Full exit")],
+            "dalio":         [("CRM","Full exit"),("WDAY","Full exit"),("NOW","Full exit"),("BKNG","Reduced"),("ADBE","Reduced")],
+            "tepper":        [("AAL","Full exit"),("OC","Full exit"),("MHK","Full exit"),("FXI","Reduced")],
+            "ackman":        [("HLT","Full exit"),("GOOGL","Exited"),("BN","Trimmed")],
+            "druckenmiller": [("GOOGL","Sold out")],
+            "loeb":          [("PGE","Full exit"),("MSFT","Full exit"),("BN","Full exit")],
+            "cohen":         [], "burry": [], "coleman": [], "tudor": [],
+            "aschenbrenner": [], "chamath": [],
+            "gerstner":      [("GOOGL","Full exit -- sold all"),("BABA","Full exit China"),("JD","Full exit China")],
+            "laffont":       [("AMZN","-82% cut"),("TSM","-83% slashed"),("NVDA","-70% reduced"),("LRCX","-71% slashed")],
+            "wood":          [("TSLA","Trimmed"),("PLTR","Trimmed"),("COIN","Trimmed"),("ROKU","-35% cut")],
+            "einhorn":       [("META","Reduced"),("AMZN","Trimmed")],
+            "klarman":       [], "griffin": [],
+        }
+        _LEGENDS_OPTIONS = {
+            "soros":         [("CRWV","PUT","Q2 2026","CoreWeave hedge"),("TSM","PUT","Q2 2026","Geo-risk hedge")],
+            "tudor":         [("IWM","PUT","Q2 2026","Small cap hedge"),("IWM","CALL","Q2 2026","Small cap long"),("QQQ","PUT","Q2 2026","Tech hedge"),("QQQ","CALL","Q2 2026","Tech long"),("SPY","CALL","Q2 2026","Market long")],
+            "aschenbrenner": [("SMH","PUT","Q2 2026","$2B VanEck Semi ETF"),("NVDA","PUT","Q2 2026","$1.6B Nvidia"),("AVGO","PUT","Q2 2026","Broadcom"),("AMD","PUT","Q2 2026","AMD"),("MU","CALL","Q2 2026","$422M Micron long"),("TSM","CALL","Q2 2026","$355M TSM long")],
+            "griffin":       [("SPY","PUT","Q2 2026","#1 SPY puts macro hedge"),("QQQ","PUT","Q2 2026","#2 QQQ tech hedge"),("SPY","CALL","Q2 2026","#3 SPY calls long"),("TSLA","CALL","Q2 2026","#4 TSLA calls"),("NVDA","CALL","Q2 2026","#5 NVDA calls")],
+        }
+        _LEGENDS_TOPS = {
+            "buffett":       [("AAPL","21.9%"),("AXP","17.4%"),("KO","11.6%"),("BAC","9.5%"),("CVX","6.6%")],
+            "soros":         [("AMZN","#1"),("GPN","#2"),("EA","#3"),("BILL","#4"),("NVDA","#5")],
+            "rentec":        [("UTHR","#1"),("PLTR","#2 trimmed"),("AAPL","#3 new"),("MU","$520M"),("NVDA","$278M")],
+            "dalio":         [("EEM","EM ETF"),("SPY","S&P ETF"),("GLD","Gold ETF"),("TSM","New"),("NVDA","Added")],
+            "tepper":        [("AMZN","15.2%"),("MU","9.5%"),("GOOG","8.4%"),("UBER","7.7%"),("TSM","7.6%")],
+            "ackman":        [("BN","17.6%"),("AMZN","17.4%"),("UBER","15.7%"),("MSFT","15.3%"),("QSR","12.2%")],
+            "druckenmiller": [("CRWV","AI infra"),("TSM","Chips")],
+            "loeb":          [("AMZN","19.4%"),("TDS","13.3%"),("CRH","9.6%"),("TPX","8.1%"),("CRS","5.9%")],
+            "cohen":         [("NVDA","#1"),("AMZN","#2"),("ANET","#3"),("ASML","#4"),("CRDO","#5")],
+            "burry":         [("MOH","35.1%"),("LULU","26.1%"),("SLM","19.5%"),("BRK","19.3%")],
+            "coleman":       [("GOOGL","13.4%"),("NVDA","9.2%"),("AMZN","9.1%"),("TSM","8.2%"),("META","7.7%")],
+            "tudor":         [("IWM puts","Hedge"),("QQQ puts","Hedge"),("SPY calls","Long")],
+            "aschenbrenner": [("BE","$879M #1"),("CLSK","AI miner"),("RIOT","BTC/AI"),("SMH PUTS","$2B")],
+            "gerstner":      [("NVDA","$1.51B"),("META","$1.22B"),("MSFT","$618M"),("AMZN","$511M"),("UBER","$457M")],
+            "laffont":       [("ASML","New $655M"),("NFLX","2x doubled"),("NU","LatAm bank")],
+            "wood":          [("TSLA","#1 trimmed"),("AMD","#2"),("CRSP","gene edit"),("HOOD","retail")],
+            "chamath":       [("Copper/COPX","AI material"),("Groq","Sold $20B")],
+            "einhorn":       [("GRBK","19.1%"),("FLR","6.9%"),("CNR","6.1%"),("BHF","5.3%"),("PCG","3.6%")],
+            "klarman":       [("AMZN","12.7%"),("QSR","11.7%"),("WCC","7.7%"),("UNP","7.3%"),("ELV","doubled")],
+            "griffin":       [("SPY PUTS","#1 macro"),("QQQ PUTS","#2 tech"),("SPY CALLS","#3 long"),("TSLA CALLS","#4"),("NVDA CALLS","#5")],
+        }
+        _LEGENDS_GEMS = {
+            "buffett":       [("NYT","Mid-$3B","+199% -- digital subs + AI licensing"),("LEN","Mid-$15B","homebuilder -- rate cut + housing deficit"),("DAL","Mid-$13B","Delta -- travel + fleet renewal"),("M","Small-$3B","Macys $55M -- deep value asset play")],
+            "soros":         [("BILL","Mid-$6B","#4 holding -- SMB fintech payments"),("GPN","Mid-$11B","#2 holding -- global payment rails")],
+            "rentec":        [("UTHR","Mid-$16B","#1 -- United Therapeutics rare disease"),("GOLD","Small-$3B","$227M Alamos Gold junior miner"),("NEM","Mid-$40B","$278M Newmont gold -- uncertainty hedge")],
+            "dalio":         [("NUE","Mid-$16B","Nucor steel -- reshoring + AI data center build")],
+            "tepper":        [("VST","Mid-$25B","Vistra -- AI data center power, doubled"),("SAND","Small-$5B","SanDisk NAND flash spinoff AI storage")],
+            "ackman":        [("QSR","Mid-$18B","12.2% -- Restaurant Brands intl compounder"),("BN","Mid-$90B","Brookfield Corp complex asset mgr")],
+            "druckenmiller": [("CRWV","Mid-$60B","CoreWeave -- NVIDIA-powered AI compute")],
+            "loeb":          [("TDS","Small-$2.5B","#2 13.3% -- Telephone Data rural telecom"),("CRS","Small-$6B","#5 5.9% -- Carpenter Tech specialty alloys"),("HUT","Small-$1.5B","Hut 8 -- Bitcoin infrastructure new")],
+            "cohen":         [("CRDO","Small-$6B","#5 -- Credo Technology AI interconnect chips"),("TDG","Mid-$75B","$336M TransDigm -- aerospace pricing power")],
+            "burry":         [("MOH","Mid-$8B","35.1% Molina -- Medicaid HMO deep value"),("SLM","Small-$3B","19.5% Sallie Mae -- student loans discount"),("BRK","Small-$4B","19.3% Bruker -- scientific instruments")],
+            "coleman":       [("INTC","Large-$80B","$180M Intel -- turnaround + foundry separation")],
+            "tudor":         [("IWM","ETF","Holds BOTH puts+calls = straddle, expects volatility")],
+            "aschenbrenner": [("BE","Mid-$4B","#1 $879M Bloom Energy biofuel for AI data centers"),("CLSK","Small-$2B","CleanSpark BTC->AI compute pivot"),("APLD","Small-$1B","Applied Digital AI/HPC"),("IREN","Small-$1B","IREN AI hosting")],
+            "gerstner":      [("CRWV","Mid-$60B","$348M CoreWeave -- AI compute cloud"),("BE","Mid-$4B","Bloom Energy -- AI power"),("ARM","Large-$120B","$259M ARM -- chip arch monopoly")],
+            "laffont":       [("NU","Mid-$55B","Nu Holdings -- 90M+ Brazil digital bank"),("ASML","Large-$280B","$655M ASML -- only EUV maker")],
+            "wood":          [("CRSP","Mid-$5B","CRISPR -- first gene editing cure"),("TEM","Mid-$8B","Tempus AI -- 200+ hospitals"),("CRCL","Small-$6B","Circle -- USDC stablecoin"),("RXRX","Small-$2B","Recursion +682% AI drug")],
+            "chamath":       [("COPX","ETF","Copper ETF -- AI data centers 5x copper"),("FCX","Large-$70B","Freeport McMoRan -- largest copper producer")],
+            "einhorn":       [("GRBK","Small-$3B","#1 19.1% Green Brick -- Texas homebuilder"),("CNR","Mid-$8B","Coal at ESG-ignored value"),("FLR","Mid-$7B","Fluor -- AI data center construction")],
+            "klarman":       [("QSR","Mid-$18B","11.7% $529M -- BK/Tim Hortons/Popeyes franchise royalties"),("WCC","Mid-$7B","WESCO -- electrical dist for AI data centers"),("ELV","Large-$35B","Doubled -- Elevance managed care value")],
+            "griffin":       [],
+        }
+        _LEGENDS_THEMES = {
+            "buffett":       ("AI + Media pivot. Exit payments. Homebuilder + airline + media.", "BULLISH AI/Search | EXITING Financials"),
+            "soros":         ("AI chip long + protective puts. Macro hedging.", "MIXED -- long chips, hedging puts"),
+            "rentec":        ("Hard rotation: chips/gold in, consumer/EV out. 3,207 stocks.", "BULLISH chips+gold | CUTTING consumer+EV"),
+            "dalio":         ("Chips in SaaS out. Steel reshoring.", "BULLISH semiconductors | EXITING SaaS"),
+            "tepper":        ("Memory supercycle + Power grid + AI cloud.", "VERY BULLISH memory/chips | EXITING China"),
+            "ackman":        ("Hyper-concentrated. MSFT mega-bet. Cloud.", "BULLISH MSFT/AMZN | EXITING travel"),
+            "druckenmiller": ("AI infra pure play. Next-gen over established tech.", "BULLISH CRWV/TSM | EXITING search"),
+            "loeb":          ("Event-driven + small gems + AI + gold.", "BULLISH META/hard assets | EXITING utilities"),
+            "cohen":         ("AI infrastructure full stack.", "BULLISH AI infra | ADDING aerospace"),
+            "burry":         ("Contrarian value. Healthcare + consumer. No AI.", "CONTRARIAN -- healthcare vs AI crowd"),
+            "coleman":       ("AI hyperscaler + INTC turnaround.", "BULLISH AI mega-cap | INTC turnaround"),
+            "tudor":         ("Pure macro: gold + options straddles.", "NEUTRAL-MACRO -- expects volatility"),
+            "aschenbrenner": ("Long AI power. Short chip sector $8.5B puts.", "ULTRA-BULL AI power | SHORT semi puts"),
+            "gerstner":      ("AI supercycle. All-in NVDA/META + infra.", "ULTRA-BULL AI | EXITING China"),
+            "laffont":       ("Rotating from chips to chip equipment.", "ROTATING -- selling NVDA | BUYING ASML"),
+            "wood":          ("Disruptive: gene edit + AI clinical + stablecoins.", "LONG-TERM BULL disruptive 5-10yr"),
+            "chamath":       ("Copper is the real AI play. Power + materials.", "BULLISH copper | AI raw materials"),
+            "einhorn":       ("Old-economy value: homebuilders + energy + infra.", "CONTRARIAN VALUE -- ignoring AI hype"),
+            "klarman":       ("Deep value: franchise royalties + rail + health.", "BULLISH QSR/AMZN/ELV | Margin of Safety"),
+            "griffin":       ("Pure quant: options on everything. 12,857 positions.", "NEUTRAL-QUANT -- volatility arb"),
+        }
+        _LEGENDS_INSIGHTS = {
+            "buffett":       "First post-Buffett 13F. GOOGL tripled. Portfolio shrunk 40->26 positions -- most aggressive cleanup ever. Hidden: NYT digital subs + Macys $55M asset play.",
+            "soros":         "Buying NVDA/TSM equity + buying puts = reflexive hedge. BILL (fintech #4) and GPN (#2 global payment rails) are rarely discussed.",
+            "rentec":        "UTHR (United Therapeutics rare disease) is the #1 holding -- almost never discussed. Quant buying gold miners. Q1 perf: -1.44%.",
+            "dalio":         "NUE (Nucor steel) is the hidden gem -- reshoring + AI data center construction. Dumped all SaaS simultaneously.",
+            "tepper":        "+6x on MU and VST doubling are boldest calls. SAND (SanDisk) hidden small cap. FXI exit = permanent China risk-off.",
+            "ackman":        "MSFT $2B+ = 15% portfolio instantly. QSR (12.2%) is overlooked gem -- intl franchise + AI drive-thru thesis.",
+            "druckenmiller": "CRWV (CoreWeave) key pick. Sold GOOGL while Buffett added = sharpest divergence. Hardware > software shift.",
+            "loeb":          "TDS (rural telecom 13.3%) and CRS (specialty alloys 5.9%) are top 5 but never discussed. HUT 8 = crypto infra bet.",
+            "cohen":         "CRDO (Credo Technology) small-cap AI interconnect in #5 spot. TDG $336M new = aerospace pricing power.",
+            "burry":         "Ignoring AI. Molina (35.1%) = Medicaid HMO discount. Only 4 stocks -- max conviction. LULU doubled = consumer trough call.",
+            "coleman":       "Pure AI conviction (GOOGL/NVDA/AMZN/TSM/META top 5). Surprise: $180M Intel -- contrarian foundry separation bet.",
+            "tudor":         "Holds IWM puts AND calls = expects large move, unsure direction. Gold + BTC = hard asset hedge. CTA non-directional.",
+            "aschenbrenner": "Ex-OpenAI researcher turned $225M into $13.7B in ~1yr. Long AI power (BE $879M) + $8.46B chip PUTS = AI demand real but chips overvalued.",
+            "gerstner":      "Coined AI supercycle. Exited all China stocks. CRWV + ARM + BE = AI needs power AND compute. 29.52% annualized return.",
+            "laffont":       "Cut NVDA -70% while others held. ASML $655M = chip equipment monopoly over makers. NFLX doubled. NU = LatAm fintech.",
+            "wood":          "Only fund with CRISPR exposure. TEM = AI + personalized medicine. CRCL = stablecoin. 5-10yr bets most funds can't hold.",
+            "chamath":       "Made 3000% on Groq ($62M to $20B). Copper parabolic thesis -- AI data centers use 5x more copper.",
+            "einhorn":       "GRBK (Green Brick) Texas homebuilder at steep discount. CNR (coal) ESG-ignored value. +6.5% Q1 return while AI funds got volatile.",
+            "klarman":       "Margin of Safety framework. QSR $529M doubled = BK/Tim Hortons/Popeyes franchise royalties recession-resistant. WCC for AI data center electrical distribution. 22 total holdings.",
+            "griffin":       "Citadel $618B = world's largest hedge fund. SPY puts + calls simultaneously = market neutral volatility capture. Pure quant 12,857 positions.",
+        }
+
+        st.markdown("### 🏆 Legendary Investors — Q1 2026 13F Filing Tracker")
+        st.caption("Filed 2026-05-15  |  Period: Mar 31 2026  |  Source: SEC 13F (45-day lag)  |  20 Investors")
+
+        _sel_key = st.selectbox(
+            "Select Investor",
+            list(_LEGENDS.keys()),
+            format_func=lambda k: f"{_LEGENDS[k]['name']} — {_LEGENDS[k]['firm']} ({_LEGENDS[k]['aum']})",
+            key="legend_sel"
+        )
+        d = _LEGENDS[_sel_key]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Firm", d["firm"])
+        c2.metric("AUM", d["aum"])
+        c3.metric("Style", d["style"])
+        c4.metric("Filed", "2026-05-15")
+
+        st.markdown("---")
+        lcol, rcol = st.columns(2)
+        with lcol:
+            st.markdown("#### 🟢 Additions / New Buys")
+            buys_data = _LEGENDS_BUYS.get(_sel_key, [])
+            if buys_data:
+                _df_buys = pd.DataFrame(buys_data, columns=["Ticker","Action","Value","Cap","Note"])
+                st.dataframe(_df_buys, hide_index=True, use_container_width=True)
+            else:
+                st.info("No buy data.")
+        with rcol:
+            st.markdown("#### 🔴 Exits / Reductions")
+            sells_data = _LEGENDS_SELLS.get(_sel_key, [])
+            if sells_data:
+                _df_sells = pd.DataFrame(sells_data, columns=["Ticker","Note"])
+                st.dataframe(_df_sells, hide_index=True, use_container_width=True)
+            else:
+                st.info("No sell data.")
+
+        opts = _LEGENDS_OPTIONS.get(_sel_key, [])
+        if opts:
+            st.markdown("#### ⚙️ Options Positions")
+            _df_opts = pd.DataFrame(opts, columns=["Ticker","Type","Expiry","Note"])
+            _df_opts["Signal"] = _df_opts["Type"].map({"PUT":"🔴 PUT","CALL":"🟢 CALL"})
+            st.dataframe(_df_opts, hide_index=True, use_container_width=True)
+
+        gems = _LEGENDS_GEMS.get(_sel_key, [])
+        if gems:
+            st.markdown("#### 💎 Small / Mid Cap Gems")
+            _df_gems = pd.DataFrame(gems, columns=["Ticker","Market Cap","Insight"])
+            st.dataframe(_df_gems, hide_index=True, use_container_width=True)
+
+        tops = _LEGENDS_TOPS.get(_sel_key, [])
+        if tops:
+            st.markdown("#### 💼 Top Holdings")
+            _df_tops = pd.DataFrame(tops, columns=["Ticker","Weight"])
+            try:
+                _df_tops["_w"] = pd.to_numeric(_df_tops["Weight"].str.extract(r"([\d.]+)")[0])
+                _fig_h = px.bar(_df_tops, x="Ticker", y="_w", text="Weight",
+                                color="_w", color_continuous_scale="Blues",
+                                labels={"_w":"Weight (%)"})
+                _fig_h.update_layout(template="plotly_white", height=240, showlegend=False,
+                                     coloraxis_showscale=False)
+                _fig_h.update_traces(textposition="outside")
+                st.plotly_chart(_fig_h, use_container_width=True)
+            except Exception:
+                st.dataframe(_df_tops[["Ticker","Weight"]], hide_index=True, use_container_width=True)
+
+        theme_txt, signal_txt = _LEGENDS_THEMES.get(_sel_key, ("—","—"))
+        insight_txt = _LEGENDS_INSIGHTS.get(_sel_key, "—")
+        tc1, tc2 = st.columns(2)
+        tc1.info(f"**🎯 Theme**\n\n{theme_txt}")
+        tc2.success(f"**📡 Signal**\n\n{signal_txt}")
+        st.warning(f"**💡 Key Insight**\n\n{insight_txt}")
+
+        st.markdown("---")
+        # ── Consensus ────────────────────────────────────────────────
+        st.markdown("### 📊 Consensus — What Most Are Buying")
+        _consensus_buys = [
+            ("NVDA",  8, 20, "8/20 legends buying -- near-universal AI chip"),
+            ("TSM",   7, 20, "7/20 -- chip supply chain consensus"),
+            ("AMZN",  7, 20, "7/20 -- cloud/AI platform"),
+            ("GOOGL", 6, 20, "6 bought vs 4 sold -- key divergence"),
+            ("MU",    5, 20, "5/20 -- memory chip supercycle"),
+            ("META",  4, 20, "4/20 -- AI ad platform"),
+            ("MSFT",  4, 20, "4/20 -- cloud infrastructure"),
+            ("AVGO",  3, 20, "3/20 -- AI networking silicon"),
+            ("CRWV",  4, 20, "4/20 -- AI compute infrastructure"),
+            ("UBER",  3, 20, "3/20 -- mobility/AI platform"),
+        ]
+        _consensus_sells = [
+            ("CRM",   5, "Dalio+Soros+Buffett(prev)+Bridgewater+Loeb -- full SaaS exit"),
+            ("GOOGL", 4, "Soros+Ackman+Druck+Gerstner SOLD vs Buffett/Coleman ADDED"),
+            ("MSFT",  3, "Soros+RenTec+Loeb trimmed"),
+            ("NFLX",  2, "RenTec -$673M"),
+            ("TSLA",  2, "RenTec -$534M, Wood trimmed"),
+            ("PLTR",  2, "RenTec -$542M, Wood trimmed"),
+        ]
+        cb1, cb2 = st.columns(2)
+        with cb1:
+            st.markdown("#### 🟢 Most Bought")
+            _df_cb = pd.DataFrame([(t, c, f"{c}/{mx}", n) for t,c,mx,n in _consensus_buys],
+                                   columns=["Ticker","Count","Out of 20","Notes"])
+            _fig_cb = px.bar(_df_cb, x="Count", y="Ticker", orientation="h",
+                             color="Count", color_continuous_scale="Greens",
+                             hover_data=["Notes"], title="Conviction Breadth (out of 20)")
+            _fig_cb.update_layout(template="plotly_white", height=350, showlegend=False,
+                                  coloraxis_showscale=False, yaxis={"categoryorder":"total ascending"})
+            st.plotly_chart(_fig_cb, use_container_width=True)
+        with cb2:
+            st.markdown("#### 🔴 Most Sold")
+            _df_cs = pd.DataFrame(_consensus_sells, columns=["Ticker","Count","Notes"])
+            _fig_cs = px.bar(_df_cs, x="Count", y="Ticker", orientation="h",
+                             color="Count", color_continuous_scale="Reds",
+                             hover_data=["Notes"], title="Exit Conviction (out of 20)")
+            _fig_cs.update_layout(template="plotly_white", height=280, showlegend=False,
+                                  coloraxis_showscale=False, yaxis={"categoryorder":"total ascending"})
+            st.plotly_chart(_fig_cs, use_container_width=True)
+
+        # ── Options Activity ──────────────────────────────────────────
+        st.markdown("#### ⚙️ Options Activity Across All Legends")
+        _opts_all = [
+            ("SMH PUTS","Aschenbrenner","Q2 2026","$2B notional VanEck Semi hedge","🔴 PUT"),
+            ("NVDA PUTS","Aschenbrenner","Q2 2026","$1.6B notional Nvidia hedge","🔴 PUT"),
+            ("CRWV PUTS","Soros","Q2 2026","CoreWeave AI hedge","🔴 PUT"),
+            ("TSM PUTS","Soros","Q2 2026","Geo-risk hedge","🔴 PUT"),
+            ("SPY PUTS","Griffin/Citadel","Q2 2026","#1 position macro hedge","🔴 PUT"),
+            ("QQQ PUTS","Griffin/Tudor","Q2 2026","Tech correction hedge","🔴 PUT"),
+            ("MU CALLS","Aschenbrenner","Q2 2026","$422M Micron long","🟢 CALL"),
+            ("TSM CALLS","Aschenbrenner","Q2 2026","$355M TSM long","🟢 CALL"),
+            ("IWM straddle","Tudor","Q2 2026","Both puts+calls = volatility bet","🟡 STRADDLE"),
+            ("NVDA CALLS","Griffin","Q2 2026","AI chip upside","🟢 CALL"),
+        ]
+        _df_opts_all = pd.DataFrame(_opts_all, columns=["Position","Fund","Expiry","Note","Type"])
+        st.dataframe(_df_opts_all, hide_index=True, use_container_width=True)
+
+        # ── QoQ Tracker ──────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 📊 Quarter-over-Quarter Tracker (Q4 2025 → Q1 2026)")
+        st.caption("Loading = adding. Unloading = selling. Net $ and avg acquisition price per quarter.")
+
+        _qoq_raw = [
+            ("Buffett",  "GOOGL", 18000, 2800,  57800, 16600, 155.6, 287.2, "LOADING+++", "+221% tripled +$13.8B"),
+            ("Buffett",  "BAC",   680000,29000, 570000, 24000,  42.6,  42.1, "UNLOADING",  "Trimmed -$5B"),
+            ("Buffett",  "DAL",       0,    0,   39800,  2600,   0.0,  65.3, "INITIATE",   "New Delta $2.6B"),
+            ("Buffett",  "V",      8500, 2100,       0,     0, 247.1,   0.0, "EXITED",     "Full exit payments"),
+            ("Buffett",  "NYT",    9000,  340,   27000,  1020,  37.8,  37.8, "LOADING++",  "+199% media +$680M"),
+            ("RenTec",   "AAPL",      0,    0,   43000,   781,   0.0, 181.6, "INITIATE",   "New $781M Apple"),
+            ("RenTec",   "MU",    12000, 1380,   18100,  1900, 115.0, 105.0, "LOADING++",  "+50% $520M Micron"),
+            ("RenTec",   "NFLX",  18000, 8100,    5000,  2250, 450.0, 450.0, "UNLOADING",  "-$5.85B exit"),
+            ("RenTec",   "PLTR",  14500, 1900,    8400,  1100, 131.0, 130.1, "UNLOADING",  "-$800M Palantir"),
+            ("Tepper",   "MU",     1800,  207,   10800,  1134, 115.0, 105.0, "LOADING+++", "+6x Micron +$927M"),
+            ("Tepper",   "UBER",   3200,  310,    9600,   930,  96.9,  96.9, "LOADING+++", "Tripled +$620M"),
+            ("Tepper",   "VST",    2800,  280,    5600,   560, 100.0, 100.0, "LOADING++",  "Doubled +$280M"),
+            ("Tepper",   "AAL",    8200,  148,       0,     0,  18.0,   0.0, "EXITED",     "Full exit airlines"),
+            ("Ackman",   "MSFT",      0,    0,   16000,  2000,   0.0, 125.0, "INITIATE",   "New $2B MSFT"),
+            ("Ackman",   "HLT",    4800,  845,       0,     0, 176.0,   0.0, "EXITED",     "Full exit Hilton"),
+            ("Loeb",     "META",      0,    0,    1800,   900,   0.0, 500.0, "INITIATE",   "New Meta $900M"),
+            ("Loeb",     "MSFT",   2400,  900,       0,     0, 375.0,   0.0, "EXITED",     "Full exit MSFT"),
+            ("Druck",    "CRWV",   1200,  186,    3400,   527, 155.0, 155.0, "LOADING++",  "Nearly 3x CoreWeave"),
+            ("Druck",    "GOOGL",  4800,  736,       0,     0, 153.3,   0.0, "EXITED",     "Full exit Alphabet"),
+            ("Aschenb",  "BE",     8000,  520,   13400,   879,  65.0,  65.6, "LOADING++",  "+67% Bloom Energy"),
+            ("Gerstner", "CRWV",   3200,  496,    4499,   348, 155.0,  77.3, "LOADING+",   "+1.28M CoreWeave"),
+            ("Gerstner", "ARM",       0,    0,    1715,   259,   0.0, 151.0, "INITIATE",   "New ARM $259M"),
+            ("Gerstner", "GOOGL",   519,  162,       0,     0, 312.1,   0.0, "EXITED",     "Full exit Alphabet"),
+            ("Laffont",  "ASML",      0,    0,     496,   655,   0.0,1320.6, "INITIATE",   "New ASML $655M monopoly"),
+            ("Laffont",  "NFLX",   3100, 1395,    6200,  2790, 450.0, 450.0, "LOADING++",  "Doubled Netflix +$1.4B"),
+            ("Laffont",  "NVDA",  28000, 3794,    8400,  1180, 135.5, 140.5, "UNLOADING",  "-70% -$2.6B"),
+            ("Laffont",  "AMZN",  18000, 3600,    3240,   648, 200.0, 200.0, "UNLOADING",  "-82% -$2.95B"),
+            ("Wood",     "CRSP",   6400,  352,    8800,   484,  55.0,  55.0, "LOADING+",   "+38% CRISPR +$132M"),
+            ("Wood",     "TSLA",  98000,28420,   86000, 24940, 290.0, 290.0, "UNLOADING",  "Trimmed -$3.48B"),
+            ("Klarman",  "QSR",    4050,  304,    8253,   529,  75.1,  64.1, "LOADING++",  "Doubled +$225M"),
+            ("Klarman",  "ELV",     616,  217,    1319,   426, 352.3, 323.0, "LOADING++",  "Doubled +$209M"),
+            ("Einhorn",  "GRBK",  18000,  486,   22600,   611,  27.0,  27.0, "LOADING+",   "Added +$125M"),
+            ("Griffin",  "NVDA",  42000, 5700,   51000,  7140, 135.7, 140.0, "LOADING+",   "Added +$1.44B"),
+            ("Griffin",  "AAPL",  38000, 6250,   40000,  7160, 164.5, 179.0, "LOADING+",   "Added +$910M"),
+            ("Dalio",    "TSM",       0,    0,    8200,   900,   0.0, 109.8, "INITIATE",   "New TSM position"),
+            ("Dalio",    "CRM",    4200,  900,       0,     0, 214.3,   0.0, "EXITED",     "Full Salesforce exit"),
+        ]
+        _df_qoq = pd.DataFrame(_qoq_raw,
+            columns=["Investor","Ticker","Q4_Shares(K)","Q4_Val($M)","Q1_Shares(K)","Q1_Val($M)",
+                     "AvgPx_Q4($)","AvgPx_Q1($)","Action","Notes"])
+        _df_qoq["Net_$_Chg(M)"] = _df_qoq["Q1_Val($M)"] - _df_qoq["Q4_Val($M)"]
+        _df_qoq["Share_Chg_%"] = (
+            (_df_qoq["Q1_Shares(K)"] - _df_qoq["Q4_Shares(K)"]) /
+            _df_qoq["Q4_Shares(K)"].replace(0, float("nan")) * 100
+        ).round(1)
+        _action_em = {"LOADING+++":"🔥🔥🔥 ","LOADING++":"🔥🔥 ","LOADING+":"🟢 ",
+                      "INITIATE":"🆕 ","HOLD":"⚪ ","UNLOADING":"🔴 ","EXITED":"💀 "}
+        _df_qoq["Signal"] = _df_qoq["Action"].map(_action_em).fillna("") + _df_qoq["Action"]
+
+        qc1, qc2, qc3 = st.columns(3)
+        _qoq_invs = ["All"] + sorted(_df_qoq["Investor"].unique().tolist())
+        _qoq_acts = ["All","LOADING+++","LOADING++","LOADING+","INITIATE","UNLOADING","EXITED"]
+        _sel_qi = qc1.selectbox("Filter Investor", _qoq_invs, key="qoq_inv")
+        _sel_qa = qc2.selectbox("Filter Action",   _qoq_acts, key="qoq_act")
+        _sel_qs = qc3.selectbox("Sort By", ["Net $ Change","Investor","Ticker"], key="qoq_sort")
+
+        _dq = _df_qoq.copy()
+        if _sel_qi != "All": _dq = _dq[_dq["Investor"] == _sel_qi]
+        if _sel_qa != "All": _dq = _dq[_dq["Action"] == _sel_qa]
+        _sort_map = {"Net $ Change": ("Net_$_Chg(M)", False),
+                     "Investor": ("Investor", True), "Ticker": ("Ticker", True)}
+        _sc, _sasc = _sort_map[_sel_qs]
+        _dq = _dq.sort_values(_sc, ascending=_sasc)
+
+        st.dataframe(_dq[["Investor","Ticker","Signal","Q4_Val($M)","Q1_Val($M)",
+                           "Net_$_Chg(M)","Share_Chg_%","AvgPx_Q4($)","AvgPx_Q1($)","Notes"]],
+                     hide_index=True, use_container_width=True)
+
+        try:
+            _net_inv = _df_qoq.groupby("Investor")["Net_$_Chg(M)"].sum().sort_values()
+            _fig_qoq = px.bar(x=_net_inv.values, y=_net_inv.index,
+                              orientation="h",
+                              color=_net_inv.values,
+                              color_continuous_scale=["red","gray","green"],
+                              color_continuous_midpoint=0,
+                              text=[f"${v:+.0f}M" for v in _net_inv.values],
+                              labels={"x":"Net $ Change ($M)","y":"Investor"},
+                              title="Net $ Position Change by Investor (Q4 2025 -> Q1 2026)")
+            _fig_qoq.update_layout(template="plotly_white", height=500,
+                                   coloraxis_showscale=False)
+            _fig_qoq.update_traces(textposition="outside")
+            st.plotly_chart(_fig_qoq, use_container_width=True)
+        except Exception:
+            pass
+
+        st.markdown("#### 🏆 Top 10 Biggest Single Position Moves")
+        _top10 = _df_qoq.iloc[_df_qoq["Net_$_Chg(M)"].abs().nlargest(10).index]
+        st.dataframe(_top10[["Investor","Ticker","Q4_Val($M)","Q1_Val($M)","Net_$_Chg(M)",
+                              "AvgPx_Q4($)","AvgPx_Q1($)","Action","Notes"]],
+                     hide_index=True, use_container_width=True)
+
+        # ── Future Catches ────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🚀 Future Catches — Small/Mid Caps Legends Are Betting On")
+        _future = [
+            ("BE",   "Bloom Energy",       "Mid-$4B",   "AI Power",    "Aschenbrenner $879M #1","5-10x","High"),
+            ("CRWV", "CoreWeave",          "Mid-$60B",  "AI Compute",  "Druck+Altimeter+ARK",   "3-5x", "High"),
+            ("CLSK", "CleanSpark",         "Small-$2B", "AI/BTC Infra","Aschenbrenner",          "5-10x","V.High"),
+            ("APLD", "Applied Digital",    "Small-$1B", "AI Datacenter","Aschenbrenner",         "5-15x","V.High"),
+            ("TEM",  "Tempus AI",          "Mid-$8B",   "AI Biotech",  "ARK Invest",             "3-8x", "High"),
+            ("CRSP", "CRISPR Therap",      "Mid-$5B",   "Gene Editing","ARK #2 holding",         "5-20x","V.High"),
+            ("CRCL", "Circle Internet",    "Small-$6B", "Stablecoin",  "ARK Invest",             "3-8x", "High"),
+            ("RXRX", "Recursion Pharma",   "Small-$2B", "AI Drug",     "ARK, institutional",     "5-20x","V.High"),
+            ("CRDO", "Credo Technology",   "Small-$6B", "AI Networking","Cohen Point72 #5",      "5-10x","High"),
+            ("ARM",  "ARM Holdings",       "Large-$120B","AI Chip Arch","Altimeter $259M",        "2-4x", "Medium"),
+            ("ASML", "ASML Holding",       "Large-$280B","Chip Equip",  "Coatue $655M, Cohen",   "2-3x", "Med-Low"),
+            ("VST",  "Vistra Energy",      "Mid-$25B",  "AI Power",    "Tepper 2x",              "3-6x", "Medium"),
+            ("SNDK", "SanDisk",            "Small-$5B", "AI Storage",  "Aschenbrenner+Tepper",   "3-6x", "High"),
+            ("UTHR", "United Therapeutics","Mid-$16B",  "Rare Disease","RenTec #1 holding",      "2-4x", "Medium"),
+            ("NUE",  "Nucor Steel",        "Mid-$16B",  "Steel/Infra", "Dalio Bridgewater",      "2-4x", "Medium"),
+            ("COPX", "Copper Miners ETF",  "ETF",       "AI Materials","Chamath thesis",          "3-8x", "High"),
+            ("HOOD", "Robinhood",          "Mid-$20B",  "Retail Finance","ARK Invest",            "3-5x", "Medium"),
+            ("NU",   "Nu Holdings",        "Mid-$55B",  "LatAm Fintech","Coatue holding",        "2-5x", "Medium"),
+            ("QSR",  "Restaurant Brands",  "Mid-$18B",  "Franchise",   "Ackman 12.2%, Klarman", "2-4x", "Medium"),
+            ("GRBK", "Green Brick Part",   "Small-$3B", "Homebuilder", "Einhorn #1 19.1%",       "2-5x", "Medium"),
+            ("MOH",  "Molina Healthcare",  "Mid-$8B",   "Healthcare",  "Burry #1 35.1%",         "2-4x", "Medium"),
+            ("CRS",  "Carpenter Tech",     "Small-$6B", "Aero Metal",  "Loeb #5 5.9%",           "2-4x", "Medium"),
+            ("BILL", "Bill Holdings",      "Mid-$6B",   "SMB Fintech", "Soros #4 holding",       "2-5x", "Medium"),
+            ("INTC", "Intel",              "Large-$80B","Chip Turnar", "Coleman $180M new",       "2-5x", "High"),
+        ]
+        _df_fc = pd.DataFrame(_future, columns=["Ticker","Name","Market Cap","Sector","Who","Potential","Risk"])
+        _fcc1, _fcc2 = st.columns(2)
+        _sec_opts = ["All"] + sorted(_df_fc["Sector"].unique().tolist())
+        _rsk_opts = ["All","V.High","High","Medium","Med-Low"]
+        _sel_fsec = _fcc1.selectbox("Sector", _sec_opts, key="fc_sec2")
+        _sel_frsk = _fcc2.selectbox("Risk",   _rsk_opts, key="fc_rsk2")
+        _dffc = _df_fc.copy()
+        if _sel_fsec != "All": _dffc = _dffc[_dffc["Sector"] == _sel_fsec]
+        if _sel_frsk != "All": _dffc = _dffc[_dffc["Risk"] == _sel_frsk]
+        st.dataframe(_dffc[["Ticker","Name","Market Cap","Sector","Who","Potential","Risk"]],
+                     hide_index=True, use_container_width=True)
+        try:
+            _dffc["_pot"] = pd.to_numeric(_dffc["Potential"].str.extract(r"(\d+)")[0])
+            _fig_fc2 = px.scatter(_dffc, x="Sector", y="_pot", size="_pot",
+                                  color="Risk", hover_data=["Ticker","Name","Who"],
+                                  color_discrete_map={"V.High":"red","High":"orange","Medium":"gold","Med-Low":"green"},
+                                  labels={"_pot":"Upside (x)"},
+                                  title="Future Catches: Upside vs Risk by Sector")
+            _fig_fc2.update_layout(template="plotly_white", height=400)
+            st.plotly_chart(_fig_fc2, use_container_width=True)
+        except Exception:
+            pass
+
+
+# ===================================================================
+# ──  LEGENDARY INVESTORS — Standalone page
+# ===================================================================
+elif page == "🏆 Legendary Investors (13F)":
+    st.markdown("## 🏆 Legendary Investors — Q1 2026 13F Tracker")
+    st.caption("Filed 2026-05-15  |  Period: Mar 31 2026  |  Source: SEC 13F (45-day lag)")
+    st.info("Navigate to **📈 Insider / Congress / Whales → 🏆 Legendary Investors (13F)** tab for the full interactive dashboard.", icon="💡")
 
 
 # ===================================================================
@@ -6140,19 +6762,61 @@ Professional options desk — dealer GEX analysis, expiry-level walls, position 
     # TAB 1: ADVISOR SCAN — single ticker deep dive
     # ════════════════════════════════════════════════════════════════
     with _tab_scan:
-        _col_sel, _col_btn = st.columns([3, 1])
-        with _col_sel:
+        # ── Row 1: Ticker + Expiry selector (always visible) ──────────
+        _r1a, _r1b, _r1c = st.columns([2, 2, 1])
+        with _r1a:
             _ga_sel = st.selectbox("Select ticker for full advisor report",
                                    _ga_all_tickers,
                                    index=_ga_all_tickers.index("SPY") if "SPY" in _ga_all_tickers else 0,
                                    key="ga_sel_adv")
-        with _col_btn:
+
+        # Load OI silently to populate expiry dropdown (lightweight query)
+        _ga_oi_meta = pd.read_sql(
+            "SELECT DISTINCT expiry_date FROM options_change "
+            "WHERE ticker=? AND trade_date_now=? AND (openInt_Call_now>0 OR openInt_Put_now>0)",
+            _ga_conn, params=(_ga_sel, _ga_today))
+        def _ga_exp_sort(d):
+            try:
+                p = str(d).split("-"); return (int(p[2]), int(p[0]), int(p[1]))
+            except Exception:
+                return (9999, 99, 99)
+        _all_ga_exps = sorted(_ga_oi_meta["expiry_date"].tolist(), key=_ga_exp_sort)
+        try:
+            import datetime as _dmod_ga
+            _ref_ga = _dmod_ga.datetime.strptime(_ga_today, "%m-%d-%Y").date()
+            _fut_ga = [e for e in _all_ga_exps
+                       if _dmod_ga.date(int(e.split("-")[2]),int(e.split("-")[0]),int(e.split("-")[1])) >= _ref_ga]
+            _pst_ga = [e for e in _all_ga_exps if e not in _fut_ga]
+        except Exception:
+            _fut_ga = _all_ga_exps; _pst_ga = []
+        _ga_exp_labels = (["📊 All Expiries (Aggregate)"] +
+                          [f"🟢 {e}" for e in _fut_ga] +
+                          [f"🔴 {e} (expired)" for e in _pst_ga])
+        with _r1b:
+            _sel_ga_exp_lbl = st.selectbox(
+                "📅 Select Expiry",
+                _ga_exp_labels, index=0, key="ga_wall_exp",
+                help="All Expiries = aggregate gamma wall across full chain. "
+                     "Select a specific expiry to filter ALL charts, tables and signals to that cycle only."
+            )
+        with _r1c:
             st.markdown("<br>", unsafe_allow_html=True)
-            _ga_run = st.button("\U0001f3af Analyze", type="primary", use_container_width=True, key="ga_run_adv")
+            _ga_run = st.button("🎯 Analyze", type="primary", use_container_width=True, key="ga_run_adv")
+
+        # Parse selected expiry
+        _sel_ga_expiry = None
+        if _sel_ga_exp_lbl and _sel_ga_exp_lbl != "📊 All Expiries (Aggregate)":
+            _sel_ga_expiry = _sel_ga_exp_lbl.replace("🟢 ","").replace("🔴 ","").replace(" (expired)","")
+        _wall_mode_label = f"Expiry: {_sel_ga_expiry}" if _sel_ga_expiry else "All Expiries (Aggregate)"
+
+        if _sel_ga_expiry:
+            st.info(f"📅 Showing all analysis for **{_ga_sel}** — Expiry **{_sel_ga_expiry}** "
+                    f"({[e for e in _fut_ga if e==_sel_ga_expiry and True] and 'Future' or 'Expired'})",
+                    icon="📅")
 
         if _ga_run:
-            with st.spinner(f"Deep analysis for {_ga_sel}…"):
-                # load OI
+            with st.spinner(f"Deep analysis for {_ga_sel} — {_wall_mode_label}…"):
+                # ── Load full OI data ──────────────────────────────────
                 _ga_oi = pd.read_sql(
                     "SELECT strike, expiry_date, openInt_Call_now, openInt_Put_now "
                     "FROM options_change WHERE ticker=? AND trade_date_now=? "
@@ -6170,26 +6834,69 @@ Professional options desk — dealer GEX analysis, expiry-level walls, position 
                 if not _spot or _ga_oi.empty:
                     st.warning(f"No data for {_ga_sel} on {_ga_today}. Try a different ticker.")
                 else:
-                    _avg_c = _ga_oi["openInt_Call_now"].mean()
-                    _avg_p = _ga_oi["openInt_Put_now"].mean()
+                    # ── Build working OI frame (single expiry OR aggregate) ──
+                    if _sel_ga_expiry:
+                        _ga_oi_work = _ga_oi[_ga_oi["expiry_date"] == _sel_ga_expiry].copy()
+                        if _ga_oi_work.empty:
+                            st.warning(f"No data for {_ga_sel} at expiry {_sel_ga_expiry}.")
+                            st.stop()
+                    else:
+                        # Aggregate: sum OI across all expiries per strike
+                        _ga_oi_agg = _ga_oi.groupby("strike", as_index=False).agg(
+                            openInt_Call_now=("openInt_Call_now", "sum"),
+                            openInt_Put_now=("openInt_Put_now", "sum"),
+                        )
+                        _dom_exp = (
+                            _ga_oi.sort_values("openInt_Call_now", ascending=False)
+                                  .drop_duplicates(subset=["strike"])[["strike","expiry_date"]]
+                        )
+                        _ga_oi_work = _ga_oi_agg.merge(_dom_exp, on="strike", how="left")
+
+                    st.caption(f"📊 Mode: **{_wall_mode_label}** | {len(_fut_ga)} future expiries, "
+                               f"{len(_pst_ga)} expired | Snapshot: {_ga_today}")
+
+                    _avg_c = _ga_oi_work["openInt_Call_now"].mean()
+                    _avg_p = _ga_oi_work["openInt_Put_now"].mean()
+
                     # Call wall = strongest call OI AT or ABOVE spot (acts as ceiling)
-                    _wc_pool = _ga_oi[(_ga_oi["openInt_Call_now"] >= _avg_c * 2.5) &
-                                       (_ga_oi["strike"] >= _spot)].sort_values("openInt_Call_now", ascending=False)
-                    if _wc_pool.empty:  # fallback: strongest call OI anywhere
-                        _wc_pool = _ga_oi[_ga_oi["openInt_Call_now"] >= _avg_c * 2.5].sort_values("openInt_Call_now", ascending=False)
+                    _wc_pool = _ga_oi_work[
+                        (_ga_oi_work["openInt_Call_now"] >= _avg_c * 2.5) &
+                        (_ga_oi_work["strike"] >= _spot)
+                    ].sort_values("openInt_Call_now", ascending=False)
+                    if _wc_pool.empty:
+                        _wc_pool = _ga_oi_work[
+                            _ga_oi_work["openInt_Call_now"] >= _avg_c * 2.5
+                        ].sort_values("openInt_Call_now", ascending=False)
+
                     # Put wall = strongest put OI AT or BELOW spot (acts as floor)
-                    _wp_pool = _ga_oi[(_ga_oi["openInt_Put_now"] >= _avg_p * 2.5) &
-                                       (_ga_oi["strike"] <= _spot)].sort_values("openInt_Put_now", ascending=False)
-                    if _wp_pool.empty:  # fallback: strongest put OI anywhere
-                        _wp_pool = _ga_oi[_ga_oi["openInt_Put_now"] >= _avg_p * 2.5].sort_values("openInt_Put_now", ascending=False)
+                    _wp_pool = _ga_oi_work[
+                        (_ga_oi_work["openInt_Put_now"] >= _avg_p * 2.5) &
+                        (_ga_oi_work["strike"] <= _spot)
+                    ].sort_values("openInt_Put_now", ascending=False)
+                    if _wp_pool.empty:
+                        _wp_pool = _ga_oi_work[
+                            _ga_oi_work["openInt_Put_now"] >= _avg_p * 2.5
+                        ].sort_values("openInt_Put_now", ascending=False)
+
                     _cw  = float(_wc_pool["strike"].iloc[0]) if not _wc_pool.empty else None
                     _pw  = float(_wp_pool["strike"].iloc[0]) if not _wp_pool.empty else None
                     _cws = float(_wc_pool["openInt_Call_now"].iloc[0]) / _avg_c if _cw else 0
                     _pws = float(_wp_pool["openInt_Put_now"].iloc[0])  / _avg_p if _pw else 0
-                    _cw_expiry = _wc_pool["expiry_date"].iloc[0] if not _wc_pool.empty else ""
-                    _pw_expiry = _wp_pool["expiry_date"].iloc[0] if not _wp_pool.empty else ""
-                    _cw_above = bool(_cw and _cw >= _spot)   # True = wall is a ceiling
-                    _pw_below = bool(_pw and _pw <= _spot)   # True = wall is a floor
+
+                    # Expiry label shown in metrics and strategy cards
+                    if _sel_ga_expiry:
+                        _cw_expiry = _sel_ga_expiry
+                        _pw_expiry = _sel_ga_expiry
+                    else:
+                        # Aggregate: show dominant expiry per wall strike
+                        def _dom_exp_for(strike, col):
+                            _r = _ga_oi[_ga_oi["strike"] == strike].sort_values(col, ascending=False).head(1)
+                            return _r["expiry_date"].iloc[0] if not _r.empty else "—"
+                        _cw_expiry = _dom_exp_for(_cw, "openInt_Call_now") if _cw else "—"
+                        _pw_expiry = _dom_exp_for(_pw, "openInt_Put_now")   if _pw else "—"
+
+                    _cw_above = bool(_cw and _cw >= _spot)
+                    _pw_below = bool(_pw and _pw <= _spot)
                     _gex = "POSITIVE" if _pcr < 1.2 else "NEGATIVE"
 
                     # ── Metrics strip ──────────────────────────────────
@@ -6212,9 +6919,409 @@ Professional options desk — dealer GEX analysis, expiry-level walls, position 
                     _mc[4].metric("GEX", _gex,
                                   delta="✅ Dampening" if _gex=="POSITIVE" else "⚠️ Amplifying")
 
+                    # ── Expiry Wall Summary Table + Chart ──────────────
+                    st.markdown("---")
+                    st.markdown("#### 📅 Call & Put Wall by Expiry")
+                    st.caption("Each expiry's dominant wall strike — the level with the highest OI concentration. "
+                               "🟡 = selected wall | 🟢 = call wall above spot | 🔴 = put wall below spot")
+
+                    _wall_rows = []
+                    for _ex in _fut_ga:          # future expiries only
+                        _eg = _ga_oi[_ga_oi["expiry_date"] == _ex].copy()
+                        if len(_eg) < 3:
+                            continue
+                        _ea_c = _eg["openInt_Call_now"].mean()
+                        _ea_p = _eg["openInt_Put_now"].mean()
+                        if _ea_c == 0 or _ea_p == 0:
+                            continue
+
+                        # Call wall: highest call OI at or above spot
+                        _wc_ex = _eg[(_eg["openInt_Call_now"] >= _ea_c * 2.5) & (_eg["strike"] >= _spot)]
+                        if _wc_ex.empty:
+                            _wc_ex = _eg[_eg["openInt_Call_now"] >= _ea_c * 2.5]
+                        # Put wall: highest put OI at or below spot
+                        _wp_ex = _eg[(_eg["openInt_Put_now"] >= _ea_p * 2.5) & (_eg["strike"] <= _spot)]
+                        if _wp_ex.empty:
+                            _wp_ex = _eg[_eg["openInt_Put_now"] >= _ea_p * 2.5]
+
+                        _cw_ex = float(_wc_ex.sort_values("openInt_Call_now", ascending=False)["strike"].iloc[0]) if not _wc_ex.empty else None
+                        _pw_ex = float(_wp_ex.sort_values("openInt_Put_now",  ascending=False)["strike"].iloc[0]) if not _wp_ex.empty else None
+                        _cw_oi_ex = float(_wc_ex["openInt_Call_now"].max()) if not _wc_ex.empty else 0
+                        _pw_oi_ex = float(_wp_ex["openInt_Put_now"].max())  if not _wp_ex.empty else 0
+                        _cw_str_ex = round(_cw_oi_ex / _ea_c, 1) if _ea_c > 0 else 0
+                        _pw_str_ex = round(_pw_oi_ex / _ea_p, 1) if _ea_p > 0 else 0
+
+                        try:
+                            _ep = _ex.split("-")
+                            _ed = _dmod_ga.date(int(_ep[2]), int(_ep[0]), int(_ep[1]))
+                            _dte_ex = (_ed - _ref_ga).days
+                        except Exception:
+                            _dte_ex = -1
+
+                        _is_sel = (_ex == _sel_ga_expiry) if _sel_ga_expiry else False
+                        _zone = ("✅ IDEAL" if 21 <= _dte_ex <= 50 else
+                                 "⚡ NEAR" if 0 < _dte_ex < 21 else
+                                 "📌 FAR"  if _dte_ex > 50 else "—")
+
+                        _wall_rows.append({
+                            "Expiry":       _ex,
+                            "DTE":          _dte_ex,
+                            "Zone":         _zone,
+                            "Call Wall $":  _cw_ex,
+                            "CW Dist %":    round((_cw_ex - _spot) / _spot * 100, 1) if _cw_ex else None,
+                            "CW Strength":  f"{_cw_str_ex:.1f}×",
+                            "CW OI":        int(_cw_oi_ex),
+                            "Put Wall $":   _pw_ex,
+                            "PW Dist %":    round((_pw_ex - _spot) / _spot * 100, 1) if _pw_ex else None,
+                            "PW Strength":  f"{_pw_str_ex:.1f}×",
+                            "PW OI":        int(_pw_oi_ex),
+                            "Selected":     _is_sel,
+                        })
+
+                    if _wall_rows:
+                        _wdf = pd.DataFrame(_wall_rows)
+
+                        # Colour rows
+                        def _wall_row_style(row):
+                            if row.get("Selected"):
+                                return ["background-color:#3a3000; color:#FFD700; font-weight:700"] * len(row)
+                            if row["DTE"] <= 7:
+                                return ["background-color:#2a0a0a; color:#ffcccc"] * len(row)
+                            if 21 <= row["DTE"] <= 50:
+                                return ["background-color:#0a2a0a; color:#ccffcc"] * len(row)
+                            return [""] * len(row)
+
+                        _disp_cols = ["Expiry","DTE","Zone","Call Wall $","CW Dist %","CW Strength",
+                                      "Put Wall $","PW Dist %","PW Strength"]
+                        st.dataframe(
+                            _wdf[_disp_cols].style.apply(_wall_row_style, axis=1)
+                                                   .format({
+                                                       "Call Wall $": lambda v: f"${v:.0f}" if v else "—",
+                                                       "Put Wall $":  lambda v: f"${v:.0f}" if v else "—",
+                                                       "CW Dist %":   lambda v: f"{v:+.1f}%" if v else "—",
+                                                       "PW Dist %":   lambda v: f"{v:+.1f}%" if v else "—",
+                                                   }),
+                            hide_index=True, use_container_width=True,
+                        )
+
+                        # ── Wall chart: all expiries side by side ──────
+                        _wdf_c = _wdf[_wdf["Call Wall $"].notna() | _wdf["Put Wall $"].notna()].copy()
+                        if not _wdf_c.empty:
+                            import plotly.graph_objects as _pgo_wall
+                            _fig_wall = _pgo_wall.Figure()
+
+                            # Spot line
+                            _fig_wall.add_hline(
+                                y=_spot,
+                                line=dict(color="#FFD700", width=2, dash="solid"),
+                                annotation_text=f"SPOT ${_spot:.2f}",
+                                annotation_font_color="#FFD700",
+                                annotation_bgcolor="rgba(0,0,0,0.6)",
+                            )
+
+                            # Call wall dots
+                            _cw_valid = _wdf_c[_wdf_c["Call Wall $"].notna()]
+                            if not _cw_valid.empty:
+                                _fig_wall.add_trace(_pgo_wall.Scatter(
+                                    x=_cw_valid["Expiry"],
+                                    y=_cw_valid["Call Wall $"],
+                                    mode="markers+lines+text",
+                                    name="Call Wall",
+                                    marker=dict(color="#00e676", size=14, symbol="triangle-up",
+                                                line=dict(color="#ffffff", width=1)),
+                                    line=dict(color="#00e676", width=1.5, dash="dot"),
+                                    text=[f"${v:.0f}" for v in _cw_valid["Call Wall $"]],
+                                    textposition="top center",
+                                    textfont=dict(color="#00e676", size=11),
+                                    hovertemplate="<b>%{x}</b><br>Call Wall: $%{y:.0f}<extra></extra>",
+                                ))
+
+                            # Put wall dots
+                            _pw_valid = _wdf_c[_wdf_c["Put Wall $"].notna()]
+                            if not _pw_valid.empty:
+                                _fig_wall.add_trace(_pgo_wall.Scatter(
+                                    x=_pw_valid["Expiry"],
+                                    y=_pw_valid["Put Wall $"],
+                                    mode="markers+lines+text",
+                                    name="Put Wall",
+                                    marker=dict(color="#ff5252", size=14, symbol="triangle-down",
+                                                line=dict(color="#ffffff", width=1)),
+                                    line=dict(color="#ff5252", width=1.5, dash="dot"),
+                                    text=[f"${v:.0f}" for v in _pw_valid["Put Wall $"]],
+                                    textposition="bottom center",
+                                    textfont=dict(color="#ff5252", size=11),
+                                    hovertemplate="<b>%{x}</b><br>Put Wall: $%{y:.0f}<extra></extra>",
+                                ))
+
+                            # Selected expiry marker — use add_shape for categorical x-axis
+                            if _sel_ga_expiry:
+                                _sel_row = _wdf_c[_wdf_c["Expiry"] == _sel_ga_expiry]
+                                if not _sel_row.empty:
+                                    # get integer index position of the selected expiry label
+                                    _exp_list = _wdf_c["Expiry"].tolist()
+                                    if _sel_ga_expiry in _exp_list:
+                                        _sel_idx = _exp_list.index(_sel_ga_expiry)
+                                        _fig_wall.add_shape(
+                                            type="line",
+                                            x0=_sel_idx, x1=_sel_idx,
+                                            y0=0, y1=1,
+                                            xref="x", yref="paper",
+                                            line=dict(color="#FFD700", width=2, dash="dash"),
+                                        )
+                                        _fig_wall.add_annotation(
+                                            x=_sel_ga_expiry, y=1.0,
+                                            xref="x", yref="paper",
+                                            text="▼ Selected",
+                                            showarrow=False,
+                                            font=dict(color="#FFD700", size=11),
+                                            bgcolor="rgba(0,0,0,0.5)",
+                                            yanchor="top",
+                                        )
+
+                            _fig_wall.update_layout(
+                                height=360,
+                                title=dict(
+                                    text=f"{_ga_sel} — Call & Put Wall per Expiry  |  Spot ${_spot:.2f}",
+                                    font=dict(color="#ffffff", size=15, family="Courier New, monospace"),
+                                    x=0.02,
+                                ),
+                                plot_bgcolor="#0e1117",
+                                paper_bgcolor="#0e1117",
+                                font=dict(family="Courier New, monospace", color="#e0e0e0"),
+                                xaxis=dict(
+                                    title=dict(text="Expiry Date", font=dict(color="#aaaaaa")),
+                                    tickfont=dict(color="#cccccc"),
+                                    gridcolor="rgba(255,255,255,0.07)",
+                                    tickangle=-30,
+                                ),
+                                yaxis=dict(
+                                    title=dict(text="Strike Price ($)", font=dict(color="#aaaaaa")),
+                                    tickfont=dict(color="#cccccc"),
+                                    gridcolor="rgba(255,255,255,0.07)",
+                                ),
+                                legend=dict(
+                                    orientation="h", yanchor="bottom", y=1.02,
+                                    bgcolor="rgba(0,0,0,0)",
+                                    font=dict(color="#e0e0e0"),
+                                ),
+                                hovermode="x unified",
+                                margin=dict(t=65, b=65, l=65, r=20),
+                            )
+                            st.plotly_chart(_fig_wall, use_container_width=True)
+                            st.caption("🟢 ▲ = Call Wall (ceiling)  |  🔴 ▼ = Put Wall (floor)  "
+                                       "|  🟡 line = Spot  |  🟡 dashed = selected expiry  "
+                                       "|  🟩 table row = ideal 21–50 DTE zone")
+
+                            # ── Chart Assessment ──────────────────────────────────
+                            _assess_lines = []
+                            _warnings = []   # anomaly flags shown separately
+
+                            # 0. Put wall jump detection — flag unnatural drops
+                            _pw_sequence = [(r["Expiry"], r["DTE"], r["Put Wall $"], r["PW Dist %"])
+                                            for r in _wall_rows if r["Put Wall $"] is not None]
+                            for _pi in range(1, len(_pw_sequence)):
+                                _p_prev = _pw_sequence[_pi - 1]
+                                _p_curr = _pw_sequence[_pi]
+                                _pw_drop = _p_prev[2] - _p_curr[2]   # positive = wall fell
+                                _pw_drop_pct = _pw_drop / _spot * 100
+                                if _pw_drop_pct >= 5:
+                                    # Classify the nature of the drop
+                                    _curr_dist = abs(_p_curr[3] or 0)
+                                    if _curr_dist >= 20:
+                                        _classification = (
+                                            "🚨 **TAIL RISK HEDGE** — "
+                                            f"${_p_curr[2]:.0f} is {_curr_dist:.1f}% below spot. "
+                                            "This is a disaster/black-swan hedge, NOT a normal floor. "
+                                            "Institutions buy deep OTM puts far out as portfolio insurance — "
+                                            "it does NOT mean price is expected to reach that level. "
+                                            "**Ignore as a price target. Use near-term walls for actual support.**"
+                                        )
+                                    elif _curr_dist >= 10:
+                                        _classification = (
+                                            "⚠️ **STRUCTURAL PUT HEDGE** — "
+                                            f"${_p_curr[2]:.0f} is {_curr_dist:.1f}% below spot. "
+                                            "Fund managers buying longer-dated puts further OTM as portfolio protection. "
+                                            "Common behaviour — longer DTE puts are cheaper far OTM. "
+                                            "Real support is closer to spot in near-term expiries."
+                                        )
+                                    else:
+                                        _classification = (
+                                            "📉 **PUT WALL SHIFT** — "
+                                            f"Floor dropped ${_pw_drop:.0f} ({_pw_drop_pct:.1f}%) "
+                                            f"between {_p_prev[0]} and {_p_curr[0]}. "
+                                            "Possible roll of put positions to lower strikes — "
+                                            "watch for this expiry's put OI build trend."
+                                        )
+                                    _warnings.append(
+                                        f"**{_p_curr[0]} ({_p_curr[1]}d):** Put wall dropped from "
+                                        f"**${_p_prev[2]:.0f}** → **${_p_curr[2]:.0f}** "
+                                        f"(−${_pw_drop:.0f}, {_pw_drop_pct:.1f}% from spot). "
+                                        + _classification
+                                    )
+
+                            # 0b. Call wall jump detection
+                            _cw_sequence = [(r["Expiry"], r["DTE"], r["Call Wall $"], r["CW Dist %"])
+                                            for r in _wall_rows if r["Call Wall $"] is not None]
+                            for _ci in range(1, len(_cw_sequence)):
+                                _c_prev = _cw_sequence[_ci - 1]
+                                _c_curr = _cw_sequence[_ci]
+                                _cw_jump = _c_curr[2] - _c_prev[2]   # positive = wall rose
+                                _cw_jump_pct = _cw_jump / _spot * 100
+                                if _cw_jump_pct >= 5:
+                                    _warnings.append(
+                                        f"**{_c_curr[0]} ({_c_curr[1]}d):** Call wall jumped from "
+                                        f"**${_c_prev[2]:.0f}** → **${_c_curr[2]:.0f}** "
+                                        f"(+${_cw_jump:.0f}, +{_cw_jump_pct:.1f}%). "
+                                        "📈 Likely a new block of call hedges/covered calls written at that strike. "
+                                        "If it's also far OTM it may be a leveraged upside bet."
+                                    )
+
+                            # 1. Near-term wall proximity
+                            if _wall_rows:
+                                _near = [r for r in _wall_rows if 0 <= r["DTE"] <= 14]
+                                if _near:
+                                    _nr = _near[0]
+                                    _nr_cw = _nr["Call Wall $"]; _nr_pw = _nr["Put Wall $"]
+                                    _nr_exp = _nr["Expiry"]
+                                    if _nr_cw and _nr_pw:
+                                        _rng = _nr_cw - _nr_pw
+                                        _rng_pct = _rng / _spot * 100
+                                        _assess_lines.append(
+                                            f"**⚡ Near-term ({_nr_exp}, {_nr['DTE']}d):** "
+                                            f"Price pinned between **${_nr_pw:.0f}** (floor) and **${_nr_cw:.0f}** (ceiling) "
+                                            f"— range {_rng_pct:.1f}%. "
+                                            + ("Tight range — expect low movement, ideal for premium selling." if _rng_pct < 4
+                                               else "Wide range — directional move possible, reduce short premium size.")
+                                        )
+
+                            # 2. Ideal zone wall assessment
+                            _ideal = [r for r in _wall_rows if 21 <= r["DTE"] <= 50]
+                            if _ideal:
+                                _ir = _ideal[0]
+                                _ir_exp = _ir["Expiry"]; _ir_dte = _ir["DTE"]
+                                _ir_cw = _ir["Call Wall $"]; _ir_pw = _ir["Put Wall $"]
+                                _ir_cws = _ir["CW Strength"]; _ir_pws = _ir["PW Strength"]
+                                _cw_dist_pct = _ir["CW Dist %"] or 0
+                                _pw_dist_pct = abs(_ir["PW Dist %"] or 0)
+                                _bias = ("BULLISH" if _cw_dist_pct > _pw_dist_pct * 1.2
+                                         else "BEARISH" if _pw_dist_pct > _cw_dist_pct * 1.2
+                                         else "NEUTRAL")
+                                _bias_em = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}[_bias]
+                                _assess_lines.append(
+                                    f"**✅ Ideal zone ({_ir_exp}, {_ir_dte}d):** "
+                                    f"Call wall **${_ir_cw:.0f}** ({_cw_dist_pct:+.1f}%, {_ir_cws} OI) | "
+                                    f"Put wall **${_ir_pw:.0f}** ({-_pw_dist_pct:+.1f}%, {_ir_pws} OI). "
+                                    f"{_bias_em} Bias: **{_bias}** — "
+                                    + ("call wall further away, bulls have more room to run." if _bias == "BULLISH"
+                                       else "put wall closer to spot, bears are pressing." if _bias == "BEARISH"
+                                       else "walls equidistant — mean-reversion / iron condor setup.")
+                                )
+
+                            # 3. Wall convergence / divergence across expiries
+                            _cw_vals = [r["Call Wall $"] for r in _wall_rows if r["Call Wall $"]]
+                            _pw_vals = [r["Put Wall $"]  for r in _wall_rows if r["Put Wall $"]]
+                            if len(_cw_vals) >= 2:
+                                _cw_trend = _cw_vals[-1] - _cw_vals[0]
+                                _pw_trend = _pw_vals[-1] - _pw_vals[0] if len(_pw_vals) >= 2 else 0
+                                if abs(_cw_trend) >= 5:
+                                    _dir = "rising" if _cw_trend > 0 else "falling"
+                                    _assess_lines.append(
+                                        f"**📈 Call wall trend:** Wall is **{_dir}** across expiries "
+                                        f"(${_cw_vals[0]:.0f} → ${_cw_vals[-1]:.0f}, Δ${_cw_trend:+.0f}). "
+                                        + ("Dealers expect price expansion higher long-term." if _cw_trend > 0
+                                           else "Dealers compressing ceiling — expect range-bound or lower prices.")
+                                    )
+                                if len(_pw_vals) >= 2 and abs(_pw_trend) >= 5:
+                                    _dir2 = "rising" if _pw_trend > 0 else "falling"
+                                    _assess_lines.append(
+                                        f"**📉 Put wall trend:** Floor **{_dir2}** across expiries "
+                                        f"(${_pw_vals[0]:.0f} → ${_pw_vals[-1]:.0f}, Δ${_pw_trend:+.0f}). "
+                                        + ("Floor rising — growing downside protection / put buying." if _pw_trend > 0
+                                           else "Floor falling — lower support expected, risk increasing.")
+                                    )
+
+                            # 4. Strongest wall overall
+                            _all_cw_str = [(r["CW Strength"], r["Expiry"], r["Call Wall $"]) for r in _wall_rows if r["Call Wall $"]]
+                            _all_pw_str = [(r["PW Strength"], r["Expiry"], r["Put Wall $"]) for r in _wall_rows if r["Put Wall $"]]
+                            if _all_cw_str:
+                                try:
+                                    _strongest_cw = max(_all_cw_str, key=lambda x: float(str(x[0]).replace("×","")))
+                                    _assess_lines.append(
+                                        f"**🔒 Strongest call wall:** **${_strongest_cw[2]:.0f}** on {_strongest_cw[1]} "
+                                        f"({_strongest_cw[0]} OI) — highest dealer gamma concentration above spot."
+                                    )
+                                except Exception:
+                                    pass
+                            if _all_pw_str:
+                                try:
+                                    _strongest_pw = max(_all_pw_str, key=lambda x: float(str(x[0]).replace("×","")))
+                                    _assess_lines.append(
+                                        f"**🛡️ Strongest put wall:** **${_strongest_pw[2]:.0f}** on {_strongest_pw[1]} "
+                                        f"({_strongest_pw[0]} OI) — strongest dealer support below spot."
+                                    )
+                                except Exception:
+                                    pass
+
+                            # 5. Overall verdict
+                            _ideal_cw_d = _ideal[0]["CW Dist %"] if _ideal else None
+                            _ideal_pw_d = abs(_ideal[0]["PW Dist %"]) if _ideal and _ideal[0]["PW Dist %"] else None
+                            if _ideal_cw_d and _ideal_pw_d:
+                                if _ideal_cw_d >= 4 and _ideal_pw_d >= 4:
+                                    _verdict = "🎯 **Wide-range setup** — both walls far from spot. High-probability iron condor territory if GEX is positive."
+                                elif _ideal_cw_d < 2:
+                                    _verdict = "⚠️ **Call wall extremely tight** — price near ceiling. Avoid bullish entries; consider bear call spread."
+                                elif _ideal_pw_d < 2:
+                                    _verdict = "⚠️ **Put wall extremely tight** — price near floor. Downside risk elevated; consider bear put spread or reduce longs."
+                                elif _ideal_cw_d >= 3 and _ideal_pw_d < 2:
+                                    _verdict = "🟢 **Bullish setup** — more room above than below. Bull put spread or long call near-term."
+                                else:
+                                    _verdict = "⚪ **Neutral setup** — walls balanced. Iron condor or sell ATM strangle near ideal expiry."
+                                _assess_lines.append(f"\n{_verdict}")
+
+                            # ── Render warnings first (anomalies) ─────────────
+                            if _warnings:
+                                st.markdown("##### ⚠️ Wall Anomalies Detected")
+                                st.caption("These are abnormal jumps in wall levels across expiries — explained below.")
+                                for _wn in _warnings:
+                                    st.warning(_wn, icon="⚠️")
+
+                            # ── Render assessment ──────────────────────────────
+                            if _assess_lines:
+                                st.markdown("##### 🧠 Chart Assessment")
+                                for _al in _assess_lines:
+                                    st.markdown(f"- {_al}")
+
+                            # ── Put wall interpretation guide ──────────────────
+                            if any(abs(r["PW Dist %"] or 0) >= 10 for r in _wall_rows if r["PW Dist %"]):
+                                with st.expander("📖 Why do put walls move so far OTM for longer expiries?"):
+                                    st.markdown("""
+**This is normal institutional behaviour — here's why:**
+
+| DTE | Typical Put Wall Distance | Reason |
+|-----|--------------------------|--------|
+| 0–14d | 0–3% OTM | Dealers and MMs hedge close to spot — real support |
+| 15–30d | 2–7% OTM | Fund managers buying near-ATM protection |
+| 30–60d | 5–15% OTM | Portfolio hedges — cheap to buy OTM with more time |
+| 60–180d | 15–30% OTM | **Tail risk / disaster hedges** — institutions buy far OTM puts as black-swan insurance |
+
+**Key rule:** The further out the expiry, the less the put wall represents a real price floor.
+- **Near-term put wall ($370–$375)** → True dealer support. Price likely to bounce here.
+- **Mid-term put wall ($350)** → Structural hedge. Meaningful only if price breaks near-term walls.
+- **Far-term put wall ($285)** → Tail risk insurance. **NOT a price target.** Treat as irrelevant to normal trading.
+
+**What to focus on:** Use the **nearest future expiry's put wall** as the actionable floor for your trade.
+The far-dated deep OTM puts are bought by pension funds and institutions as catastrophic protection — ignore them for intraday/swing trading.
+                                    """)
+
+                    else:
+                        st.info("Not enough OI data to compute per-expiry walls.")
+                    st.markdown("---")
+
                     # ── Industry-level OI chart ────────────────────────
-                    st.markdown("#### \U0001f4ca Open Interest Map — All Strikes")
-                    _agg = _ga_oi.groupby("strike")[["openInt_Call_now","openInt_Put_now"]].sum().reset_index()
+                    _chart_title = f"Open Interest Map — {_wall_mode_label}"
+                    st.markdown(f"#### 📊 {_chart_title}")
+                    # Use the working frame (respects expiry filter)
+                    _agg = _ga_oi_work.groupby("strike")[["openInt_Call_now","openInt_Put_now"]].sum().reset_index()
                     _view = _agg[(_agg["strike"] >= _spot*0.88) & (_agg["strike"] <= _spot*1.12)]
                     if not _view.empty:
                         _max_oi = max(_view["openInt_Call_now"].max(), _view["openInt_Put_now"].max())
@@ -7056,9 +8163,15 @@ Real edge comes from discipline and filters — not a higher strike.
             if _eoi.empty or not _espot:
                 st.warning("No data.")
             else:
-                # Build expiry rows
+                # Sort expiries chronologically (MM-DD-YYYY format)
+                def _exp_chron_key(d):
+                    try:
+                        p = str(d).split("-")
+                        return (int(p[2]), int(p[0]), int(p[1]))
+                    except Exception:
+                        return (9999, 99, 99)
                 _exp_rows = []
-                _all_expiries = sorted(_eoi["expiry_date"].unique())
+                _all_expiries = sorted(_eoi["expiry_date"].unique(), key=_exp_chron_key)
                 for _ex in _all_expiries:
                     _eg = _eoi[_eoi["expiry_date"] == _ex]
                     if len(_eg) < 4: continue
@@ -7093,7 +8206,7 @@ Real edge comes from discipline and filters — not a higher strike.
                 _hm_exp = []; _hm_strikes = []
                 _view_oi = _eoi[(_eoi["strike"] >= _espot*0.9) & (_eoi["strike"] <= _espot*1.1)]
                 _hm_strikes = sorted(_view_oi["strike"].unique())
-                _hm_exps = sorted(_view_oi["expiry_date"].unique())
+                _hm_exps = sorted(_view_oi["expiry_date"].unique(), key=_exp_chron_key)
                 for _he in _hm_exps:
                     _row = []
                     for _hs in _hm_strikes:
@@ -7110,9 +8223,32 @@ Real edge comes from discipline and filters — not a higher strike.
                         colorbar=dict(title=dict(text="Call OI", font=dict(color="#aaa")),
                                      tickfont=dict(color="#aaa"))
                     ))
-                    _fig_hm.add_vline(x=f"${_espot:.0f}",
-                                      line=dict(color="#FFD700", width=2),
-                                      annotation_text="SPOT", annotation_font_color="#1565C0")
+                    try:
+                        # Categorical x-axis uses string labels "$NNN" — find nearest
+                        _hm_x_labels = [f"${s:.0f}" for s in _hm_strikes]
+                        _nearest_spot_label = min(
+                            _hm_x_labels,
+                            key=lambda lbl: abs(float(lbl.replace("$","")) - _espot)
+                        )
+                        _spot_idx = _hm_x_labels.index(_nearest_spot_label)
+                        _fig_hm.add_shape(
+                            type="line",
+                            x0=_spot_idx - 0.5, x1=_spot_idx + 0.5,
+                            y0=0, y1=1,
+                            xref="x", yref="paper",
+                            line=dict(color="#FFD700", width=2),
+                        )
+                        _fig_hm.add_annotation(
+                            x=_nearest_spot_label, y=1.0,
+                            xref="x", yref="paper",
+                            text=f"SPOT ${_espot:.0f}",
+                            showarrow=False,
+                            font=dict(color="#FFD700", size=10),
+                            bgcolor="rgba(0,0,0,0.6)",
+                            yanchor="bottom",
+                        )
+                    except Exception:
+                        pass  # categorical axis - skip spot line
                     _fig_hm.update_layout(
                         title=dict(text=f"{_exp_sel} Call OI Heatmap — Strike × Expiry",
                                   font=dict(color="#1565C0", size=15)),
@@ -7285,6 +8421,12 @@ Stop: buy back at <b>${_cred*2:.2f}</b>
     # ════════════════════════════════════════════════════════════════
     with _tab_log:
         st.markdown("### \U0001f4dd Log a Trade")
+        _gal_rst = st.button("🔄 Reset Form", key="ga_log_reset")
+        if _gal_rst:
+            for _k in ["f_tk2", "f_type2", "f_qty2", "f_sh2", "f_lg2", "f_cr2",
+                       "f_acct2", "f_ent2", "f_exp2", "f_note2"]:
+                st.session_state.pop(_k, None)
+            st.rerun()
         with st.form("ga_log_form_v2"):
             _fl1, _fl2, _fl3 = st.columns(3)
             _f_tk   = _fl1.selectbox("Ticker", _ga_all_tickers, key="f_tk2")
@@ -7506,6 +8648,12 @@ elif page == "⚡ Trade Risk Calculator":
             st.markdown(_PAGE_HELP.get(page, ""))
     st.markdown("*Bloomberg-style scenario analysis before you enter a trade*")
 
+    _rc_reset_keys = ["rc_tk", "rc_type", "rc_strike", "rc_exp", "rc_entry", "rc_qty"]
+    if st.button("🔄 Reset Fields", key="rc_reset"):
+        for _k in _rc_reset_keys:
+            st.session_state.pop(_k, None)
+        st.rerun()
+
     c1, c2, c3, c4 = st.columns(4)
     rc_ticker = c1.text_input("Ticker", "SPY", key="rc_tk")
     rc_type = c2.selectbox("Option Type", ["call", "put"], key="rc_type")
@@ -7602,7 +8750,12 @@ elif page == "⚡ Trade Risk Calculator":
     # ── What-If Option Profit/Loss Simulator ──
     st.markdown("---")
     st.markdown("<div>🔮 Option P&L Simulator (OptionsStrat-style)</div>", unsafe_allow_html=True)
-    st.markdown("*Drag the sliders to explore option value at any stock price & date — see P&L chart live*")
+    _sim_hdr, _sim_rst = st.columns([6, 1])
+    _sim_hdr.markdown("*Drag the sliders to explore option value at any stock price & date — see P&L chart live*")
+    if _sim_rst.button("🔄 Reset", key="sim_reset"):
+        for _k in ["sim_tk", "sim_otype", "sim_strike", "sim_expiry", "sim_entry", "sim_qty", "sim_buy_dt", "sim_iv_ovr"]:
+            st.session_state.pop(_k, None)
+        st.rerun()
 
     sim_c1, sim_c2, sim_c3, sim_c4 = st.columns(4)
     sim_ticker = sim_c1.text_input("Ticker", value="SPY", key="sim_tk")
@@ -8338,7 +9491,13 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         st.markdown("---")
 
     # ── Position Inputs ──
-    st.markdown("<div>📋 Your Position</div>", unsafe_allow_html=True)
+    _ep_hdr, _ep_rst = st.columns([6, 1])
+    _ep_hdr.markdown("<div>📋 Your Position</div>", unsafe_allow_html=True)
+    if _ep_rst.button("🔄 Reset", key="ep_reset"):
+        for _k in ["ep_tk", "ep_type", "ep_strike", "ep_entry", "ep_buy_dt", "ep_expiry",
+                   "ep_qty", "_ep_last_tk", "ep_load_pos"]:
+            st.session_state.pop(_k, None)
+        st.rerun()
     ep_c1, ep_c2, ep_c3, ep_c4 = st.columns(4)
     ep_ticker = ep_c1.text_input("Ticker", value="GOOG", key="ep_tk")
     ep_type = ep_c2.selectbox("Option Type", ["put", "call"],
@@ -11166,14 +12325,23 @@ if page == "🧠 High-Prob Engine":
 
                 def _highlight(row):
                     sig_ = row["Signal"]
-                    if "BULL" in sig_:      return ["background-color:#1a3a1a"]*len(row)
-                    elif "BEAR" in sig_:    return ["background-color:#3a1a1a"]*len(row)
-                    elif "PREMIUM" in sig_: return ["background-color:#2a2a0a"]*len(row)
-                    return [""]*len(row)
+                    if "BULL" in sig_:
+                        # Bloomberg/industry green: deep green bg, bright white text
+                        return ["background-color:#0d4f1c; color:#ffffff; font-weight:600"]*len(row)
+                    elif "BEAR" in sig_:
+                        # Bloomberg/industry red: deep red bg, bright white text
+                        return ["background-color:#6b0000; color:#ffffff; font-weight:600"]*len(row)
+                    elif "PREMIUM" in sig_:
+                        # Premium sell: amber/gold bg, dark text for contrast
+                        return ["background-color:#7a5500; color:#ffffff; font-weight:600"]*len(row)
+                    # Neutral: very subtle grey — visible in both light and dark themes
+                    return ["background-color:#2d2d2d; color:#e0e0e0"]*len(row)
 
                 st.dataframe(
-                    tdf.style.apply(_highlight, axis=1).bar(
-                        subset=["Prob%"], color=["#4CAF50", "#f44336"], vmin=40, vmax=90),
+                    tdf.style.apply(_highlight, axis=1)
+                              .bar(subset=["Prob%"], color=["#66bb6a", "#ef5350"],
+                                   vmin=40, vmax=90, align="mid")
+                              .format({"Prob%": "{:.0f}%", "Weight": "{:.2f}"}),
                     hide_index=True, use_container_width=True, height=680)
 
                 # Premium sell signals summary
