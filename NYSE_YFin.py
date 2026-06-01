@@ -310,6 +310,7 @@ OHLC_MAX_RETRIES  = 2      # retries per contract
 OHLC_BACKOFF_BASE = 2.0    # exponential backoff base (seconds * 2^attempt)
 OHLC_CIRCUIT_N    = 6      # consecutive rate-limit hits before circuit break
 OHLC_CIRCUIT_WAIT = 45     # seconds to sleep when circuit breaks
+OHLC_CHECKPOINT   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ohlc_checkpoint.json")
 
 def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
                                      call_symbol_col="contractSymbol_Call",
@@ -365,6 +366,26 @@ def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
     if not all_syms:
         return df
 
+    # Load checkpoint: skip already-fetched symbols
+    info_map = {}
+    checkpoint_date = None
+    if os.path.exists(OHLC_CHECKPOINT):
+        try:
+            with open(OHLC_CHECKPOINT, "r") as f:
+                ckpt = json.load(f)
+            checkpoint_date = ckpt.get("date")
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            if checkpoint_date == today_str:
+                info_map = ckpt.get("data", {})
+                resumed = sum(1 for s in all_syms if s in info_map)
+                print(f"  Resuming OHLC from checkpoint: {resumed}/{len(all_syms)} already done")
+            else:
+                print(f"  Checkpoint is from {checkpoint_date}, starting fresh for today")
+        except Exception as e:
+            print(f"  Could not load OHLC checkpoint: {e}")
+
+    all_syms_todo = [s for s in all_syms if s not in info_map]
+
     session = curl_requests.Session(impersonate="chrome")
     consecutive_rl  = 0
     adaptive_sleep  = OHLC_BASE_SLEEP
@@ -396,11 +417,19 @@ def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
                 return sym, None
         return sym, None
 
-    info_map = {}
     total = len(all_syms)
     rl_count_total = 0
+    already_done = total - len(all_syms_todo)
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
-    for i, sym in enumerate(all_syms, 1):
+    def _save_checkpoint():
+        try:
+            with open(OHLC_CHECKPOINT, "w") as f:
+                json.dump({"date": today_str, "data": info_map}, f)
+        except Exception:
+            pass
+
+    for i, sym in enumerate(all_syms_todo, already_done + 1):
         _, data = fetch_info(sym)
 
         if data == "RATE_LIMITED":
@@ -424,7 +453,13 @@ def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
         time.sleep(adaptive_sleep)
         print_progress_bar(i, total, prefix="OHLC Snapshots")
 
-    print(f"\n  OHLC complete: {total - rl_count_total} fetched, "
+        # Save checkpoint every 50 symbols
+        if i % 50 == 0:
+            _save_checkpoint()
+
+    _save_checkpoint()
+    fetched_now = len(all_syms_todo) - rl_count_total
+    print(f"\n  OHLC complete: {already_done} from checkpoint + {fetched_now} fetched, "
           f"{rl_count_total} rate-limited ({skipped_otm} deep-OTM pre-skipped)")
 
     new_cols = [
@@ -648,6 +683,27 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
     trade_day_str_file = trade_day.strftime('%d%b%Y')   # for filenames
     trade_day_str_db = trade_day.strftime('%m-%d-%Y')   # for DB/CSV
 
+    # Checkpoint files for resume support
+    checkpoint_json = os.path.join(US_CHARTS_DIR, f"Options_Strike_CallPut_{trade_day_str_file}_checkpoint.json")
+    partial_csv     = os.path.join(US_CHARTS_DIR, f"Options_Strike_CallPut_{trade_day_str_file}_partial.csv")
+
+    # Load existing checkpoint
+    done_tickers = set()
+    all_rows = []
+    if os.path.exists(checkpoint_json) and os.path.exists(partial_csv):
+        try:
+            with open(checkpoint_json, "r") as f:
+                done_tickers = set(json.load(f).get("done", []))
+            partial_df = pd.read_csv(partial_csv, dtype=str)
+            if not partial_df.empty:
+                all_rows = [partial_df]
+            print(f"Resuming from checkpoint: {len(done_tickers)} tickers already done, "
+                  f"{len(partial_df)} rows loaded.")
+        except Exception as e:
+            print(f"Checkpoint load failed ({e}), starting fresh.")
+            done_tickers = set()
+            all_rows = []
+
     def infer_asset_type(ticker):
         if ticker in [yf_ticker_fix(t) for t in INDEX_TICKERS]:
             return "index"
@@ -661,10 +717,21 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
             return "crypto"
         return "stock"
 
+    def _save_checkpoint(done_set, rows_list):
+        with open(checkpoint_json, "w") as f:
+            json.dump({"done": sorted(done_set)}, f)
+        if rows_list:
+            pd.concat(rows_list, ignore_index=True).to_csv(partial_csv, index=False)
+
     total = len(all_tickers)
-    all_rows = []
+    done_count = len(done_tickers)
 
     for i, ticker in enumerate(all_tickers, 1):
+        if ticker in done_tickers:
+            print(f"\n[{i}/{total}] Skipping {ticker} (already done)")
+            print_progress_bar(i, total, prefix="Options Data (Yahoo)")
+            continue
+
         company_name = company_name_map.get(ticker, ticker)
         asset_type = infer_asset_type(ticker)
 
@@ -681,6 +748,10 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
             print(f"{ticker}: added {sum(len(r) for r in rows_list)} rows")
         else:
             print(f"{ticker}: no data (no options or skipped)")
+
+        done_tickers.add(ticker)
+        done_count += 1
+        _save_checkpoint(done_tickers, all_rows)
 
         print_progress_bar(i, total, prefix="Options Data (Yahoo)")
 
@@ -753,6 +824,14 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
 
     conn.close()
     print(f"DB write and weekly/monthly refresh completed for {trade_day_str_file}")
+
+    # Clean up checkpoint files now that everything is committed
+    for _cp in [checkpoint_json, partial_csv]:
+        try:
+            if os.path.exists(_cp):
+                os.remove(_cp)
+        except Exception:
+            pass
 
     print("Sample record for today:\n", df_final.head(1).to_string(index=False))
     return df_final, out_file
@@ -982,7 +1061,8 @@ def build_stock_daily(trade_day, all_tickers):
         try:
             trade_day_iso = trade_day.strftime("%Y-%m-%d")
             tk = yf.Ticker(ticker, session=session)
-            hist = tk.history(start=trade_day_iso, end=trade_day_iso, interval="1d")
+            _end_iso = (trade_day + timedelta(days=1)).strftime("%Y-%m-%d")
+            hist = tk.history(start=trade_day_iso, end=_end_iso, interval="1d")
             if hist.empty:
                 hist = tk.history(period="1d")
             if hist.empty:

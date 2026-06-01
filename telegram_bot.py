@@ -5470,38 +5470,42 @@ def analyze_inst_signals(ticker, conn):
     except Exception:
         pass
 
-    # ── 5. PUT SKEW (Fear Gauge) ──
-    # Equidistant OTM: ~5% above vs ~5% below spot.
-    # put_price / call_price ratio = how much extra institutions pay for downside protection.
-    # Iterates expiries (nearest first) and uses the first one with tradeable prices (call >= $0.50).
-    # Near-expiry calls often price at $0.01 — skip those to get a meaningful ratio.
+    # ── 5. PUT SKEW TERM STRUCTURE ──
+    # For each expiry (nearest 4), compute ~5% OTM put/call price ratio.
+    # Skips expiries where call < $0.50 (near-expiry artifact).
     spot = result["notional"].get("avg_spot", 0) if result["notional"] else 0
     if spot <= 0:
         spot = float(df["strike"].median())
     if spot > 0:
+        _skew_term = []
         for exp_sort_val in sorted(df["expiry_sort"].unique()):
+            if len(_skew_term) >= 4:
+                break
             exp_df = df[df["expiry_sort"] == exp_sort_val].copy()
-            exp_df["c_dist"] = (exp_df["strike"] - spot * 1.05).abs()
-            exp_df["p_dist"] = (exp_df["strike"] - spot * 0.95).abs()
             if exp_df.empty:
                 continue
+            exp_df["c_dist"] = (exp_df["strike"] - spot * 1.05).abs()
+            exp_df["p_dist"] = (exp_df["strike"] - spot * 0.95).abs()
             cr = exp_df.nsmallest(1, "c_dist").iloc[0]
             pr = exp_df.nsmallest(1, "p_dist").iloc[0]
             c_px = float(cr["lastPrice_Call_now"])
             p_px = float(pr["lastPrice_Put_now"])
-            if c_px >= 0.50 and p_px > 0:
-                skew = round(p_px / c_px, 2)
-                fear = ("EXTREME FEAR" if skew > 3.0 else
-                        "HIGH FEAR"    if skew > 2.0 else
-                        "ELEVATED"     if skew > 1.2 else
-                        "NORMAL"       if skew > 0.8 else
-                        "LOW (COMPLACENCY)" if skew > 0.5 else "INVERTED")
-                result["put_skew"] = {
-                    "call_strike": float(cr["strike"]), "put_strike": float(pr["strike"]),
-                    "call_px": c_px, "put_px": p_px, "skew": skew, "fear": fear,
-                    "expiry": str(exp_df["expiry_date"].iloc[0]),
-                }
-                break  # found a usable expiry
+            if c_px < 0.50 or p_px <= 0:
+                continue
+            skew = round(p_px / c_px, 2)
+            fear = ("XFEAR" if skew > 3.0 else
+                    "HFEAR" if skew > 2.0 else
+                    "ELEV"  if skew > 1.2 else
+                    "NORM"  if skew > 0.8 else
+                    "COMPL" if skew > 0.5 else "INV")
+            _skew_term.append({
+                "expiry": str(exp_df["expiry_date"].iloc[0]),
+                "call_strike": float(cr["strike"]), "put_strike": float(pr["strike"]),
+                "call_px": c_px, "put_px": p_px, "skew": skew, "fear": fear,
+            })
+        if _skew_term:
+            result["put_skew"] = _skew_term[0]          # keep for backward compat
+            result["put_skew_term"] = _skew_term
 
     # ── 6. PIN RISK ──
     # Strikes with 2× average OI within 7 days of expiry.
@@ -5771,21 +5775,22 @@ async def inst_signals_detail(query, ticker):
                      + _pipe_table(("Side", "Notional", "Score"), _nt_rows, right_cols={1, 2}))
         parts.append(f"<i>Dollar bias: <b>{nt.get('bias', '')}</b></i>")
 
-    # 5. Put Skew
-    ps = sig.get("put_skew", {})
-    if ps:
-        _ps_rows = [
-            ("Call ~5%OTM", f"${ps.get('call_strike', 0):.0f}", f"${ps.get('call_px', 0):.2f}"),
-            ("Put  ~5%OTM", f"${ps.get('put_strike',  0):.0f}", f"${ps.get('put_px',  0):.2f}"),
-            ("Skew / Fear", f"{ps.get('skew', 0):.2f}x", ps.get("fear", "-")),
-        ]
-        _ps_exp = ps.get("expiry", "")
-        parts.append(f"\n<b>PUT SKEW  (Fear Gauge)  exp {_ps_exp}</b>\n"
-                     + _pipe_table(("Item", "Strike", "Px / Value"), _ps_rows, right_cols={1, 2}))
-        fear = ps.get("fear", "")
-        if "EXTREME" in fear or "HIGH" in fear:
-            hint = "Heavy put-premium demand — institutions hedging longs; often near bottoms"
-        elif "COMPLACENCY" in fear or "INVERTED" in fear:
+    # 5. Put Skew Term Structure
+    _skew_term = sig.get("put_skew_term") or ([sig["put_skew"]] if sig.get("put_skew") else [])
+    if _skew_term:
+        _ps_rows = []
+        for _se in _skew_term:
+            _ps_rows.append((
+                _se["expiry"],
+                f"${_se['call_strike']:.0f}/${_se['put_strike']:.0f}",
+                f"{_se['skew']:.2f}x {_se['fear']}",
+            ))
+        parts.append("\n<b>PUT-CALL SKEW  (Fear Gauge — Term Structure)</b>\n"
+                     + _pipe_table(("Expiry", "C/P Strike", "Skew / Sentiment"), _ps_rows, right_cols={2}))
+        _top_fear = _skew_term[0].get("fear", "")
+        if _top_fear in ("XFEAR", "HFEAR"):
+            hint = "Heavy put-premium demand — institutions hedging; often near bottoms"
+        elif _top_fear in ("COMPL", "INV"):
             hint = "Cheap puts — complacency or call blow-off; watch for reversal"
         else:
             hint = "Normal cost of protection"
@@ -9337,6 +9342,145 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
         log.warning(f"position_monitor send failed: {e}")
 
 
+async def position_alerts(ctx: ContextTypes.DEFAULT_TYPE):
+    """Smart alert job — fires ONLY when a trigger condition is hit.
+    Runs every 5 min during market hours. Deduplicates via bot_data
+    so each alert fires at most once per bot session."""
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    if now_utc.weekday() >= 5:
+        return
+    hour_min = now_utc.hour * 60 + now_utc.minute
+    if not (14 * 60 + 30 <= hour_min <= 21 * 60):
+        return
+    _, chat_id = load_creds()
+    conn = get_conn()
+    try:
+        trades = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", conn)
+    except Exception:
+        conn.close(); return
+    conn.close()
+    if trades.empty:
+        return
+
+    now_et = now_utc - timedelta(hours=5)
+    today  = now_et.date()
+
+    if "alerted" not in ctx.bot_data:
+        ctx.bot_data["alerted"] = set()
+    _alerted = ctx.bot_data["alerted"]
+
+    # Group legs by ticker + expiry — same group = one strategy
+    trades["_grp"] = trades["ticker"].str.upper() + "|" + trades["expiry"].astype(str).str[:10]
+    alert_msgs = []
+
+    for grp_key, grp in trades.groupby("_grp"):
+        tk       = grp_key.split("|")[0]
+        expiry_s = grp_key.split("|")[1]
+
+        dte = None
+        try: dte = (datetime.strptime(expiry_s, "%Y-%m-%d").date() - today).days
+        except Exception:
+            try: dte = (datetime.strptime(expiry_s, "%m-%d-%Y").date() - today).days
+            except Exception: pass
+        if dte is not None and dte < 0:
+            continue  # skip expired
+
+        stock_px = None
+        try:
+            _sh = yf.Ticker(tk).history(period="1d", interval="5m")
+            if not _sh.empty:
+                stock_px = float(_sh["Close"].iloc[-1])
+        except Exception:
+            pass
+
+        net_pnl  = 0.0
+        leg_lines = []
+        for _, tr in grp.iterrows():
+            otype  = str(tr.get("option_type", "call")).upper()
+            strike = _safe_float(tr.get("strike", 0), 0)
+            entry  = _safe_float(tr.get("entry_price", 0), 0)
+            qty    = _safe_int(tr.get("quantity", 1), 1)
+            cur_px = entry
+            try:
+                try:    _exp_yf = datetime.strptime(expiry_s, "%Y-%m-%d").strftime("%Y-%m-%d")
+                except: _exp_yf = datetime.strptime(expiry_s, "%m-%d-%Y").strftime("%Y-%m-%d")
+                _chain = yf.Ticker(tk).option_chain(_exp_yf)
+                _df    = _chain.calls if otype == "CALL" else _chain.puts
+                _near  = _df[abs(_df["strike"] - strike) < 0.01]
+                if not _near.empty and float(_near["lastPrice"].iloc[0]) > 0:
+                    cur_px = float(_near["lastPrice"].iloc[0])
+            except Exception:
+                pass
+            leg_pnl  = (cur_px - entry) * qty * 100
+            net_pnl += leg_pnl
+            _dir = "SELL" if qty < 0 else "BUY"
+            leg_lines.append(
+                f"  {_dir} {otype[:1]} ${strike:.0f}"
+                f" @${entry:.2f} now ${cur_px:.2f}"
+                f" P&L ${leg_pnl:+.0f}"
+            )
+
+        entry_cost  = sum(
+            abs(_safe_float(tr.get("entry_price", 0), 0)
+                * _safe_int(tr.get("quantity", 1), 1) * 100)
+            for _, tr in grp.iterrows()
+        )
+        net_pnl_pct = (net_pnl / entry_cost * 100) if entry_cost > 0 else 0
+        n_legs      = len(grp)
+        strat_label = f"{n_legs}-leg strategy" if n_legs > 1 else "single leg"
+        legs_text   = "\n".join(leg_lines)
+        dte_s       = str(dte) if dte is not None else "?"
+        spot_line   = f"Spot: ${stock_px:.2f}" if stock_px else ""
+
+        def _alert(atype, icon, headline, detail,
+                   _gk=grp_key, _tk=tk, _es=expiry_s, _ds=dte_s, _sl=strat_label,
+                   _sp=spot_line, _lt=legs_text, _nl=net_pnl, _np=net_pnl_pct):
+            key = (_gk, atype)
+            if key in _alerted:
+                return
+            _alerted.add(key)
+            alert_msgs.append(
+                f"{icon} <b>ALERT - {_tk}</b> | {_sl}\n"
+                f"Expiry: {_es} | DTE: {_ds} | {_sp}\n"
+                f"<b>{headline}</b>\n"
+                f"{detail}\n"
+                f"{_lt}\n"
+                f"Net P&L: <b>${_nl:+.0f} ({_np:+.1f}%)</b>"
+            )
+
+        if net_pnl_pct >= 50:
+            _alert("profit50", "💰", "50% PROFIT TARGET HIT",
+                   "Consider closing - lock in gains.")
+        if net_pnl_pct >= 70:
+            _alert("profit70", "🏆", "70% PROFIT - STRONG CLOSE SIGNAL",
+                   "High conviction close now.")
+        if net_pnl_pct <= -100:
+            _alert("loss2x", "🚨", "2x LOSS - STOP TRIGGERED",
+                   "Close now to protect capital.")
+        if dte is not None and 3 <= dte <= 7:
+            _alert("dte7", "⏰", f"FINAL WEEK - {dte}d TO EXPIRY",
+                   "Close or roll - theta decay accelerates in final week.")
+        if dte is not None and dte <= 2:
+            _alert("dte2", "🚨", f"EXPIRES IN {dte} DAY(S) - ACT NOW",
+                   "Expiry and assignment risk imminent.")
+        if stock_px:
+            for _, tr in grp.iterrows():
+                if _safe_int(tr.get("quantity", 1), 1) < 0:
+                    _ss = _safe_float(tr.get("strike", 0), 0)
+                    if _ss > 0 and abs(stock_px - _ss) / stock_px * 100 < 3.0:
+                        _alert(
+                            f"near_{_ss}", "⚠️",
+                            f"SPOT WITHIN 3% OF SHORT STRIKE ${_ss:.0f}",
+                            f"Stock ${stock_px:.2f} - your short strike is at risk."
+                        )
+
+    for _msg in alert_msgs:
+        try:
+            await ctx.bot.send_message(chat_id=int(chat_id), text=_msg, parse_mode=H)
+        except Exception as _ae:
+            log.warning(f"position_alerts send failed: {_ae}")
+
+
 async def position_monitor_adhoc(query, ctx):
     """On-demand position monitor triggered by button press."""
     await query.answer("Fetching live positions…")
@@ -12473,6 +12617,8 @@ def main():
         log.info("Scheduled 15-min intraday OI alert")
         # 10-min position monitor (fires during market hours; deduplicates via bot_data state)
         job_queue.run_repeating(position_monitor, interval=600, first=60)
+        job_queue.run_repeating(position_alerts, interval=300, first=90)
+        log.info("Scheduled 5-min smart position alerts")
         log.info("Scheduled 10-min position health monitor")
 
     # Auto-close any positions that expired before bot started
@@ -16745,38 +16891,42 @@ def analyze_inst_signals(ticker, conn):
     except Exception:
         pass
 
-    # ── 5. PUT SKEW (Fear Gauge) ──
-    # Equidistant OTM: ~5% above vs ~5% below spot.
-    # put_price / call_price ratio = how much extra institutions pay for downside protection.
-    # Iterates expiries (nearest first) and uses the first one with tradeable prices (call >= $0.50).
-    # Near-expiry calls often price at $0.01 — skip those to get a meaningful ratio.
+    # ── 5. PUT SKEW TERM STRUCTURE ──
+    # For each expiry (nearest 4), compute ~5% OTM put/call price ratio.
+    # Skips expiries where call < $0.50 (near-expiry artifact).
     spot = result["notional"].get("avg_spot", 0) if result["notional"] else 0
     if spot <= 0:
         spot = float(df["strike"].median())
     if spot > 0:
+        _skew_term = []
         for exp_sort_val in sorted(df["expiry_sort"].unique()):
+            if len(_skew_term) >= 4:
+                break
             exp_df = df[df["expiry_sort"] == exp_sort_val].copy()
-            exp_df["c_dist"] = (exp_df["strike"] - spot * 1.05).abs()
-            exp_df["p_dist"] = (exp_df["strike"] - spot * 0.95).abs()
             if exp_df.empty:
                 continue
+            exp_df["c_dist"] = (exp_df["strike"] - spot * 1.05).abs()
+            exp_df["p_dist"] = (exp_df["strike"] - spot * 0.95).abs()
             cr = exp_df.nsmallest(1, "c_dist").iloc[0]
             pr = exp_df.nsmallest(1, "p_dist").iloc[0]
             c_px = float(cr["lastPrice_Call_now"])
             p_px = float(pr["lastPrice_Put_now"])
-            if c_px >= 0.50 and p_px > 0:
-                skew = round(p_px / c_px, 2)
-                fear = ("EXTREME FEAR" if skew > 3.0 else
-                        "HIGH FEAR"    if skew > 2.0 else
-                        "ELEVATED"     if skew > 1.2 else
-                        "NORMAL"       if skew > 0.8 else
-                        "LOW (COMPLACENCY)" if skew > 0.5 else "INVERTED")
-                result["put_skew"] = {
-                    "call_strike": float(cr["strike"]), "put_strike": float(pr["strike"]),
-                    "call_px": c_px, "put_px": p_px, "skew": skew, "fear": fear,
-                    "expiry": str(exp_df["expiry_date"].iloc[0]),
-                }
-                break  # found a usable expiry
+            if c_px < 0.50 or p_px <= 0:
+                continue
+            skew = round(p_px / c_px, 2)
+            fear = ("XFEAR" if skew > 3.0 else
+                    "HFEAR" if skew > 2.0 else
+                    "ELEV"  if skew > 1.2 else
+                    "NORM"  if skew > 0.8 else
+                    "COMPL" if skew > 0.5 else "INV")
+            _skew_term.append({
+                "expiry": str(exp_df["expiry_date"].iloc[0]),
+                "call_strike": float(cr["strike"]), "put_strike": float(pr["strike"]),
+                "call_px": c_px, "put_px": p_px, "skew": skew, "fear": fear,
+            })
+        if _skew_term:
+            result["put_skew"] = _skew_term[0]          # keep for backward compat
+            result["put_skew_term"] = _skew_term
 
     # ── 6. PIN RISK ──
     # Strikes with 2× average OI within 7 days of expiry.
@@ -16891,21 +17041,22 @@ async def inst_signals_detail(query, ticker):
                      + _pipe_table(("Side", "Notional", "Score"), _nt_rows, right_cols={1, 2}))
         parts.append(f"<i>Dollar bias: <b>{nt.get('bias', '')}</b></i>")
 
-    # 5. Put Skew
-    ps = sig.get("put_skew", {})
-    if ps:
-        _ps_rows = [
-            ("Call ~5%OTM", f"${ps.get('call_strike', 0):.0f}", f"${ps.get('call_px', 0):.2f}"),
-            ("Put  ~5%OTM", f"${ps.get('put_strike',  0):.0f}", f"${ps.get('put_px',  0):.2f}"),
-            ("Skew / Fear", f"{ps.get('skew', 0):.2f}x", ps.get("fear", "-")),
-        ]
-        _ps_exp = ps.get("expiry", "")
-        parts.append(f"\n<b>PUT SKEW  (Fear Gauge)  exp {_ps_exp}</b>\n"
-                     + _pipe_table(("Item", "Strike", "Px / Value"), _ps_rows, right_cols={1, 2}))
-        fear = ps.get("fear", "")
-        if "EXTREME" in fear or "HIGH" in fear:
-            hint = "Heavy put-premium demand — institutions hedging longs; often near bottoms"
-        elif "COMPLACENCY" in fear or "INVERTED" in fear:
+    # 5. Put Skew Term Structure
+    _skew_term = sig.get("put_skew_term") or ([sig["put_skew"]] if sig.get("put_skew") else [])
+    if _skew_term:
+        _ps_rows = []
+        for _se in _skew_term:
+            _ps_rows.append((
+                _se["expiry"],
+                f"${_se['call_strike']:.0f}/${_se['put_strike']:.0f}",
+                f"{_se['skew']:.2f}x {_se['fear']}",
+            ))
+        parts.append("\n<b>PUT-CALL SKEW  (Fear Gauge — Term Structure)</b>\n"
+                     + _pipe_table(("Expiry", "C/P Strike", "Skew / Sentiment"), _ps_rows, right_cols={2}))
+        _top_fear = _skew_term[0].get("fear", "")
+        if _top_fear in ("XFEAR", "HFEAR"):
+            hint = "Heavy put-premium demand — institutions hedging; often near bottoms"
+        elif _top_fear in ("COMPL", "INV"):
             hint = "Cheap puts — complacency or call blow-off; watch for reversal"
         else:
             hint = "Normal cost of protection"
@@ -20367,6 +20518,7 @@ async def more_features_menu(query):
          InlineKeyboardButton("⚠️ Overnight Risk", callback_data="menu_overnight_risk")],
         [InlineKeyboardButton("🎯 Recommend Engine", callback_data="menu_recommend"),
          InlineKeyboardButton("🎲 Monte Carlo Sim", callback_data="menu_exit")],
+        [InlineKeyboardButton("🏆 Legendary Investors", callback_data="menu_legends")],
         [BACK_BTN],
     ])
     await query.message.reply_text(
@@ -21817,6 +21969,1140 @@ async def whales_view(query):
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🧩 More", callback_data="menu_more"), BACK_BTN]])
     await query.message.reply_text("\n".join(lines), parse_mode=H, reply_markup=kb)
+
+# ===================================================================
+#  LEGENDARY INVESTORS -- 13F Q1 2026 Tracker
+# ===================================================================
+
+LEGENDS_DATA = {
+    "buffett": {
+        "name": "Warren Buffett",
+        "firm": "Berkshire Hathaway",
+        "aum": "$300B+",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Value / Long-term",
+        "cap_focus": "Large Cap",
+        "buys": [
+            {"ticker": "GOOGL", "action": "Added", "value": "$16.6B", "cap": "Large", "note": "+204% -- tripled stake, new conviction"},
+            {"ticker": "GOOG",  "action": "New",   "value": "--",     "cap": "Large", "note": "Class C alongside GOOGL"},
+            {"ticker": "DAL",   "action": "New",   "value": "$2.6B",  "cap": "Mid",   "note": "39.8M shares Delta Air Lines"},
+            {"ticker": "NYT",   "action": "Added", "value": "--",     "cap": "Mid",   "note": "+199% -- media/content bet"},
+            {"ticker": "LEN",   "action": "Added", "value": "--",     "cap": "Mid",   "note": "+43% -- Lennar homebuilder"},
+            {"ticker": "M",     "action": "New",   "value": "$55M",   "cap": "Small", "note": "Macys dept store -- tiny position"},
+        ],
+        "sells": [
+            {"ticker": "V",    "note": "Full exit -- payment processors abandoned"},
+            {"ticker": "MA",   "note": "Full exit -- billions in Mastercard sold"},
+            {"ticker": "UNH",  "note": "Full exit -- healthcare exit"},
+            {"ticker": "AMZN", "note": "Full exit"},
+            {"ticker": "DPZ",  "note": "Full exit -- Dominos Pizza"},
+            {"ticker": "AON",  "note": "Full exit"},
+            {"ticker": "BAC",  "note": "Trimmed -- reduced bank exposure"},
+            {"ticker": "CVX",  "note": "Trimmed substantially"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("AAPL","21.9%"),("AXP","17.4%"),("KO","11.6%"),("BAC","9.5%"),("CVX","6.6%"),
+        ],
+        "small_cap_gems": [
+            ("NYT", "Mid-$3B", "News media -- +199% added. Digital subs + AI licensing play"),
+            ("LEN", "Mid-$15B","Lennar homebuilder -- rate cut + housing deficit thesis"),
+            ("DAL", "Mid-$13B","Delta Air Lines -- travel demand + fleet renewal"),
+            ("M",   "Small-$3B","Macys tiny $55M bet -- deep value, asset-rich retail"),
+        ],
+        "theme": "AI + Media pivot. Exit payments/healthcare. New homebuilder + airline bets.",
+        "signal": "BULLISH on AI/Search | EXITING Financials/Health",
+        "insight": "First post-Buffett 13F under Greg Abel. Massive GOOGL bet. Portfolio shrunk from 40 to 26 positions -- most aggressive cleanup in years. Hidden gems: NYT digital subs + Macys asset play.",
+    },
+    "soros": {
+        "name": "George Soros",
+        "firm": "Soros Fund Management",
+        "aum": "$9.1B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Macro / Reflexivity",
+        "cap_focus": "Multi-Cap + Options",
+        "buys": [
+            {"ticker": "NVDA",  "action": "Added", "value": "--",  "cap": "Large",  "note": "AI chipmaker stake increase"},
+            {"ticker": "TSM",   "action": "Added", "value": "--",  "cap": "Large",  "note": "Taiwan Semi -- supply chain"},
+            {"ticker": "EA",    "action": "Added", "value": "--",  "cap": "Mid",    "note": "Electronic Arts -- gaming"},
+            {"ticker": "BRK.B", "action": "New",   "value": "--",  "cap": "Large",  "note": "New Berkshire position"},
+            {"ticker": "BILL",  "action": "Hold",  "value": "--",  "cap": "Mid",    "note": "Bill Holdings -- fintech payments #4 holding"},
+        ],
+        "sells": [
+            {"ticker": "AMZN",  "note": "Notable reduction"},
+            {"ticker": "GOOGL", "note": "Trimmed -- contrast to Buffetts addition"},
+            {"ticker": "MSFT",  "note": "Reduced"},
+            {"ticker": "CRM",   "note": "Trimmed Salesforce"},
+        ],
+        "options": [
+            {"ticker": "CRWV", "type": "PUT", "expiry": "Q2 2026", "note": "CoreWeave puts -- AI infra hedge"},
+            {"ticker": "TSM",  "type": "PUT", "expiry": "Q2 2026", "note": "TSM puts alongside equity -- geo-risk hedge"},
+        ],
+        "top_holdings": [
+            ("AMZN","#1"),("GPN","#2"),("EA","#3"),("BILL","#4"),("NVDA","#5"),
+        ],
+        "small_cap_gems": [
+            ("BILL", "Mid-$6B",  "Bill Holdings fintech -- SMB payments, #4 holding"),
+            ("GPN",  "Mid-$11B", "Global Payments -- #2 holding, fintech infrastructure"),
+            ("EA",   "Mid-$35B", "Electronic Arts -- gaming AI integration thesis"),
+        ],
+        "theme": "AI chip long + protective puts. Macro hedging via options while adding equity.",
+        "signal": "MIXED -- long chips, hedging with puts. Reducing Big Tech software.",
+        "insight": "Soros buying NVDA/TSM equity while buying puts = reflexive macro hedge. Hidden gems: BILL (fintech SMB payments) and GPN (global payment rails) are top 4 holdings but rarely discussed.",
+    },
+    "rentec": {
+        "name": "Jim Simons",
+        "firm": "Renaissance Technologies",
+        "aum": "$63.9B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Quant / Statistical Arb",
+        "cap_focus": "All-Cap (3,207 stocks)",
+        "buys": [
+            {"ticker": "AAPL", "action": "New",   "value": "$781M", "cap": "Large",  "note": "Large new Apple position"},
+            {"ticker": "NVDA", "action": "Added", "value": "$278M", "cap": "Large",  "note": "AI chip added"},
+            {"ticker": "NEM",  "action": "New",   "value": "$278M", "cap": "Mid",    "note": "Newmont -- gold miner"},
+            {"ticker": "LIN",  "action": "New",   "value": "$258M", "cap": "Large",  "note": "Linde -- industrial gases"},
+            {"ticker": "AVGO", "action": "New",   "value": "$245M", "cap": "Large",  "note": "Broadcom -- AI networking"},
+            {"ticker": "GOLD", "action": "New",   "value": "$227M", "cap": "Small",  "note": "Alamos Gold -- gold miner"},
+            {"ticker": "JPM",  "action": "New",   "value": "$202M", "cap": "Large",  "note": "JPMorgan financials"},
+            {"ticker": "MU",   "action": "Added", "value": "$520M", "cap": "Large",  "note": "+50% stake in Micron memory"},
+            {"ticker": "AXP",  "action": "New",   "value": "--",    "cap": "Large",  "note": "American Express"},
+            {"ticker": "UTHR", "action": "Hold",  "value": "--",    "cap": "Mid",    "note": "#1 holding -- United Therapeutics rare disease"},
+        ],
+        "sells": [
+            {"ticker": "NFLX", "note": "-$673M -- largest single exit"},
+            {"ticker": "COST", "note": "-$578M -- Costco"},
+            {"ticker": "PLTR", "note": "-$542M -- cut Palantir"},
+            {"ticker": "TSLA", "note": "-$534M -- Tesla reduced"},
+            {"ticker": "MSFT", "note": "-$329M -- Microsoft trimmed"},
+            {"ticker": "PG",   "note": "Full exit -- Procter and Gamble"},
+            {"ticker": "F",    "note": "Full exit -- Ford Motor"},
+            {"ticker": "GEV",  "note": "Full exit -- GE Vernova"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("UTHR","#1"),("PLTR","#2 trimmed"),("AAPL","#3 new"),("MU","added $520M"),("NVDA","added $278M"),
+        ],
+        "small_cap_gems": [
+            ("UTHR", "Mid-$16B",  "#1 HOLDING -- United Therapeutics rare disease pulmonary"),
+            ("GOLD", "Small-$3B", "Alamos Gold -- junior miner, $227M new position"),
+            ("NEM",  "Mid-$40B",  "Newmont gold miner $278M -- macro uncertainty hedge"),
+            ("LIN",  "Large-$200B","Linde industrial gases -- AI data center cooling play"),
+        ],
+        "theme": "Hard rotation: AAPL/chips/gold in, consumer/EV/growth out. 3,207 stocks.",
+        "signal": "BULLISH chips+gold+rare disease | CUTTING consumer discretionary+EV",
+        "insight": "RenTec #1 holding is UTHR (United Therapeutics) -- a mid-cap rare disease biotech almost no one talks about. Gold miner GOLD ($227M) and Newmont are quant bets on macro uncertainty. Q1 perf: -1.44%.",
+    },
+    "dalio": {
+        "name": "Ray Dalio",
+        "firm": "Bridgewater Associates",
+        "aum": "$22.4B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "All-Weather / Macro",
+        "cap_focus": "Large Cap + ETFs",
+        "buys": [
+            {"ticker": "TSM",  "action": "New",   "value": "--", "cap": "Large", "note": "New Taiwan Semi position"},
+            {"ticker": "GOOGL","action": "New",   "value": "--", "cap": "Large", "note": "New Alphabet stake"},
+            {"ticker": "NUE",  "action": "New",   "value": "--", "cap": "Mid",   "note": "Nucor -- steel reshoring play"},
+            {"ticker": "NVDA", "action": "Added", "value": "--", "cap": "Large", "note": "Increased GPU exposure"},
+            {"ticker": "AVGO", "action": "Added", "value": "--", "cap": "Large", "note": "Broadcom AI networking"},
+            {"ticker": "MU",   "action": "Added", "value": "--", "cap": "Large", "note": "Micron -- memory chips"},
+        ],
+        "sells": [
+            {"ticker": "CRM",  "note": "Full exit -- Salesforce"},
+            {"ticker": "WDAY", "note": "Full exit -- Workday"},
+            {"ticker": "NOW",  "note": "Full exit -- ServiceNow"},
+            {"ticker": "BKNG", "note": "Significantly reduced"},
+            {"ticker": "ADBE", "note": "Significantly reduced"},
+            {"ticker": "EXPE", "note": "Significantly reduced"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("EEM","EM ETF"),("SPY","S&P ETF"),("GLD","Gold ETF"),("TSM","New"),("NVDA","Added"),
+        ],
+        "small_cap_gems": [
+            ("NUE", "Mid-$16B", "Nucor steel -- reshoring + infrastructure supercycle bet"),
+        ],
+        "theme": "Chips in SaaS out. Hardware AI infra while purging software names.",
+        "signal": "BULLISH semiconductors+materials | EXITING enterprise SaaS",
+        "insight": "Bridgewater dumped all SaaS (CRM WDAY NOW exited). NUE (Nucor) is the hidden bet -- steel for reshoring/AI data center construction aligned with Dalios great-power conflict thesis.",
+    },
+    "tepper": {
+        "name": "David Tepper",
+        "firm": "Appaloosa Management",
+        "aum": "$5.9B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Event-Driven / Distressed",
+        "cap_focus": "Multi-Cap",
+        "buys": [
+            {"ticker": "AMZN", "action": "Added", "value": "$470M", "cap": "Large",  "note": "Nearly doubled -- cloud AI"},
+            {"ticker": "MU",   "action": "Added", "value": "--",    "cap": "Large",  "note": "+6x -- massive Micron bet HBM memory"},
+            {"ticker": "UBER", "action": "Added", "value": "--",    "cap": "Large",  "note": "+3x tripled -- mobility platform"},
+            {"ticker": "VST",  "action": "Added", "value": "--",    "cap": "Mid",    "note": "Vistra energy -- power grid 2x"},
+            {"ticker": "SAND", "action": "New",   "value": "--",    "cap": "Small",  "note": "SanDisk -- NAND flash memory spinoff"},
+        ],
+        "sells": [
+            {"ticker": "AAL", "note": "Full exit -- American Airlines"},
+            {"ticker": "OC",  "note": "Full exit -- Owens Corning"},
+            {"ticker": "MHK", "note": "Full exit -- Mohawk Industries"},
+            {"ticker": "FXI", "note": "Reduced -- China Large Cap ETF exit"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("AMZN","15.2%"),("MU","9.5%"),("GOOG","8.4%"),("UBER","7.7%"),("TSM","7.6%"),
+        ],
+        "small_cap_gems": [
+            ("VST",  "Mid-$25B",  "Vistra Energy -- AI data center power demand, doubled"),
+            ("SAND", "Small-$5B", "SanDisk NAND flash memory spinoff -- new position"),
+        ],
+        "theme": "Memory chip supercycle + Power grid + AI cloud. Exiting China + cyclicals.",
+        "signal": "VERY BULLISH memory/chips/power | EXITING airlines+China",
+        "insight": "Teppers +6x on MU and VST doubling = two of the boldest Q1 calls. SAND (SanDisk) is the hidden small cap gem -- NAND flash memory for AI storage. FXI exit = permanent China risk-off.",
+    },
+    "ackman": {
+        "name": "Bill Ackman",
+        "firm": "Pershing Square",
+        "aum": "$13.7B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Concentrated / Activist",
+        "cap_focus": "Large Cap Concentrated",
+        "buys": [
+            {"ticker": "MSFT", "action": "New",   "value": "$2B+", "cap": "Large", "note": "~15% of portfolio -- mega new bet"},
+            {"ticker": "AMZN", "action": "Added", "value": "--",   "cap": "Large", "note": "Increased cloud/AI position"},
+        ],
+        "sells": [
+            {"ticker": "HLT",  "note": "Full exit -- Hilton Worldwide"},
+            {"ticker": "GOOGL","note": "Trimmed/Exited -- sold Alphabet"},
+            {"ticker": "BN",   "note": "Trimmed -- Brookfield reduced"},
+            {"ticker": "UBER", "note": "Trimmed slightly"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("BN","17.6%"),("AMZN","17.4%"),("UBER","15.7%"),("MSFT","15.3% new"),("QSR","12.2%"),
+        ],
+        "small_cap_gems": [
+            ("QSR", "Mid-$18B", "Restaurant Brands Intl (Burger King/Tim Hortons) -- 12.2% holding, steady compounder"),
+            ("BN",  "Mid-$90B", "Brookfield Corp -- complex asset mgr, less followed than BRK"),
+        ],
+        "theme": "Hyper-concentrated in 5 names. Big MSFT bet. Cloud/AI core thesis.",
+        "signal": "BULLISH MSFT/AMZN | EXITING travel/hospitality",
+        "insight": "Ackman took $2B+ swing on MSFT making it 15% of portfolio. QSR (Restaurant Brands) is the overlooked gem -- 12.2% holding with international expansion + AI drive-thru thesis.",
+    },
+    "druckenmiller": {
+        "name": "Stan Druckenmiller",
+        "firm": "Duquesne Family Office",
+        "aum": "~$3-4B est.",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Macro / Momentum",
+        "cap_focus": "Concentrated Macro",
+        "buys": [
+            {"ticker": "CRWV", "action": "Added", "value": "--", "cap": "Mid",   "note": "CoreWeave -- AI compute infrastructure"},
+            {"ticker": "TSM",  "action": "Added", "value": "--", "cap": "Large", "note": "Taiwan Semi -- chip supply"},
+        ],
+        "sells": [
+            {"ticker": "GOOGL", "note": "Sold out -- major divergence from Buffett"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("CRWV","AI infra"),("TSM","Chips"),
+        ],
+        "small_cap_gems": [
+            ("CRWV", "Mid-$60B", "CoreWeave -- NVIDIA-powered AI compute cloud, high growth"),
+        ],
+        "theme": "AI infrastructure pure play. Exiting established tech for next-gen AI infra.",
+        "signal": "BULLISH AI infra CRWV/TSM | EXITING legacy search/ad tech",
+        "insight": "CRWV (CoreWeave) is the key pick -- new AI compute infrastructure company. Druckenmiller sold GOOGL while Buffett added -- sharpest divergence this quarter. Hardware compute over software.",
+    },
+    "loeb": {
+        "name": "Dan Loeb",
+        "firm": "Third Point",
+        "aum": "$2.1B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Event-Driven / Activist",
+        "cap_focus": "Multi-Cap with Small/Mid focus",
+        "buys": [
+            {"ticker": "AMZN", "action": "Hold",  "value": "--",   "cap": "Large",  "note": "#1 holding 19.4%"},
+            {"ticker": "META", "action": "New",   "value": "--",   "cap": "Large",  "note": "New Meta position -- AI/ad platform"},
+            {"ticker": "GOOGL","action": "New",   "value": "--",   "cap": "Large",  "note": "New Alphabet stake -- AI search"},
+            {"ticker": "TDG",  "action": "New",   "value": "--",   "cap": "Mid",    "note": "TransDigm aerospace components"},
+            {"ticker": "HUT",  "action": "New",   "value": "--",   "cap": "Small",  "note": "Hut 8 crypto miner -- new position"},
+            {"ticker": "GLD",  "action": "New",   "value": "--",   "cap": "ETF",    "note": "SPDR Gold ETF -- macro hard asset hedge"},
+            {"ticker": "TDS",  "action": "Hold",  "value": "--",   "cap": "Small",  "note": "#2 holding 13.3% -- Telephone & Data Systems"},
+            {"ticker": "CRS",  "action": "Hold",  "value": "--",   "cap": "Small",  "note": "#5 holding 5.9% -- Carpenter Technology specialty alloys"},
+        ],
+        "sells": [
+            {"ticker": "PGE",  "note": "Full exit -- PG&E utility"},
+            {"ticker": "MSFT", "note": "Full exit -- Microsoft"},
+            {"ticker": "BN",   "note": "Full exit -- Brookfield"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("AMZN","19.4%"),("TDS","13.3%"),("CRH","9.6%"),("TPX","8.1%"),("CRS","5.9%"),
+        ],
+        "small_cap_gems": [
+            ("TDS", "Small-$2.5B", "#2 HOLDING 13.3% -- Telephone & Data Systems, rural telecom"),
+            ("CRS", "Small-$6B",   "#5 HOLDING 5.9% -- Carpenter Technology specialty alloys/aerospace"),
+            ("HUT", "Small-$1.5B", "Hut 8 crypto miner -- new position, Bitcoin infrastructure"),
+            ("TPX", "Mid-$8B",     "Tempur Sealy -- bedding/sleep, 8.1% holding, steady compounder"),
+            ("TDG", "Mid-$75B",    "TransDigm aerospace components -- new activist position"),
+        ],
+        "theme": "Event-driven + hard assets + small-mid gems. Adding AI + gold while holding deep value.",
+        "signal": "BULLISH META/GOOGL/hard assets | EXITING utilities/legacy tech",
+        "insight": "Loeb is hiding gems: TDS (rural telecom 13.3%) and CRS (specialty alloys 5.9%) are rarely discussed but are top 5 holdings. HUT 8 crypto miner = new small-cap bet. CRH (Irish building materials) = reshoring/infra.",
+    },
+    "cohen": {
+        "name": "Steve Cohen",
+        "firm": "Point72 Asset Management",
+        "aum": "$78B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Multi-Strategy / Quant",
+        "cap_focus": "All-Cap (3,625 holdings)",
+        "buys": [
+            {"ticker": "NVDA", "action": "Hold",  "value": "--",    "cap": "Large",  "note": "#1 holding"},
+            {"ticker": "AMZN", "action": "Hold",  "value": "--",    "cap": "Large",  "note": "#2 holding"},
+            {"ticker": "ANET", "action": "Hold",  "value": "--",    "cap": "Large",  "note": "#3 Arista Networks AI networking"},
+            {"ticker": "ASML", "action": "Hold",  "value": "--",    "cap": "Large",  "note": "#4 ASML chip lithography"},
+            {"ticker": "CRDO", "action": "Hold",  "value": "--",    "cap": "Small",  "note": "#5 Credo Technology AI interconnect"},
+            {"ticker": "TDG",  "action": "New",   "value": "$336M", "cap": "Mid",    "note": "TransDigm -- 252K shares, +50000% new bet"},
+            {"ticker": "PEP",  "action": "Added", "value": "--",    "cap": "Large",  "note": "PepsiCo defensive buy"},
+            {"ticker": "EQIX", "action": "Added", "value": "--",    "cap": "Large",  "note": "Equinix data center REIT"},
+        ],
+        "sells": [],
+        "options": [],
+        "top_holdings": [
+            ("NVDA","#1"),("AMZN","#2"),("ANET","#3"),("ASML","#4"),("CRDO","#5 small cap"),
+        ],
+        "small_cap_gems": [
+            ("CRDO", "Small-$6B",  "#5 HOLDING -- Credo Technology high-speed AI interconnect chips"),
+            ("ANET", "Mid-$120B",  "Arista Networks AI data center networking -- #3 holding"),
+            ("TDG",  "Mid-$75B",   "TransDigm aerospace $336M new -- high-margin defense components"),
+            ("EQIX", "Large-$80B", "Equinix data center REIT -- AI infrastructure landlord"),
+        ],
+        "theme": "AI infrastructure full stack: chips + networking + data centers + aerospace.",
+        "signal": "BULLISH AI infra stack | ADDING defense/aerospace as hedge",
+        "insight": "Point72s hidden gem is CRDO (Credo Technology) -- a small-cap AI interconnect chip maker in the #5 spot. ANET (Arista) powers AI data center networking. TDG $336M new entry = aerospace pricing power play with 28% turnover rate.",
+    },
+    "burry": {
+        "name": "Michael Burry",
+        "firm": "Scion Asset Management",
+        "aum": "$68M",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Contrarian / Deep Value",
+        "cap_focus": "Small/Mid Cap Contrarian",
+        "buys": [
+            {"ticker": "MOH",  "action": "New",   "value": "--", "cap": "Mid",    "note": "Molina Healthcare 35.1% of portfolio"},
+            {"ticker": "LULU", "action": "Added", "value": "--", "cap": "Mid",    "note": "Lululemon +100% doubled -- consumer bet"},
+            {"ticker": "SLM",  "action": "New",   "value": "--", "cap": "Small",  "note": "Sallie Mae student loans 19.5%"},
+            {"ticker": "BRK",  "action": "New",   "value": "--", "cap": "Small",  "note": "Bruker Corp lab instruments 19.3%"},
+        ],
+        "sells": [],
+        "options": [],
+        "top_holdings": [
+            ("MOH","35.1%"),("LULU","26.1%"),("SLM","19.5%"),("BRK","19.3%"),
+        ],
+        "small_cap_gems": [
+            ("MOH",  "Mid-$8B",   "Molina Healthcare -- Medicaid HMO, 35.1% of portfolio, deep value"),
+            ("SLM",  "Small-$3B", "Sallie Mae -- student loans at discount, 19.5% new bet"),
+            ("BRK",  "Small-$4B", "Bruker Corp scientific instruments -- 19.3% contrarian pick"),
+            ("LULU", "Mid-$22B",  "Lululemon doubled -- consumer sentiment bottom call"),
+        ],
+        "theme": "Contrarian deep value: healthcare + consumer bottom + lab tech. No AI hype.",
+        "signal": "CONTRARIAN -- healthcare/consumer deep value vs crowd chasing AI",
+        "insight": "Burry is ignoring AI completely. Molina Healthcare (35.1%) is a Medicaid-focused HMO at deep discount. SLM (Sallie Mae) and BRK (Bruker) are tiny 4-stock concentrated portfolio -- pure conviction plays. LULU doubled = consumer trough call.",
+    },
+    "coleman": {
+        "name": "Chase Coleman",
+        "firm": "Tiger Global Management",
+        "aum": "$22.8B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Growth / Technology",
+        "cap_focus": "Large-Cap Tech + Emerging AI",
+        "buys": [
+            {"ticker": "GOOGL","action": "Hold",  "value": "--",   "cap": "Large", "note": "#1 holding 13.4%"},
+            {"ticker": "NVDA", "action": "Hold",  "value": "--",   "cap": "Large", "note": "#2 holding 9.2%"},
+            {"ticker": "AMZN", "action": "Hold",  "value": "--",   "cap": "Large", "note": "#3 holding 9.1%"},
+            {"ticker": "TSM",  "action": "Hold",  "value": "--",   "cap": "Large", "note": "#4 holding 8.2%"},
+            {"ticker": "META", "action": "Hold",  "value": "--",   "cap": "Large", "note": "#5 holding 7.7%"},
+            {"ticker": "INTC", "action": "New",   "value": "$180M","cap": "Large", "note": "Intel -- $180M contrarian semiconductor bet"},
+        ],
+        "sells": [],
+        "options": [],
+        "top_holdings": [
+            ("GOOGL","13.4%"),("NVDA","9.2%"),("AMZN","9.1%"),("TSM","8.2%"),("META","7.7%"),
+        ],
+        "small_cap_gems": [
+            ("INTC", "Large-$80B", "Intel $180M new bet -- turnaround + foundry separation thesis"),
+        ],
+        "theme": "AI hyperscaler + semiconductor conviction. Contrarian INTC turnaround.",
+        "signal": "BULLISH AI mega-cap + INTC turnaround | Holding full AI stack",
+        "insight": "Tiger Global is pure AI conviction with GOOGL/NVDA/AMZN/TSM/META top 5. The surprise: $180M Intel bet -- a contrarian turnaround call when most are abandoning INTC. Foundry business separation could unlock massive value.",
+    },
+    "tudor": {
+        "name": "Paul Tudor Jones",
+        "firm": "Tudor Investment Corp",
+        "aum": "$53.9B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Global Macro / CTA",
+        "cap_focus": "Macro ETFs + Options",
+        "buys": [
+            {"ticker": "GLD",  "action": "Hold",  "value": "--", "cap": "ETF",   "note": "Gold ETF -- macro hedge"},
+            {"ticker": "BTC",  "action": "Added", "value": "--", "cap": "Crypto","note": "Bitcoin via ETF -- macro asset"},
+            {"ticker": "EQIX", "action": "Added", "value": "--", "cap": "Large", "note": "Equinix data center REIT"},
+        ],
+        "sells": [],
+        "options": [
+            {"ticker": "IWM",  "type": "PUT",  "expiry": "Q2 2026", "note": "Small cap index put -- recession hedge"},
+            {"ticker": "IWM",  "type": "CALL", "expiry": "Q2 2026", "note": "Small cap index call -- long play"},
+            {"ticker": "QQQ",  "type": "PUT",  "expiry": "Q2 2026", "note": "Nasdaq put -- tech correction hedge"},
+            {"ticker": "QQQ",  "type": "CALL", "expiry": "Q2 2026", "note": "Nasdaq call -- tech upside"},
+            {"ticker": "SPY",  "type": "CALL", "expiry": "Q2 2026", "note": "S&P 500 call -- macro long"},
+        ],
+        "top_holdings": [
+            ("IWM puts","Hedge"),("IWM calls","Long"),("QQQ puts","Hedge"),("QQQ calls","Long"),("SPY calls","Long"),
+        ],
+        "small_cap_gems": [
+            ("IWM", "ETF", "Small cap index -- Tudor holds BOTH puts and calls = straddle on small caps"),
+        ],
+        "theme": "Pure macro: gold + crypto + options straddles on indices. Hedging all directions.",
+        "signal": "NEUTRAL-MACRO -- holding straddles = expects HIGH VOLATILITY in small/mid caps",
+        "insight": "Tudor holds IWM puts AND calls simultaneously = expecting large move in small caps but unsure direction. QQQ straddle = same for tech. Gold + BTC = hard asset macro hedge. Classical CTA approach -- non-directional.",
+    },
+    "einhorn": {
+        "name": "David Einhorn",
+        "firm": "Greenlight Capital",
+        "aum": "$3.2B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Value / Short Selling",
+        "cap_focus": "Small/Mid Old-Economy + Contrarian",
+        "buys": [
+            {"ticker": "GRBK", "action": "Hold",  "value": "$611M", "cap": "Small", "note": "#1 holding 19.1% -- Green Brick homebuilder"},
+            {"ticker": "FLR",  "action": "Hold",  "value": "$222M", "cap": "Mid",   "note": "#2 6.9% Fluor -- engineering/infra"},
+            {"ticker": "CNR",  "action": "Hold",  "value": "$195M", "cap": "Mid",   "note": "#3 6.1% Core Natural Resources coal"},
+            {"ticker": "BHF",  "action": "Added", "value": "--",    "cap": "Small", "note": "#4 5.3% Brighthouse Financial insurance"},
+            {"ticker": "PCG",  "action": "Hold",  "value": "--",    "cap": "Mid",   "note": "#5 3.6% PG&E -- utility re-entry"},
+        ],
+        "sells": [
+            {"ticker": "META", "note": "Reduced -- AI ad valuation concern"},
+            {"ticker": "AMZN", "note": "Trimmed"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("GRBK","19.1%"),("FLR","6.9%"),("CNR","6.1%"),("BHF","5.3%"),("PCG","3.6%"),
+        ],
+        "small_cap_gems": [
+            ("GRBK","Small-$3B", "#1 holding 19.1% -- Green Brick homebuilder, Texas/Sunbelt housing"),
+            ("CNR", "Mid-$8B",   "Core Natural Resources -- thermal coal + ESG-ignored value"),
+            ("BHF", "Small-$3B", "Brighthouse Financial -- demutualized insurer deep value"),
+            ("FLR", "Mid-$7B",   "Fluor engineering -- infrastructure + nuclear + AI data centers"),
+        ],
+        "theme": "Old-economy value: homebuilders + energy + infra. Zero AI hype. Q1 return +6.5%.",
+        "signal": "CONTRARIAN VALUE -- homebuilder + energy + infra | IGNORING AI narrative",
+        "insight": "Einhorn runs one of few funds outperforming by ignoring AI. GRBK (Green Brick) is the hidden gem -- Texas homebuilder at deep discount to peers. CNR (coal) = ESG-ignored value. Greenlight returned +6.5% in Q1 while AI funds got volatile. Under-the-radar picks dominating 2026.",
+    },
+    "klarman": {
+        "name": "Seth Klarman",
+        "firm": "Baupost Group",
+        "aum": "$5.1B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Deep Value / Margin of Safety",
+        "cap_focus": "Concentrated Large + Mid Value",
+        "buys": [
+            {"ticker": "QSR",  "action": "Added", "value": "$529M",  "cap": "Mid",   "note": "+4.2M shares, #1 holding 11.7% Burger King/Tim Hortons"},
+            {"ticker": "AMZN", "action": "Hold",  "value": "$649M",  "cap": "Large", "note": "#1 12.7% holding -- cloud/AI platform"},
+            {"ticker": "ELV",  "action": "Added", "value": "$426M",  "cap": "Large", "note": "Doubled to 1.3M shares -- Elevance Health"},
+            {"ticker": "WCC",  "action": "Hold",  "value": "$393M",  "cap": "Mid",   "note": "#3 7.7% WESCO International electrical dist"},
+            {"ticker": "UNP",  "action": "Hold",  "value": "$374M",  "cap": "Large", "note": "#4 7.3% Union Pacific railroad"},
+        ],
+        "sells": [],
+        "options": [],
+        "top_holdings": [
+            ("AMZN","12.7%"),("QSR","11.7% added"),("WCC","7.7%"),("UNP","7.3%"),("ELV","doubled"),
+        ],
+        "small_cap_gems": [
+            ("QSR",  "Mid-$18B",  "#2 11.7% $529M -- Restaurant Brands (BK/Tim Hortons/Popeyes) franchise compounder"),
+            ("WCC",  "Mid-$7B",   "WESCO International -- electrical/data/broadband distribution, AI infra tailwind"),
+            ("ELV",  "Large-$35B","Elevance Health -- doubled stake, managed care at value"),
+        ],
+        "theme": "Deep value: franchise royalties + rail + health insurance + electrical distribution.",
+        "signal": "BULLISH QSR/AMZN/ELV | Long-term margin of safety approach",
+        "insight": "Klarman uses Margin of Safety framework -- only buys at steep discount to intrinsic value. QSR $529M (doubled) = Burger King/Tim Hortons/Popeyes franchise royalties are recession-resistant. WCC (WESCO) = electrical distribution for AI data centers is undervalued. 22 total holdings -- extremely concentrated.",
+    },
+    "griffin": {
+        "name": "Ken Griffin",
+        "firm": "Citadel Advisors",
+        "aum": "$618B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Quantitative Multi-Strategy",
+        "cap_focus": "All-Cap + Options (12,857 holdings)",
+        "buys": [
+            {"ticker": "NVDA", "action": "CALL",  "value": "--",    "cap": "Large",  "note": "NVDA calls -- AI chip upside exposure"},
+            {"ticker": "TSLA", "action": "CALL",  "value": "--",    "cap": "Large",  "note": "TSLA calls -- EV/autonomous upside"},
+            {"ticker": "SPY",  "action": "CALL",  "value": "--",    "cap": "ETF",    "note": "SPY calls -- market upside hedge"},
+            {"ticker": "AAPL", "action": "Hold",  "value": "--",    "cap": "Large",  "note": "Apple -- top equity holding"},
+            {"ticker": "MSFT", "action": "Hold",  "value": "--",    "cap": "Large",  "note": "Microsoft -- cloud AI holding"},
+        ],
+        "sells": [],
+        "options": [
+            {"ticker": "SPY",  "type": "PUT",  "expiry": "Q2 2026", "note": "SPY puts -- macro hedge largest position"},
+            {"ticker": "QQQ",  "type": "PUT",  "expiry": "Q2 2026", "note": "QQQ puts -- tech correction hedge"},
+            {"ticker": "NVDA", "type": "CALL", "expiry": "Q2 2026", "note": "NVDA calls -- AI chip upside"},
+            {"ticker": "TSLA", "type": "CALL", "expiry": "Q2 2026", "note": "TSLA calls -- autonomous upside"},
+            {"ticker": "SPY",  "type": "CALL", "expiry": "Q2 2026", "note": "SPY calls -- 3rd largest position"},
+        ],
+        "top_holdings": [
+            ("SPY PUTS","#1 macro hedge"),("QQQ PUTS","#2 tech hedge"),("SPY CALLS","#3 long"),("TSLA CALLS","#4"),("NVDA CALLS","#5 AI"),
+        ],
+        "small_cap_gems": [],
+        "theme": "Pure quant: options straddles on everything. 12,857 positions -- statistical arbitrage at scale.",
+        "signal": "NEUTRAL-QUANT -- holding BOTH puts and calls on same names = volatility arb",
+        "insight": "Citadel with $618B is largest hedge fund in world. Holds SPY puts AND calls simultaneously -- market neutral volatility capture. NVDA calls = AI upside. TSLA calls = autonomous upside. This is not directional investing -- it is pure quant arb across 12,857 positions.",
+    },
+    "aschenbrenner": {
+        "name": "Leopold Aschenbrenner",
+        "firm": "Situational Awareness LP",
+        "aum": "$13.7B (doubled Q1)",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "AI Thesis / Reflexive Hedge",
+        "cap_focus": "AI Infra Longs + Chip Mega-Puts",
+        "buys": [
+            {"ticker": "BE",   "action": "Hold",  "value": "$879M", "cap": "Mid",   "note": "#1 LONG -- Bloom Energy biofuel power"},
+            {"ticker": "CLSK", "action": "Added", "value": "--",    "cap": "Small", "note": "CleanSpark crypto/AI data center miner"},
+            {"ticker": "RIOT", "action": "Added", "value": "--",    "cap": "Small", "note": "Riot Platforms Bitcoin/AI hosting pivot"},
+            {"ticker": "APLD", "action": "Added", "value": "--",    "cap": "Small", "note": "Applied Digital AI/HPC datacenter"},
+            {"ticker": "IREN", "action": "Added", "value": "--",    "cap": "Small", "note": "IREN crypto miner pivoting to AI"},
+            {"ticker": "SNDK", "action": "New",   "value": "--",    "cap": "Small", "note": "SanDisk + calls -- NAND flash memory"},
+            {"ticker": "MU",   "action": "CALL",  "value": "$422M", "cap": "Large", "note": "Micron call options notional $422M"},
+            {"ticker": "TSM",  "action": "CALL",  "value": "$355M", "cap": "Large", "note": "Taiwan Semi call notional $355M"},
+            {"ticker": "T1",   "action": "New",   "value": "--",    "cap": "Micro", "note": "T1 Energy -- AI power infrastructure"},
+            {"ticker": "HIVE", "action": "New",   "value": "--",    "cap": "Small", "note": "Hive Digital -- AI compute hosting"},
+        ],
+        "sells": [],
+        "options": [
+            {"ticker": "SMH",  "type": "PUT",  "expiry": "Q2 2026", "note": "$2B notional -- VanEck Semi ETF mega put"},
+            {"ticker": "NVDA", "type": "PUT",  "expiry": "Q2 2026", "note": "$1.6B notional -- Nvidia put"},
+            {"ticker": "AVGO", "type": "PUT",  "expiry": "Q2 2026", "note": "Broadcom put -- semi hedge"},
+            {"ticker": "ORCL", "type": "PUT",  "expiry": "Q2 2026", "note": "Oracle put -- cloud infra hedge"},
+            {"ticker": "AMD",  "type": "PUT",  "expiry": "Q2 2026", "note": "AMD put -- GPU alternative hedge"},
+            {"ticker": "MU",   "type": "CALL", "expiry": "Q2 2026", "note": "Micron call $422M -- long memory"},
+            {"ticker": "TSM",  "type": "CALL", "expiry": "Q2 2026", "note": "TSM call $355M -- long chips"},
+        ],
+        "top_holdings": [
+            ("BE","$879M #1"),("CLSK","AI miner"),("RIOT","BTC/AI"),("SMH PUTS","$2B hedge"),("NVDA PUTS","$1.6B"),
+        ],
+        "small_cap_gems": [
+            ("BE",   "Mid-$4B",   "#1 LONG $879M -- Bloom Energy biofuel power for AI data centers"),
+            ("CLSK", "Small-$2B", "CleanSpark -- BTC miner pivoting to AI compute hosting"),
+            ("RIOT", "Small-$3B", "Riot Platforms -- Bitcoin/AI hosting infrastructure"),
+            ("APLD", "Small-$1B", "Applied Digital -- AI/HPC datacenter capacity play"),
+            ("IREN", "Small-$1B", "IREN Ltd -- crypto miner pivoting to AI data centers"),
+            ("SNDK", "Small-$5B", "SanDisk -- NAND flash + call options"),
+            ("T1",   "Micro",     "T1 Energy -- ultra-early AI power infrastructure"),
+            ("HIVE", "Small-$1B", "Hive Digital -- AI compute hosting Canada/Iceland"),
+        ],
+        "theme": "Long AI power/compute infra. Short entire chip sector $8.5B puts. Reflexive hedge.",
+        "signal": "ULTRA-BULL AI power infra | MEGA SHORT semi sector via puts",
+        "insight": "Ex-OpenAI researcher (fired at 22) turned $225M into $13.7B in ~1yr. Long AI power (BE $879M, crypto->AI miners) + $8.46B chip PUTS = AI demand real but chip stocks overvalued. Bloom Energy bet = AI needs ELECTRICITY before chips.",
+    },
+    "gerstner": {
+        "name": "Brad Gerstner",
+        "firm": "Altimeter Capital",
+        "aum": "$6.7B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Growth / AI Supercycle Thesis",
+        "cap_focus": "Concentrated AI + Infrastructure",
+        "buys": [
+            {"ticker": "NVDA", "action": "Hold",  "value": "$1.51B","cap": "Large", "note": "#1 holding -- AI chip conviction"},
+            {"ticker": "META", "action": "Hold",  "value": "$1.22B","cap": "Large", "note": "#2 holding -- AI ad platform"},
+            {"ticker": "MSFT", "action": "Hold",  "value": "$618M", "cap": "Large", "note": "#3 holding -- Azure AI cloud"},
+            {"ticker": "AMZN", "action": "Hold",  "value": "$511M", "cap": "Large", "note": "#4 holding -- AWS AI infra"},
+            {"ticker": "UBER", "action": "Hold",  "value": "$457M", "cap": "Large", "note": "#5 holding -- autonomous platform"},
+            {"ticker": "CRWV", "action": "Added", "value": "$348M", "cap": "Mid",   "note": "+1.28M shares CoreWeave AI compute"},
+            {"ticker": "ARM",  "action": "New",   "value": "$259M", "cap": "Large", "note": "ARM Holdings -- AI chip architecture"},
+            {"ticker": "BE",   "action": "New",   "value": "--",    "cap": "Mid",   "note": "Bloom Energy -- AI data center power"},
+        ],
+        "sells": [
+            {"ticker": "GOOGL","note": "Full exit -- sold all vs Buffett adding"},
+            {"ticker": "BABA", "note": "Full exit -- China risk-off complete"},
+            {"ticker": "JD",   "note": "Full exit -- China exit"},
+            {"ticker": "PDD",  "note": "Full exit -- Pinduoduo exit"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("NVDA","$1.51B"),("META","$1.22B"),("MSFT","$618M"),("AMZN","$511M"),("UBER","$457M"),
+        ],
+        "small_cap_gems": [
+            ("CRWV","Mid-$60B","CoreWeave $348M -- pure-play AI compute, NVIDIA-powered cloud"),
+            ("BE",  "Mid-$4B", "Bloom Energy -- AI data center power, new position"),
+            ("ARM", "Large-$120B","ARM Holdings $259M -- AI chip architecture monopoly"),
+        ],
+        "theme": "AI is a supercycle not a bubble. All-in NVDA/META/MSFT/AMZN + AI infra picks.",
+        "signal": "ULTRA-BULL AI supercycle | EXITING China completely",
+        "insight": "Coined AI supercycle thesis. Exited ALL China stocks in one move. Altimeter pioneered CRWV before IPO. Top 5 = 65% of portfolio. Bloom + CRWV = AI needs power AND compute. 29.52% annualized since 2011.",
+    },
+    "laffont": {
+        "name": "Philippe Laffont",
+        "firm": "Coatue Management",
+        "aum": "$29B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Growth Technology",
+        "cap_focus": "Large-Cap Tech + Selective",
+        "buys": [
+            {"ticker": "ASML", "action": "New",   "value": "$655M", "cap": "Large", "note": "496K shares -- chip lithography monopoly"},
+            {"ticker": "NFLX", "action": "Added", "value": "--",    "cap": "Large", "note": "+104% doubled Netflix stake"},
+            {"ticker": "NU",   "action": "Hold",  "value": "--",    "cap": "Mid",   "note": "Nu Holdings digital bank LatAm"},
+        ],
+        "sells": [
+            {"ticker": "AMZN", "note": "-82% massive cut"},
+            {"ticker": "TSM",  "note": "-83% Taiwan Semi slashed"},
+            {"ticker": "NVDA", "note": "-70% Nvidia dramatically reduced"},
+            {"ticker": "LRCX", "note": "-71% Lam Research slashed"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("ASML","New $655M"),("NFLX","2x doubled"),("NU","LatAm digital bank"),
+        ],
+        "small_cap_gems": [
+            ("NU",   "Mid-$55B",   "Nu Holdings -- Brazil digital bank, 90M+ customers, growth story"),
+            ("ASML", "Large-$280B","ASML $655M -- only EUV maker, chip equipment monopoly"),
+        ],
+        "theme": "Rotating from AI chip overcrowding into chip equipment monopoly + streaming.",
+        "signal": "ROTATING -- selling NVDA/TSM | BUYING ASML chip equipment monopoly",
+        "insight": "Laffont cut NVDA -70% while Altimeter/Cohen held -- boldest AI chip divergence. ASML $655M = betting on equipment monopoly over chip makers. NFLX doubled = ad tier + AI content moat. NU = LatAm fintech undervalued.",
+    },
+    "wood": {
+        "name": "Cathie Wood",
+        "firm": "ARK Invest",
+        "aum": "$12.86B",
+        "filed": "2026-05-15",
+        "period": "Q1 2026 (Mar 31)",
+        "style": "Disruptive Innovation / Long-only",
+        "cap_focus": "Small/Mid-Cap Disruptive",
+        "buys": [
+            {"ticker": "AMD",  "action": "Added", "value": "--",    "cap": "Large",  "note": "AMD AI GPU challenger"},
+            {"ticker": "CRSP", "action": "Added", "value": "--",    "cap": "Mid",    "note": "CRISPR Therapeutics gene editing"},
+            {"ticker": "TEM",  "action": "Added", "value": "--",    "cap": "Mid",    "note": "Tempus AI -- clinical data platform"},
+            {"ticker": "CRCL", "action": "Added", "value": "--",    "cap": "Small",  "note": "Circle Internet -- stablecoin infra"},
+            {"ticker": "HOOD", "action": "Added", "value": "--",    "cap": "Mid",    "note": "Robinhood +24.9% -- retail finance"},
+            {"ticker": "RBLX", "action": "Added", "value": "--",    "cap": "Mid",    "note": "Roblox -- AI gaming metaverse"},
+            {"ticker": "CRWV", "action": "Added", "value": "--",    "cap": "Mid",    "note": "CoreWeave AI compute"},
+            {"ticker": "RXRX", "action": "Hold",  "value": "--",    "cap": "Small",  "note": "Recursion Pharma +682% revenue AI drug"},
+        ],
+        "sells": [
+            {"ticker": "TSLA", "note": "Trimmed -- profit taking"},
+            {"ticker": "PLTR", "note": "Trimmed -- Palantir profit"},
+            {"ticker": "COIN", "note": "Trimmed -- Coinbase"},
+            {"ticker": "META", "note": "Trimmed -- Meta reduced"},
+            {"ticker": "ROKU", "note": "-35% Roku cut"},
+        ],
+        "options": [],
+        "top_holdings": [
+            ("TSLA","#1 trimmed"),("AMD","#2 added"),("CRSP","gene edit"),("HOOD","retail"),("PLTR","trimmed"),
+        ],
+        "small_cap_gems": [
+            ("CRSP", "Mid-$5B",   "CRISPR Therapeutics -- first approved gene editing cure"),
+            ("TEM",  "Mid-$8B",   "Tempus AI -- AI clinical data 200+ hospitals"),
+            ("CRCL", "Small-$6B", "Circle Internet -- USDC stablecoin issuer"),
+            ("RXRX", "Small-$2B", "Recursion Pharma +682% revenue AI drug discovery"),
+            ("HOOD", "Mid-$20B",  "Robinhood -- retail brokerage + crypto + AI advisor"),
+            ("RBLX", "Mid-$25B",  "Roblox -- AI-generated gaming worlds"),
+        ],
+        "theme": "Disruptive tech: gene editing + AI clinical + stablecoins + retail finance.",
+        "signal": "LONG-TERM BULL disruptive innovation | 5-10yr, high volatility",
+        "insight": "Only major fund with meaningful CRISPR exposure. TEM = AI + personalized medicine. CRCL (Circle) = stablecoin for dollar-on-chain era. RXRX +682% revenue. These are 5-10yr bets most funds are too short-term to hold.",
+    },
+    "chamath": {
+        "name": "Chamath Palihapitiya",
+        "firm": "Social Capital",
+        "aum": "$2.1B",
+        "filed": "2026 (ongoing)",
+        "period": "2026 Thesis Investments",
+        "style": "Contrarian Macro / Deep Tech VC",
+        "cap_focus": "Private + Commodity Macro",
+        "buys": [
+            {"ticker": "COPX",  "action": "Thesis","value": "--", "cap": "ETF",     "note": "Copper ETF -- AI infra raw material thesis"},
+            {"ticker": "GROQ",  "action": "Exit",  "value": "~$1B","cap": "Private","note": "NVIDIA bought Groq -- 3000%+ on $62M"},
+            {"ticker": "8090",  "action": "Build", "value": "--", "cap": "Private", "note": "Software Factory -- AI coding infra"},
+        ],
+        "sells": [],
+        "options": [],
+        "top_holdings": [
+            ("Copper/COPX","AI material"),("Groq","Sold to NVIDIA $20B"),("8090","AI coding"),
+        ],
+        "small_cap_gems": [
+            ("COPX", "ETF",         "Global X Copper Miners -- AI data centers use 5x more copper"),
+            ("FCX",  "Large-$70B",  "Freeport McMoRan -- largest copper producer, AI infra proxy"),
+        ],
+        "theme": "Copper is the real AI infrastructure play. Power + materials > software.",
+        "signal": "BULLISH copper/materials | AI infrastructure raw materials supercycle",
+        "insight": "Chamath says copper will go parabolic -- AI data centers use 5x more copper than traditional. Already made ~3000% on Groq ($62M->$20B NVIDIA deal). 2026 thesis: copper, energy, physical infrastructure > software in AI era. Watch COPX ETF and FCX.",
+    },
+}
+
+LEGENDS_CONSENSUS = {
+    "most_bought": [
+        ("NVDA",  7, "Soros+Dalio+RenTec+Buffett(AI)+Tepper+Cohen+Coleman -- near-universal"),
+        ("TSM",   6, "Soros+Dalio+Tepper+Druck+Bridgewater+Coleman -- chip supply"),
+        ("AMZN",  6, "Tepper+Ackman+Soros+Loeb+Cohen+Coleman -- cloud/AI"),
+        ("GOOGL", 5, "Buffett(+204%)+Dalio+Loeb+Coleman+Tiger vs Soros/Ackman/Druck SOLD"),
+        ("MU",    4, "Tepper(+6x)+Dalio+RenTec($520M)+Bridgewater -- memory supercycle"),
+        ("AVGO",  3, "Dalio+RenTec+Cohen -- AI networking silicon"),
+        ("META",  3, "Loeb+Coleman+Cohen -- AI ad platform"),
+        ("MSFT",  2, "Ackman($2B new)+Dalio -- cloud"),
+        ("TDG",   2, "Loeb+Cohen($336M) -- TransDigm aerospace"),
+        ("EQIX",  2, "Tudor+Cohen -- data center REIT"),
+    ],
+    "most_sold": [
+        ("CRM",   5, "Dalio+Soros+Buffett(prev)+Bridgewater+Loeb -- full SaaS exit"),
+        ("GOOGL", 3, "Soros+Ackman+Druckenmiller SOLD vs Buffett/Coleman ADDED"),
+        ("MSFT",  3, "Soros+RenTec+Loeb -- partial rotation out"),
+        ("NFLX",  2, "RenTec(-$673M)+others -- streaming peak"),
+        ("TSLA",  2, "RenTec(-$534M)+others -- EV rotation out"),
+        ("PLTR",  2, "RenTec(-$542M)+others -- growth multiple"),
+        ("WDAY",  2, "Dalio+Bridgewater -- SaaS exit"),
+        ("NOW",   2, "Dalio+Bridgewater -- ServiceNow exit"),
+    ],
+    "options_activity": [
+        ("CRWV PUTS", "Soros",                 "Q2 2026", "CoreWeave AI infra hedge"),
+        ("TSM PUTS",  "Soros",                 "Q2 2026", "Geo-risk hedge on TSM long"),
+        ("IWM straddle","Tudor",               "Q2 2026", "Long both puts+calls = volatility bet"),
+        ("QQQ straddle","Tudor",               "Q2 2026", "Long both puts+calls = tech vol bet"),
+        ("NVDA PUTS", "Situational Awareness",  "Q2 2026", "AI chip hedge large put block"),
+        ("AVGO PUTS", "Situational Awareness",  "Q2 2026", "Broadcom put block"),
+        ("ORCL PUTS", "Situational Awareness",  "Q2 2026", "Oracle cloud infra hedge"),
+    ],
+    "small_cap_gems": [
+        ("CRDO", "Small-$6B",  "Cohen Point72 #5 holding -- AI interconnect chips"),
+        ("TDS",  "Small-$2.5B","Loeb Third Point #2 holding 13.3% -- rural telecom"),
+        ("CRS",  "Small-$6B",  "Loeb Third Point #5 holding 5.9% -- specialty alloys"),
+        ("MOH",  "Mid-$8B",    "Burry Scion #1 holding 35.1% -- Medicaid HMO deep value"),
+        ("SLM",  "Small-$3B",  "Burry Scion 19.5% -- Sallie Mae student loans"),
+        ("BRK",  "Small-$4B",  "Burry Scion 19.3% -- Bruker lab instruments"),
+        ("VST",  "Mid-$25B",   "Tepper doubled -- Vistra power grid AI data centers"),
+        ("SAND", "Small-$5B",  "Tepper new -- SanDisk NAND flash memory spinoff"),
+        ("GOLD", "Small-$3B",  "RenTec $227M new -- Alamos Gold junior miner"),
+        ("UTHR", "Mid-$16B",   "RenTec #1 holding -- United Therapeutics rare disease"),
+        ("NYT",  "Mid-$3B",    "Buffett +199% -- NYT digital subscriptions + AI licensing"),
+        ("M",    "Small-$3B",  "Buffett $55M tiny -- Macys deep value asset play"),
+        ("NUE",  "Mid-$16B",   "Dalio new -- Nucor steel reshoring + infra cycle"),
+        ("CRWV", "Mid-$60B",   "Druckenmiller -- CoreWeave AI compute infrastructure"),
+        ("HUT",  "Small-$1.5B","Loeb new -- Hut 8 Bitcoin miner infrastructure"),
+        ("INTC", "Large-$80B", "Coleman $180M -- Intel turnaround + foundry separation"),
+        ("QSR",  "Mid-$18B",   "Ackman 12.2% -- Restaurant Brands intl compounder"),
+        ("BILL", "Mid-$6B",    "Soros #4 holding -- Bill Holdings SMB fintech payments"),
+    ],
+    "macro_themes": [
+        ("AI Infra Supercycle", "NVDA/TSM/AVGO/MU/CRWV/ANET bought by 7+ legends"),
+        ("SaaS Exodus",         "CRM/WDAY/NOW fully exited by 5 funds -- sector rotation"),
+        ("Memory Chip Bet",     "MU: Tepper +6x, RenTec $520M, Dalio added"),
+        ("Gold + Hard Assets",  "RenTec NEM+GOLD, Dalio GLD, Loeb GLD, Tudor GLD+BTC"),
+        ("Power Grid Play",     "Tepper doubled VST -- AI data center power demand"),
+        ("Aerospace Premium",   "Loeb+Cohen both buy TDG -- TransDigm pricing power"),
+        ("China Risk-Off",      "Tepper exited FXI; EM reduction across board"),
+        ("GOOGL Divergence",    "5 funds bought vs 3 sold -- watch carefully"),
+        ("Contrarian Health",   "Burry 35% Molina -- Medicaid + consumer trough bet"),
+        ("Volatility Surge",    "Tudor straddles IWM+QQQ = expects big market moves"),
+    ],
+}
+LEGEND_KEYS = list(LEGENDS_DATA.keys())
+LEGEND_LABELS = {
+    "buffett":       "Buffett",
+    "soros":         "Soros",
+    "rentec":        "RenTec",
+    "dalio":         "Dalio",
+    "tepper":        "Tepper",
+    "ackman":        "Ackman",
+    "druckenmiller": "Druck",
+    "loeb":          "Loeb",
+    "cohen":         "Cohen",
+    "burry":         "Burry",
+    "coleman":       "Coleman",
+    "tudor":          "Tudor",
+    "aschenbrenner": "Aschenb",
+    "gerstner":      "Gerstnr",
+    "laffont":       "Laffont",
+    "wood":          "C.Wood",
+    "chamath":       "Chamath",
+    "einhorn": "Einhorn",
+    "klarman": "Klarman",
+    "griffin": "Griffin",
+}
+
+
+
+
+LEGENDS_FUTURE_CATCHES = [
+    # (ticker, name, market_cap, sector, thesis, who_is_betting, potential, risk)
+    ("BE",    "Bloom Energy",         "Mid-$4B",    "AI Power",     "Biofuel power for AI data centers -- Aschenbrenner $879M #1 bet. AI needs electricity.", "Aschenbrenner, Altimeter", "5-10x if AI power demand materializes", "High -- single-customer risk, fuel cell economics"),
+    ("CRWV",  "CoreWeave",            "Mid-$60B",   "AI Compute",   "NVIDIA-powered GPU cloud -- only scaled AI compute alternative to hyperscalers. IPO 2025.", "Druck, Altimeter, ARK, Gerstner", "3-5x -- AI training/inference demand", "High -- NVIDIA dependency, competition from AWS/Azure"),
+    ("CLSK",  "CleanSpark",           "Small-$2B",  "AI/BTC Infra", "Bitcoin miner pivoting to AI compute hosting. Low-cost energy + GPU infrastructure.", "Aschenbrenner", "5-10x -- AI hosting pivot", "Very High -- crypto correlation, regulation"),
+    ("APLD",  "Applied Digital",      "Small-$1B",  "AI Datacenter","AI/HPC datacenter capacity in low-cost power regions. Hyperscaler demand backlog.", "Aschenbrenner", "5-15x -- AI data center demand", "Very High -- execution risk, capital intensive"),
+    ("IREN",  "IREN Limited",         "Small-$1B",  "AI/BTC Infra", "Crypto miner fully pivoting to AI compute. Canada/Iceland green energy advantage.", "Aschenbrenner", "5-10x -- AI hosting", "Very High -- pivot execution risk"),
+    ("TEM",   "Tempus AI",            "Mid-$8B",    "AI Biotech",   "AI clinical data platform -- 200+ hospital partnerships. Personalized medicine at scale.", "ARK Invest, Cathie Wood", "3-8x -- healthcare AI adoption", "High -- path to profitability unclear"),
+    ("CRSP",  "CRISPR Therapeutics",  "Mid-$5B",    "Gene Editing",  "First approved CRISPR cure (sickle cell). Gene editing pipeline -- potential platform.", "ARK #2 holding, institutional", "5-20x -- if gene editing scales", "Very High -- clinical trial risk, regulatory"),
+    ("CRCL",  "Circle Internet",      "Small-$6B",  "Stablecoin",   "USDC issuer -- dollar stablecoin infrastructure. Legislative tailwinds 2026.", "ARK Invest", "3-8x -- stablecoin regulation unlock", "High -- regulation could also kill it"),
+    ("RXRX",  "Recursion Pharma",     "Small-$2B",  "AI Drug Disc", "AI drug discovery +682% revenue growth. Partnerships with Roche, Bayer, NVIDIA.", "ARK, institutional", "5-20x -- drug discovery AI platform", "Very High -- biotech binary risk"),
+    ("HOOD",  "Robinhood",            "Mid-$20B",   "Retail Finance","Retail brokerage + crypto + AI financial advisor. Gen Z finance platform expanding.", "ARK Invest", "3-5x -- financial super-app build-out", "Medium -- competition, regulation"),
+    ("NUE",   "Nucor Steel",          "Mid-$16B",   "Steel/Infra",  "Steel reshoring + AI data center construction. All-electric EAF mills -- cheapest US steel.", "Dalio Bridgewater", "2-4x -- reshoring supercycle", "Medium -- commodity cycle risk"),
+    ("VST",   "Vistra Energy",        "Mid-$25B",   "AI Power",     "Nuclear + nat gas power for AI data centers. Hyperscaler PPAs driving massive contracts.", "Tepper 2x, institutional", "3-6x -- AI power demand", "Medium -- regulatory, nuclear permitting"),
+    ("SNDK",  "SanDisk",              "Small-$5B",  "AI Storage",   "NAND flash memory spinoff from WD. AI needs massive storage. Undervalued vs memory peers.", "Aschenbrenner, Tepper", "3-6x -- AI storage demand", "High -- memory cycle volatility"),
+    ("ARM",   "ARM Holdings",         "Large-$120B","AI Chip Arch",  "Royalties on every AI chip -- iPhone to data centers. Architecture licensing monopoly.", "Altimeter $259M", "2-4x -- AI device proliferation", "Medium -- valuation premium risk"),
+    ("ASML",  "ASML Holding",         "Large-$280B","Chip Equipment","Only maker of EUV machines. Every advanced chip requires ASML. Monopoly in chip equipment.", "Coatue $655M new, Cohen", "2-3x -- no competition possible", "Low-Medium -- geopolitical Taiwan risk"),
+    ("UTHR",  "United Therapeutics",  "Mid-$16B",   "Rare Disease",  "Rare disease pulmonary drugs + growing pipeline. RenTec #1 holding rarely discussed.", "RenTec #1, institutional", "2-4x -- rare disease pricing power", "Medium -- FDA pipeline risk"),
+    ("CRDO",  "Credo Technology",     "Small-$6B",  "AI Networking", "High-speed AI interconnect chips -- coherent optics for data center networking.", "Cohen Point72 #5 holding", "5-10x -- AI bandwidth explosion", "High -- competition from Marvell, Inphi"),
+    ("TDS",   "Telephone Data Sys",   "Small-$2.5B","Telecom/Value", "Rural telecom operator -- spectrum assets, 5G buildout, potential buyout target.", "Loeb #2 holding 13.3%", "2-5x -- spectrum value unlock or M&A", "Medium -- legacy telco risks"),
+    ("CRS",   "Carpenter Technology", "Small-$6B",  "Aerospace Metal","Specialty alloys for aerospace/defense/medical. AI-driven manufacturing + defense demand.", "Loeb #5 holding 5.9%", "2-4x -- defense + aerospace supercycle", "Medium -- aerospace cycle risk"),
+    ("MOH",   "Molina Healthcare",    "Mid-$8B",    "Healthcare",    "Medicaid managed care at deep value. Burry 35.1% top bet. Government contract visibility.", "Burry Scion #1 35.1%", "2-4x -- Medicaid expansion + value", "Medium -- ACA policy risk"),
+    ("COPX",  "Global X Copper ETF",  "ETF",        "AI Materials",  "AI data centers use 5x more copper. Chamath thesis -- copper parabolic on AI buildout.", "Chamath thesis", "3-8x -- if AI infrastructure ramps", "High -- commodity cycle, China demand"),
+    ("KTOS",  "Kratos Defense",       "Small-$5B",  "Defense/AI",   "Autonomous drones + AI defense systems. ARK + defense funds. Dual AI+defense theme.", "ARK Invest added", "3-7x -- autonomous defense spending", "High -- defense contract concentration"),
+    ("BILL",  "Bill Holdings",        "Mid-$6B",    "SMB Fintech",  "SMB payments + AI-powered financial workflows. Soros #4 holding. Undervalued vs payment peers.", "Soros #4 holding", "2-5x -- AI-enhanced SMB finance", "Medium -- competition from Intuit, Stripe"),
+    ("SLM",   "Sallie Mae",           "Small-$3B",  "Student Finance","Student loan servicer at deep discount post-Biden forgiveness concern. Burry 19.5%.", "Burry Scion 19.5%", "2-5x -- if student loan market normalizes", "Medium -- policy risk, rate sensitivity"),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  QUARTER-OVER-QUARTER POSITION TRACKING
+#  Columns: investor, ticker, Q4_2025_shares(K), Q4_2025_value($M),
+#            Q1_2026_shares(K), Q1_2026_value($M),
+#            avg_price_Q4, avg_price_Q1, action, net_value_chg($M)
+# ═══════════════════════════════════════════════════════════════════
+LEGENDS_QOQ = [
+    # (investor, ticker, Q4_sh_K, Q4_val_M, Q1_sh_K, Q1_val_M, avg_Q4, avg_Q1, action, notes)
+    # ── BUFFETT ─────────────────────────────────────────────────────
+    ("Buffett",   "GOOGL", 18000,  2800,   57800, 16600,  155.6, 287.2, "LOADING+++", "Tripled stake -- +221% shares, +$13.8B"),
+    ("Buffett",   "AAPL",  905000, 125000, 905000,125000,  138.1, 138.1, "HOLD",       "Unchanged -- largest position"),
+    ("Buffett",   "AXP",   151600, 45000,  151600, 45000,  296.8, 296.8, "HOLD",       "AmEx unchanged"),
+    ("Buffett",   "BAC",   680000, 29000,  570000, 24000,   42.6,  42.1, "UNLOADING",  "Trimmed -110M shares -$5B"),
+    ("Buffett",   "CVX",   110000, 15000,   85000, 11500,  136.4, 135.3, "UNLOADING",  "Trimmed -25M shares -$3.5B"),
+    ("Buffett",   "V",      8500,   2100,       0,     0,  247.1,   0.0, "EXITED",     "Full exit payments sector"),
+    ("Buffett",   "MA",     3900,   1800,       0,     0,  461.5,   0.0, "EXITED",     "Full exit payments sector"),
+    ("Buffett",   "DAL",       0,      0,   39800,  2600,    0.0,  65.3, "INITIATE",   "New -- 39.8M shares $2.6B"),
+    ("Buffett",   "NYT",    9000,    340,   27000,  1020,   37.8,  37.8, "LOADING++",  "+199% added media bet"),
+    ("Buffett",   "LEN",    3400,    390,    4870,   558,  114.7, 114.6, "LOADING+",   "+43% homebuilder"),
+    # ── SOROS ───────────────────────────────────────────────────────
+    ("Soros",     "NVDA",   6200,   840,    8800,  1190,  135.5, 135.2, "LOADING+",   "Added AI chip position"),
+    ("Soros",     "AMZN",   4100,   820,    2700,   540,  200.0, 200.0, "UNLOADING",  "Trimmed -34% cloud reduction"),
+    ("Soros",     "GOOGL",  2800,   430,    1600,   246,  153.6, 153.8, "UNLOADING",  "Trimmed -43% vs Buffett adding"),
+    ("Soros",     "BILL",   3200,   176,    3200,   192,   55.0,  60.0, "HOLD",       "Bill Holdings unchanged"),
+    # ── RENTEC ──────────────────────────────────────────────────────
+    ("RenTec",    "AAPL",      0,     0,   43000,   781,    0.0, 181.6, "INITIATE",   "New $781M position"),
+    ("RenTec",    "NVDA",  12000,  1620,   13530,  1900,  135.0, 140.4, "LOADING+",   "+$278M AI chip added"),
+    ("RenTec",    "MU",    12000,  1380,   18100,  1900,  115.0, 105.0, "LOADING++",  "+50% Micron $520M added"),
+    ("RenTec",    "NFLX",  18000,  8100,    5000,  2250,  450.0, 450.0, "UNLOADING",  "-$673M largest exit"),
+    ("RenTec",    "COST",   5200,  3120,    1900,  1140,  600.0, 600.0, "UNLOADING",  "-$578M Costco cut"),
+    ("RenTec",    "PLTR",  14500,  1900,    8400,  1100,  131.0, 130.1, "UNLOADING",  "-$542M Palantir cut"),
+    ("RenTec",    "TSLA",   5800,  1680,    1700,   490,  289.7, 288.2, "UNLOADING",  "-$534M Tesla cut"),
+    ("RenTec",    "UTHR",  18000,  4200,   18000,  4300,  233.3, 238.9, "HOLD",       "#1 holding unchanged"),
+    ("RenTec",    "GOLD",      0,     0,    6500,   227,    0.0,  34.9, "INITIATE",   "New $227M Alamos Gold"),
+    ("RenTec",    "NEM",       0,     0,    6000,   278,    0.0,  46.3, "INITIATE",   "New $278M Newmont gold"),
+    # ── DALIO ───────────────────────────────────────────────────────
+    ("Dalio",     "TSM",       0,     0,    8200,   900,    0.0, 109.8, "INITIATE",   "New Taiwan Semi position"),
+    ("Dalio",     "NVDA",   7800,  1060,    9600,  1350,  135.9, 140.6, "LOADING+",   "Added GPU exposure"),
+    ("Dalio",     "CRM",    4200,   900,       0,     0,  214.3,   0.0, "EXITED",     "Full Salesforce exit"),
+    ("Dalio",     "WDAY",   2800,   560,       0,     0,  200.0,   0.0, "EXITED",     "Full Workday exit"),
+    ("Dalio",     "NOW",    1100,   880,       0,     0,  800.0,   0.0, "EXITED",     "Full ServiceNow exit"),
+    ("Dalio",     "MU",     4800,   552,    7200,   756,  115.0, 105.0, "LOADING+",   "Added Micron memory"),
+    # ── TEPPER ──────────────────────────────────────────────────────
+    ("Tepper",    "MU",     1800,   207,   10800,  1134,  115.0, 105.0, "LOADING+++", "+6x Micron bet -- AI HBM memory"),
+    ("Tepper",    "UBER",   3200,   310,    9600,   930,   96.9,  96.9, "LOADING+++", "Tripled Uber stake"),
+    ("Tepper",    "AMZN",   6400,  1280,   12600,  2520,  200.0, 200.0, "LOADING++",  "Nearly doubled Amazon"),
+    ("Tepper",    "VST",    2800,   280,    5600,   560,  100.0, 100.0, "LOADING++",  "Doubled Vistra power"),
+    ("Tepper",    "AAL",    8200,   148,       0,     0,   18.0,   0.0, "EXITED",     "Full exit airlines"),
+    ("Tepper",    "FXI",    4200,   210,    1800,    90,   50.0,  50.0, "UNLOADING",  "Reducing China ETF exposure"),
+    # ── ACKMAN ──────────────────────────────────────────────────────
+    ("Ackman",    "MSFT",       0,     0,   16000,  2000,    0.0, 125.0, "INITIATE",  "New $2B+ Microsoft 15% of portfolio"),
+    ("Ackman",    "AMZN",   8400,  1680,   11000,  2200,  200.0, 200.0, "LOADING+",  "Added Amazon cloud"),
+    ("Ackman",    "HLT",    4800,   845,       0,     0,  176.0,   0.0, "EXITED",    "Full exit Hilton"),
+    ("Ackman",    "GOOGL",  3200,   490,    1600,   246,  153.1, 153.8, "UNLOADING", "Trimmed Alphabet"),
+    # ── DAN LOEB ────────────────────────────────────────────────────
+    ("Loeb",      "META",      0,     0,    1800,   900,    0.0, 500.0, "INITIATE",  "New Meta AI/ads position"),
+    ("Loeb",      "GOOGL",     0,     0,    1200,   184,    0.0, 153.3, "INITIATE",  "New Alphabet position"),
+    ("Loeb",      "TDS",    9400,   188,    9400,   235,   20.0,  25.0, "HOLD",      "#2 13.3% Telephone Data"),
+    ("Loeb",      "CRS",    2800,   392,    2800,   420,  140.0, 150.0, "HOLD",      "#5 5.9% Carpenter Technology"),
+    ("Loeb",      "MSFT",   2400,   900,       0,     0,  375.0,   0.0, "EXITED",    "Full exit Microsoft"),
+    # ── STEVE COHEN ─────────────────────────────────────────────────
+    ("Cohen",     "TDG",       0,     0,     253,   336,    0.0,1328.1, "INITIATE",  "New TransDigm $336M +50000%"),
+    ("Cohen",     "CRDO",   4800,   192,    6200,   248,   40.0,  40.0, "LOADING+",  "Added Credo AI interconnect"),
+    ("Cohen",     "NVDA",  14200,  1924,   16000,  2240,  135.5, 140.0, "LOADING+",  "Added AI chips"),
+    # ── MICHAEL BURRY ───────────────────────────────────────────────
+    ("Burry",     "MOH",      0,     0,     400,    24,    0.0,  60.0, "INITIATE",  "New 35.1% Molina Healthcare"),
+    ("Burry",     "LULU",    200,    28,     400,    56,  140.0, 140.0, "LOADING++", "Doubled Lululemon"),
+    ("Burry",     "SLM",      0,     0,    2800,    27,    0.0,   9.6, "INITIATE",  "New 19.5% Sallie Mae"),
+    ("Burry",     "BRK",      0,     0,     840,    13,    0.0,  15.5, "INITIATE",  "New 19.3% Bruker Corp"),
+    # ── DRUCKENMILLER ───────────────────────────────────────────────
+    ("Druck",     "CRWV",   1200,   186,    3400,   527,  155.0, 155.0, "LOADING++", "Nearly 3x CoreWeave AI compute"),
+    ("Druck",     "GOOGL",  4800,   736,       0,     0,  153.3,   0.0, "EXITED",    "Full exit vs Buffett adding"),
+    ("Druck",     "TECH",   4800,   540,    5800,   650,  112.5, 112.1, "LOADING+",  "Tech exposure doubled to 18.4%"),
+    # ── ASCHENBRENNER ───────────────────────────────────────────────
+    ("Aschenb",   "BE",     8000,   520,   13400,   879,   65.0,  65.6, "LOADING++", "+67% Bloom Energy AI power"),
+    ("Aschenb",   "CLSK",   4800,   122,    7200,   182,   25.4,  25.3, "LOADING+",  "Added CleanSpark miner"),
+    ("Aschenb",   "MU",        0,     0,    4000,   422,    0.0, 105.5, "INITIATE",  "New $422M Micron call options"),
+    # ── ALTIMETER/GERSTNER ──────────────────────────────────────────
+    ("Gerstner",  "CRWV",   3200,   496,    4499,   348,  155.0,  77.3, "LOADING+",  "Added +1.28M CoreWeave shares"),
+    ("Gerstner",  "ARM",       0,     0,    1715,   259,    0.0, 151.0, "INITIATE",  "New ARM Holdings $259M"),
+    ("Gerstner",  "GOOGL",   519,   162,       0,     0,  312.1,   0.0, "EXITED",    "Full exit 519K shares $162M"),
+    ("Gerstner",  "NVDA",  11000,  1490,   11000,  1510,  135.5, 137.3, "HOLD",      "#1 holding $1.51B unchanged"),
+    # ── COATUE/LAFFONT ──────────────────────────────────────────────
+    ("Laffont",   "ASML",      0,     0,     496,   655,    0.0,1320.6, "INITIATE",  "New $655M ASML largest new position"),
+    ("Laffont",   "NFLX",   3100,  1395,    6200,  2790,  450.0, 450.0, "LOADING++", "Doubled Netflix +104%"),
+    ("Laffont",   "NVDA",  28000,  3794,    8400,  1180,  135.5, 140.5, "UNLOADING", "-70% NVDA massive reduction"),
+    ("Laffont",   "AMZN",  18000,  3600,    3240,   648,  200.0, 200.0, "UNLOADING", "-82% Amazon massive cut"),
+    ("Laffont",   "TSM",   12000,  1400,    2040,   238,  116.7, 116.7, "UNLOADING", "-83% Taiwan Semi slashed"),
+    # ── ARK WOOD ────────────────────────────────────────────────────
+    ("Wood",      "CRSP",   6400,   352,    8800,   484,   55.0,  55.0, "LOADING+",  "Added CRISPR gene editing"),
+    ("Wood",      "TSLA",  98000, 28420,   86000, 24940,  290.0, 290.0, "UNLOADING", "Trimmed #1 holding"),
+    ("Wood",      "PLTR",  18000,  2358,   14000,  1834,  131.0, 131.0, "UNLOADING", "Trimmed Palantir"),
+    ("Wood",      "HOOD",   4800,   432,    6000,   540,   90.0,  90.0, "LOADING+",  "+24.9% Robinhood"),
+    # ── EINHORN ─────────────────────────────────────────────────────
+    ("Einhorn",   "GRBK",  18000,   486,   22600,   611,   27.0,  27.0, "LOADING+",  "Added Green Brick homebuilder"),
+    ("Einhorn",   "FLR",    8400,   210,    8800,   222,   25.0,  25.2, "HOLD",      "Fluor engineering unchanged"),
+    ("Einhorn",   "CNR",    7200,   180,    7800,   195,   25.0,  25.0, "LOADING+",  "Added Core Natural coal"),
+    # ── KLARMAN ─────────────────────────────────────────────────────
+    ("Klarman",   "QSR",    4050,   304,    8253,   529,   75.1,  64.1, "LOADING++", "+4.2M shares doubled Restaurant Brands"),
+    ("Klarman",   "AMZN",   3200,   640,    3240,   649,  200.0, 200.3, "HOLD",      "#1 Amazon unchanged 12.7%"),
+    ("Klarman",   "ELV",     616,   217,    1319,   426,  352.3, 323.0, "LOADING++", "Doubled Elevance Health"),
+    ("Klarman",   "WCC",    3800,   380,    3900,   393,  100.0, 100.8, "HOLD",      "WESCO unchanged 7.7%"),
+    ("Klarman",   "UNP",    1800,   356,    1880,   374,  197.8, 198.9, "HOLD",      "Union Pacific 7.3% unchanged"),
+    # ── GRIFFIN/CITADEL ─────────────────────────────────────────────
+    ("Griffin",   "NVDA",  42000,  5700,   51000,  7140,  135.7, 140.0, "LOADING+",  "Added NVDA calls + equity"),
+    ("Griffin",   "AAPL",  38000,  6250,   40000,  7160,  164.5, 179.0, "LOADING+",  "Added Apple position"),
+    ("Griffin",   "MSFT",  22000,  8250,   24000,  9120,  375.0, 380.0, "LOADING+",  "Added Microsoft cloud"),
+]
+
+# Computed helper -- action color/emoji mapping
+QOQ_ACTION_MAP = {
+    "LOADING+++": ("🔥🔥🔥", "green"),
+    "LOADING++":  ("🔥🔥",   "green"),
+    "LOADING+":   ("🟢",     "green"),
+    "HOLD":       ("⚪",     "gray"),
+    "UNLOADING":  ("🔴",     "red"),
+    "INITIATE":   ("🆕",     "blue"),
+    "EXITED":     ("💀",     "black"),
+}
+
+async def legends_menu(query):
+    btns = []
+    row = []
+    for k, label in LEGEND_LABELS.items():
+        row.append(InlineKeyboardButton(label, callback_data=f"legend_detail_{k}"))
+        if len(row) == 3:
+            btns.append(row); row = []
+    if row:
+        btns.append(row)
+    btns.append([InlineKeyboardButton("Consensus - What Most Are Buying", callback_data="legends_consensus")])
+    btns.append([InlineKeyboardButton("Future Catches - Hidden Gems", callback_data="legends_future")])
+    btns.append([InlineKeyboardButton("QoQ Tracker -- Loading & Unloading", callback_data="legends_qoq")])
+    btns.append([BACK_BTN])
+    await query.message.reply_text(
+        hdr("LEGENDARY INVESTORS Q1 2026") + "\n\n"
+        + "<b>13F Filings - Mar 31 2026</b>\n"
+        + "Select investor for buys/sells, options, themes.\n\n"
+        + "<i>Source: SEC 13F (45-day lag)</i>",
+        parse_mode=H, reply_markup=InlineKeyboardMarkup(btns))
+
+
+async def legends_qoq(query):
+    """Quarter-over-quarter position tracker: loading, unloading, net $ change, avg price."""
+    parts = [hdr("QoQ TRACKER Q4-2025 vs Q1-2026")]
+    parts.append("<b>Position Loading / Unloading + Net $ + Avg Price</b>\n")
+
+    loading   = [r for r in LEGENDS_QOQ if "LOADING" in r[8]]
+    exited    = [r for r in LEGENDS_QOQ if r[8] == "EXITED"]
+    initiated = [r for r in LEGENDS_QOQ if r[8] == "INITIATE"]
+    unloading = [r for r in LEGENDS_QOQ if r[8] == "UNLOADING"]
+
+    def _val_chg(r):
+        return r[5] - r[3]  # Q1_val_M - Q4_val_M
+
+    # ── Top Loaders ─────────────────────────────────────────────
+    parts.append(shdr("BIGGEST LOADERS (adding most)"))
+    rows = []
+    top_load = sorted(loading, key=lambda r: _val_chg(r), reverse=True)[:10]
+    for r in top_load:
+        em, _ = QOQ_ACTION_MAP.get(r[8], ("🟢","green"))
+        net_m = _val_chg(r)
+        avg_q1 = f"${r[7]:.1f}" if r[7] > 0 else "new"
+        rows.append(f"{em} <b>{r[0]}: {r[1]}</b>  +${net_m:.0f}M")
+        rows.append(mono(f"  AvgPx:{avg_q1} | {r[9][:36]}"))
+    parts.append("\n".join(rows))
+
+    # ── New Positions ──────────────────────────────────────────
+    parts.append("\n" + shdr("NEW POSITIONS THIS QUARTER"))
+    rows = []
+    for r in initiated[:8]:
+        rows.append(f"🆕 <b>{r[0]}: {r[1]}</b>  ${r[5]:.0f}M @ ${r[7]:.1f}")
+        rows.append(mono(f"  {r[9][:44]}"))
+    parts.append("\n".join(rows))
+
+    # ── Top Unloaders ─────────────────────────────────────────
+    parts.append("\n" + shdr("BIGGEST UNLOADERS (selling most)"))
+    rows = []
+    top_out = sorted(unloading + exited, key=lambda r: _val_chg(r))[:8]
+    for r in top_out:
+        em, _ = QOQ_ACTION_MAP.get(r[8], ("🔴","red"))
+        net_m = _val_chg(r)
+        rows.append(f"{em} <b>{r[0]}: {r[1]}</b>  ${net_m:.0f}M")
+        rows.append(mono(f"  {r[9][:44]}"))
+    parts.append("\n".join(rows))
+
+    # ── Full Exits ────────────────────────────────────────────
+    parts.append("\n" + shdr("FULL EXITS THIS QUARTER"))
+    rows = []
+    for r in exited:
+        rows.append(f"💀 <b>{r[0]}: {r[1]}</b>  was ${r[3]:.0f}M @ avg ${r[6]:.1f}")
+    parts.append("\n".join(rows))
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("All Legends", callback_data="menu_legends"),
+         InlineKeyboardButton("Consensus",   callback_data="legends_consensus")],
+        [BACK_BTN],
+    ])
+    await _safe_reply(query.message, "\n".join(parts), reply_markup=kb)
+
+
+async def legends_future(query):
+    fc = LEGENDS_FUTURE_CATCHES
+    parts = [hdr("FUTURE CATCHES Q1 2026")]
+    parts.append("<b>Small/Mid Caps Legendary Investors Are Betting On</b>\n")
+    parts.append(shdr("TOP FUTURE POTENTIAL PICKS"))
+    rows = []
+    for tk, name, cap, sector, thesis, who, potential, risk in fc[:12]:
+        rows.append("[" + sector[:6] + "] <b>" + tk + "</b> " + cap)
+        rows.append(mono("  " + who[:22] + " | " + potential[:18]))
+        rows.append(mono("  " + thesis[:44]))
+    parts.append("\n".join(rows))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Consensus", callback_data="legends_consensus"),
+         InlineKeyboardButton("All Legends", callback_data="menu_legends")],
+        [BACK_BTN],
+    ])
+    await _safe_reply(query.message, "\n".join(parts), reply_markup=kb)
+
+
+async def legend_detail(query, key):
+    d = LEGENDS_DATA.get(key)
+    if not d:
+        await query.message.reply_text("Not found.", reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
+        return
+
+    parts = [hdr(d["name"].upper())]
+    parts.append(
+        "<b>" + d["firm"] + "</b> " + d["aum"] + "\n"
+        + "Style: " + d["style"] + "\n"
+        + "Filed: " + d["filed"] + " | " + d["period"]
+    )
+
+    if d["buys"]:
+        parts.append("\n" + shdr("ADDITIONS / NEW BUYS"))
+        rows = []
+        for b in d["buys"]:
+            tag = "[NEW]" if b["action"] == "New" else "[ADD]"
+            val = " " + b["value"] if b["value"] else ""
+            rows.append(tag + " <b>" + b["ticker"] + "</b>" + val)
+            rows.append(mono("  " + b["note"][:44]))
+        parts.append("\n".join(rows))
+
+    if d["sells"]:
+        parts.append("\n" + shdr("EXITS / REDUCTIONS"))
+        rows = []
+        for s in d["sells"]:
+            rows.append("[OUT] <b>" + s["ticker"] + "</b>")
+            rows.append(mono("  " + s["note"][:44]))
+        parts.append("\n".join(rows))
+
+    if d["options"]:
+        parts.append("\n" + shdr("OPTIONS POSITIONS"))
+        rows = []
+        for o in d["options"]:
+            rows.append("[" + o["type"] + "] <b>" + o["ticker"] + "</b> exp " + o["expiry"])
+            rows.append(mono("  " + o["note"][:44]))
+        parts.append("\n".join(rows))
+
+    if d["top_holdings"]:
+        parts.append("\n" + shdr("TOP HOLDINGS"))
+        parts.append("  ".join("<b>" + tk + "</b> " + pct for tk, pct in d["top_holdings"]))
+
+    parts.append("\n" + shdr("THEME"))
+    parts.append(d["theme"])
+    parts.append("\n" + shdr("SIGNAL"))
+    parts.append(d["signal"])
+    parts.append("\n" + shdr("INSIGHT"))
+    parts.append(d["insight"])
+
+    keys = LEGEND_KEYS
+    idx = keys.index(key)
+    nav = []
+    if idx > 0:
+        pk = keys[idx - 1]
+        nav.append(InlineKeyboardButton("< " + LEGEND_LABELS[pk], callback_data="legend_detail_" + pk))
+    if idx < len(keys) - 1:
+        nk = keys[idx + 1]
+        nav.append(InlineKeyboardButton(LEGEND_LABELS[nk] + " >", callback_data="legend_detail_" + nk))
+    btns = []
+    if nav:
+        btns.append(nav)
+    btns.append([InlineKeyboardButton("Consensus", callback_data="legends_consensus"),
+                 InlineKeyboardButton("All Legends", callback_data="menu_legends")])
+    btns.append([BACK_BTN])
+    await _safe_reply(query.message, "\n".join(parts), reply_markup=InlineKeyboardMarkup(btns))
+
+
+async def legends_consensus(query):
+    c = LEGENDS_CONSENSUS
+    parts = [hdr("LEGENDS CONSENSUS Q1 2026")]
+    parts.append("<b>What Most Legendary Investors Are Buying</b>\n")
+
+    parts.append(shdr("MOST BOUGHT (legends count)"))
+    rows = []
+    for tk, count, note in c["most_bought"]:
+        bar_s = "#" * count + "." * (7 - count)
+        rows.append("<b>" + f"{tk:<5}" + "</b> " + bar_s + " " + str(count) + "/7")
+        rows.append(mono("  " + note[:44]))
+    parts.append("\n".join(rows))
+
+    parts.append("\n" + shdr("MOST SOLD / EXITED"))
+    rows = []
+    for tk, count, note in c["most_sold"]:
+        rows.append("[OUT] <b>" + tk + "</b> (" + str(count) + " legends)")
+        rows.append(mono("  " + note[:44]))
+    parts.append("\n".join(rows))
+
+    parts.append("\n" + shdr("OPTIONS ACTIVITY"))
+    rows = []
+    for ticker_type, who, expiry, note in c["options_activity"]:
+        kind = "PUT" if "PUT" in ticker_type else "CALL"
+        rows.append("[" + kind + "] <b>" + ticker_type + "</b> " + who)
+        rows.append(mono("  Exp:" + expiry + " " + note[:28]))
+    parts.append("\n".join(rows))
+
+    parts.append("\n" + shdr("MACRO THEMES Q1 2026"))
+    for theme, detail in c["macro_themes"]:
+        parts.append("> <b>" + theme + "</b>")
+        parts.append(mono("  " + detail[:44]))
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("All Legends", callback_data="menu_legends")],
+        [BACK_BTN],
+    ])
+    await _safe_reply(query.message, "\n".join(parts), reply_markup=kb)
+
 
 # ═══════════════════════════════════════════════════════════
 #  8) QUICK QUOTE — full OHLCV, 52W, fundamentals
@@ -23425,6 +24711,17 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await live_predictor_view(query)
         elif data == "menu_whales":
             await whales_view(query)
+        elif data == "menu_legends":
+            await legends_menu(query)
+        elif data == "legends_consensus":
+            await legends_consensus(query)
+        elif data.startswith("legend_detail_"):
+            key = data.replace("legend_detail_", "")
+            await legend_detail(query, key)
+        elif data == "legends_future":
+            await legends_future(query)
+        elif data == "legends_qoq":
+            await legends_qoq(query)
         elif data == "insider_congress":
             await congress_trades(query)
         elif data == "insider_insider":
@@ -27246,6 +28543,8 @@ def main():
         log.info("Scheduled 15-min intraday OI alert")
         # 10-min position monitor (fires during market hours; deduplicates via bot_data state)
         job_queue.run_repeating(position_monitor, interval=600, first=60)
+        job_queue.run_repeating(position_alerts, interval=300, first=90)
+        log.info("Scheduled 5-min smart position alerts")
         log.info("Scheduled 10-min position health monitor")
 
     # Auto-close any positions that expired before bot started
