@@ -5401,8 +5401,15 @@ def analyze_inst_signals(ticker, conn):
         put_oi=("openInt_Put_now", "sum"),
     ).reset_index()
     by_s["total_oi"] = by_s["call_oi"] + by_s["put_oi"]
-    mean_oi = by_s["total_oi"].mean()
-    walls = by_s[by_s["total_oi"] >= mean_oi * 2.0].sort_values("total_oi", ascending=False).head(6)
+    # Filter to ±20% of OI-weighted ATM before computing mean — prevents deep-ITM
+    # hedges (far from spot) from corrupting the threshold and misidentifying walls
+    _atm_anchor = float((by_s["strike"] * by_s["total_oi"]).sum() / by_s["total_oi"].sum()) \
+                  if by_s["total_oi"].sum() > 0 else float(by_s["strike"].median())
+    _by_s_near = by_s[by_s["strike"].between(_atm_anchor * 0.80, _atm_anchor * 1.20)]
+    if _by_s_near.empty:
+        _by_s_near = by_s
+    mean_oi = _by_s_near["total_oi"].mean()
+    walls = _by_s_near[_by_s_near["total_oi"] >= mean_oi * 2.0].sort_values("total_oi", ascending=False).head(6)
     for _, w in walls.iterrows():
         c, p = float(w["call_oi"]), float(w["put_oi"])
         wtype = "CALL" if c > p * 1.5 else ("PUT" if p > c * 1.5 else "BOTH")
@@ -16822,8 +16829,15 @@ def analyze_inst_signals(ticker, conn):
         put_oi=("openInt_Put_now", "sum"),
     ).reset_index()
     by_s["total_oi"] = by_s["call_oi"] + by_s["put_oi"]
-    mean_oi = by_s["total_oi"].mean()
-    walls = by_s[by_s["total_oi"] >= mean_oi * 2.0].sort_values("total_oi", ascending=False).head(6)
+    # Filter to ±20% of OI-weighted ATM before computing mean — prevents deep-ITM
+    # hedges (far from spot) from corrupting the threshold and misidentifying walls
+    _atm_anchor = float((by_s["strike"] * by_s["total_oi"]).sum() / by_s["total_oi"].sum()) \
+                  if by_s["total_oi"].sum() > 0 else float(by_s["strike"].median())
+    _by_s_near = by_s[by_s["strike"].between(_atm_anchor * 0.80, _atm_anchor * 1.20)]
+    if _by_s_near.empty:
+        _by_s_near = by_s
+    mean_oi = _by_s_near["total_oi"].mean()
+    walls = _by_s_near[_by_s_near["total_oi"] >= mean_oi * 2.0].sort_values("total_oi", ascending=False).head(6)
     for _, w in walls.iterrows():
         c, p = float(w["call_oi"]), float(w["put_oi"])
         wtype = "CALL" if c > p * 1.5 else ("PUT" if p > c * 1.5 else "BOTH")
