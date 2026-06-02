@@ -26486,6 +26486,126 @@ def _el_scan_gamma_walls(conn):
 #   • Position size 1-2% account risk per trade
 # ═══════════════════════════════════════════════════════════════
 
+def _ga_expiry_wall_table(ticker, conn, spot):
+    """
+    Build per-expiry wall table and anomaly detection.
+    Returns (rows, anomalies) where each row is a dict with
+    expiry, dte, cw, cw_str, cw_dist, pw, pw_str, pw_dist, zone.
+    anomalies is a list of warning strings.
+    """
+    from datetime import datetime as _dt, date as _date
+    td = conn.execute(
+        "SELECT trade_date_now FROM options_change "
+        "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1"
+    ).fetchone()
+    if not td:
+        return [], []
+    today_str = td[0]
+    try:
+        tp = today_str.split("-")
+        today_dt = _date(int(tp[2]), int(tp[0]), int(tp[1]))
+    except Exception:
+        today_dt = _date.today()
+
+    df = pd.read_sql(
+        "SELECT strike, expiry_date, openInt_Call_now, openInt_Put_now "
+        "FROM options_change WHERE ticker=? AND trade_date_now=? "
+        "AND (openInt_Call_now>0 OR openInt_Put_now>0)",
+        conn, params=(ticker.upper(), today_str))
+    if df.empty:
+        return [], []
+    for c in ["strike", "openInt_Call_now", "openInt_Put_now"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    def _exp_key(d):
+        try:
+            p = str(d).split("-")
+            return (int(p[2]), int(p[0]), int(p[1]))
+        except Exception:
+            return (9999, 99, 99)
+
+    def _exp_date(d):
+        try:
+            p = str(d).split("-")
+            return _date(int(p[2]), int(p[0]), int(p[1]))
+        except Exception:
+            return None
+
+    all_exps = sorted(df["expiry_date"].dropna().unique(), key=_exp_key)
+    future_exps = [e for e in all_exps if (_exp_date(e) or _date.min) >= today_dt]
+
+    rows = []
+    for ex in future_exps:
+        eg = df[df["expiry_date"] == ex].copy()
+        if len(eg) < 3:
+            continue
+        ea_c = eg["openInt_Call_now"].mean()
+        ea_p = eg["openInt_Put_now"].mean()
+        if ea_c == 0 or ea_p == 0:
+            continue
+        wc = eg[(eg["openInt_Call_now"] >= ea_c * 2.5) & (eg["strike"] >= spot)].sort_values("openInt_Call_now", ascending=False)
+        if wc.empty:
+            wc = eg[eg["openInt_Call_now"] >= ea_c * 2.5].sort_values("openInt_Call_now", ascending=False)
+        wp = eg[(eg["openInt_Put_now"] >= ea_p * 2.5) & (eg["strike"] <= spot)].sort_values("openInt_Put_now", ascending=False)
+        if wp.empty:
+            wp = eg[eg["openInt_Put_now"] >= ea_p * 2.5].sort_values("openInt_Put_now", ascending=False)
+        cw = float(wc["strike"].iloc[0]) if not wc.empty else None
+        pw = float(wp["strike"].iloc[0]) if not wp.empty else None
+        cw_str = float(wc["openInt_Call_now"].max()) / ea_c if cw else 0
+        pw_str = float(wp["openInt_Put_now"].max())  / ea_p if pw else 0
+        ed = _exp_date(ex)
+        dte = (ed - today_dt).days if ed else -1
+        zone = ("IDEAL" if 21 <= dte <= 50 else "NEAR" if 0 < dte < 21 else "FAR" if dte > 50 else "TODAY")
+        rows.append({
+            "expiry": str(ex)[:10], "dte": dte, "zone": zone,
+            "cw": cw, "cw_str": round(cw_str, 1),
+            "cw_dist": round((cw - spot) / spot * 100, 1) if cw else None,
+            "pw": pw, "pw_str": round(pw_str, 1),
+            "pw_dist": round((pw - spot) / spot * 100, 1) if pw else None,
+        })
+
+    # Anomaly detection — put wall and call wall jumps between consecutive expiries
+    anomalies = []
+    for i in range(1, len(rows)):
+        prev, curr = rows[i - 1], rows[i]
+
+        # Put wall drop
+        if prev["pw"] and curr["pw"]:
+            drop = prev["pw"] - curr["pw"]
+            drop_pct = drop / spot * 100 if spot > 0 else 0
+            curr_dist = abs(curr["pw_dist"] or 0)
+            if drop_pct >= 5:
+                if curr_dist >= 20:
+                    tag = "TAIL RISK HEDGE"
+                    note = "Disaster insurance — NOT a price target. Ignore for trading."
+                elif curr_dist >= 10:
+                    tag = "STRUCTURAL HEDGE"
+                    note = "Portfolio protection — funds buy cheaper far-OTM puts with more DTE."
+                else:
+                    tag = "PUT WALL SHIFT"
+                    note = "Possible roll of put positions to lower strikes."
+                anomalies.append(
+                    f"PW DROP {curr['expiry']} ({curr['dte']}d): "
+                    f"${prev['pw']:.0f}→${curr['pw']:.0f} "
+                    f"(-${drop:.0f}, {curr_dist:.1f}% OTM) "
+                    f"[{tag}] {note}"
+                )
+
+        # Call wall jump
+        if prev["cw"] and curr["cw"]:
+            jump = curr["cw"] - prev["cw"]
+            jump_pct = jump / spot * 100 if spot > 0 else 0
+            if jump_pct >= 5:
+                anomalies.append(
+                    f"CW JUMP {curr['expiry']} ({curr['dte']}d): "
+                    f"${prev['cw']:.0f}→${curr['cw']:.0f} "
+                    f"(+${jump:.0f}) "
+                    f"[BLOCK HEDGE] New call hedges/covered calls written far above spot."
+                )
+
+    return rows, anomalies
+
+
 def _ga_get_wall(ticker, conn):
     """Get current call/put wall for ticker. Returns dict or None."""
     td = conn.execute(
@@ -26662,6 +26782,46 @@ async def gamma_advisor_view(query, ticker=None):
             parts.append("\n<b>⚠️ Risks to watch:</b>")
             for w_txt in warnings[:3]:
                 parts.append(f"• {w_txt}")
+
+        # ── Per-expiry wall table ─────────────────────────────
+        _ew_rows, _ew_anomalies = _ga_expiry_wall_table(tk, conn, spot)
+        if _ew_rows:
+            parts.append("\n<b>📅 Wall by Expiry</b>")
+            # Header
+            _tbl = [f"{'Exp':<10} {'DTE':>3} {'CW':>6} {'CWd':>5} {'PW':>6} {'PWd':>6}"]
+            _tbl.append("─" * 42)
+            for _r in _ew_rows[:8]:   # cap at 8 rows for mobile
+                _cw_s = f"${_r['cw']:.0f}" if _r["cw"] else "  —  "
+                _pw_s = f"${_r['pw']:.0f}" if _r["pw"] else "  —  "
+                _cwd  = f"{_r['cw_dist']:+.1f}%" if _r["cw_dist"] is not None else "  — "
+                _pwd  = f"{_r['pw_dist']:+.1f}%" if _r["pw_dist"] is not None else "  — "
+                _z    = "✅" if _r["zone"] == "IDEAL" else ("⚡" if _r["zone"] == "NEAR" else "📌")
+                _tbl.append(f"{_r['expiry']:<10} {_r['dte']:>3} {_cw_s:>6} {_cwd:>5} {_pw_s:>6} {_pwd:>6} {_z}")
+            parts.append(mono("\n".join(_tbl)))
+            parts.append("<i>✅IDEAL(21-50d) ⚡NEAR(&lt;21d) 📌FAR(&gt;50d)</i>")
+
+        # ── Anomaly flags ─────────────────────────────────────
+        if _ew_anomalies:
+            parts.append("\n<b>⚠️ Wall Anomalies</b>")
+            for _an in _ew_anomalies[:4]:
+                # Split at first ] to separate tag from note
+                if "[" in _an and "]" in _an:
+                    _tag_end = _an.index("]")
+                    _header  = _an[:_tag_end + 1]
+                    _note    = _an[_tag_end + 1:].strip()
+                    parts.append(f"• <b>{_header}</b>")
+                    parts.append(f"  <i>{_note}</i>")
+                else:
+                    parts.append(f"• {_an}")
+            # Tail risk explanation if any far-OTM put walls detected
+            _has_tail = any("TAIL RISK" in a for a in _ew_anomalies)
+            _has_struct = any("STRUCTURAL" in a for a in _ew_anomalies)
+            if _has_tail or _has_struct:
+                parts.append(
+                    "\n<i>📖 Normal: longer-DTE puts are bought far OTM as disaster insurance. "
+                    "Use NEAR-term put wall as your real floor. "
+                    "Far-OTM walls are NOT price targets.</i>"
+                )
 
         # Historical context
         parts.append(f"\n<b>📊 Historical (your own data):</b>")

@@ -315,7 +315,8 @@ OHLC_CHECKPOINT   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oh
 def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
                                      call_symbol_col="contractSymbol_Call",
                                      put_symbol_col="contractSymbol_Put",
-                                     max_retries=OHLC_MAX_RETRIES) -> pd.DataFrame:
+                                     max_retries=OHLC_MAX_RETRIES,
+                                     trade_day=None) -> pd.DataFrame:
     # --- Build ATM-filtered symbol set ---
     # Parse spot price from the contract symbols where possible,
     # but use the dataframe's strike column as a proxy for ATM filtering.
@@ -367,20 +368,21 @@ def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
         return df
 
     # Load checkpoint: skip already-fetched symbols
+    # Use trade_day (the market date being processed) not wall-clock date,
+    # so overnight restarts before next market open still resume correctly.
+    today_str = trade_day.strftime("%Y-%m-%d") if trade_day else datetime.now().strftime("%Y-%m-%d")
     info_map = {}
-    checkpoint_date = None
     if os.path.exists(OHLC_CHECKPOINT):
         try:
             with open(OHLC_CHECKPOINT, "r") as f:
                 ckpt = json.load(f)
             checkpoint_date = ckpt.get("date")
-            today_str = datetime.now().strftime("%Y-%m-%d")
             if checkpoint_date == today_str:
                 info_map = ckpt.get("data", {})
                 resumed = sum(1 for s in all_syms if s in info_map)
                 print(f"  Resuming OHLC from checkpoint: {resumed}/{len(all_syms)} already done")
             else:
-                print(f"  Checkpoint is from {checkpoint_date}, starting fresh for today")
+                print(f"  Checkpoint is from {checkpoint_date}, starting fresh for {today_str}")
         except Exception as e:
             print(f"  Could not load OHLC checkpoint: {e}")
 
@@ -420,7 +422,6 @@ def enrich_with_option_ohlc_parallel(df: pd.DataFrame,
     total = len(all_syms)
     rl_count_total = 0
     already_done = total - len(all_syms_todo)
-    today_str = datetime.now().strftime("%Y-%m-%d")
 
     def _save_checkpoint():
         try:
@@ -771,7 +772,7 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
     print(f"Removed {before - after} exact duplicate rows")
 
     print("Enriching options data with per-contract OHLC via yfinance.info ...")
-    df_final = enrich_with_option_ohlc_parallel(df_final)
+    df_final = enrich_with_option_ohlc_parallel(df_final, trade_day=trade_day)
 
     # expiry_date already MM-DD-YYYY from fetch_option_chain; ensure consistent format
     df_final["expiry_date"] = pd.to_datetime(
