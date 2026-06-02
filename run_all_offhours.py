@@ -19,9 +19,12 @@ STATE_FILE = os.path.join(STATE_DIR, "run_all_offhours_last_ok.txt")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# Run gate: execute only after this local hour in RUN_TZ on NYSE trading days.
+# Run gate windows (NY time):
+#   Pre-market  : midnight – PRE_MARKET_END  (targets previous trading day)
+#   Post-close  : POST_CLOSE_START – midnight (targets today)
 RUN_TZ = "America/New_York"
-RUN_AFTER_HOUR = 17
+PRE_MARKET_END   = 9    # 00:00 – 08:59 NY → pull previous trading day EOD
+POST_CLOSE_START = 17   # 17:00+  NY     → pull today's EOD
 
 
 # Anti-sleep flags
@@ -90,24 +93,31 @@ def in_off_hours():
 
 
 def can_run_now_for_gate():
-    """Return (ok, today_ny, now_ny, reason) for configured trading-day run gate."""
+    """Return (ok, target_day, today_ny, now_ny, reason).
+
+    Two allowed windows (NY time):
+      Pre-market  00:00–PRE_MARKET_END   → target = previous trading day
+      Post-close  POST_CLOSE_START–23:59 → target = today (must be trading day)
+    """
     ny_tz = ZoneInfo(RUN_TZ)
     now_ny = datetime.now(ny_tz)
     today_ny = now_ny.date()
+    hour = now_ny.hour
 
-    if not is_trading_day(today_ny):
-        return False, today_ny, now_ny, "Today is not an NYSE trading day"
+    # Pre-market window: midnight up to PRE_MARKET_END
+    if hour < PRE_MARKET_END:
+        prev = last_trading_day_before(today_ny)
+        if prev is None:
+            return False, today_ny, today_ny, now_ny, "No previous trading day found"
+        return True, prev, today_ny, now_ny, f"Pre-market: targeting {prev}"
 
-    gate_time = datetime.combine(
-        today_ny,
-        datetime.min.time(),
-        tzinfo=ny_tz,
-    ).replace(hour=RUN_AFTER_HOUR, minute=0, second=0, microsecond=0)
+    # Post-close window: POST_CLOSE_START onwards, today must be a trading day
+    if hour >= POST_CLOSE_START:
+        if not is_trading_day(today_ny):
+            return False, today_ny, today_ny, now_ny, "Today is not an NYSE trading day"
+        return True, today_ny, today_ny, now_ny, "Post-close: targeting today"
 
-    if now_ny < gate_time:
-        return False, today_ny, now_ny, "Current NY time is before 5:00 PM"
-
-    return True, today_ny, now_ny, "OK"
+    return False, today_ny, today_ny, now_ny, f"Market hours ({hour:02d}:xx NY) — not a run window"
 
 
 def is_trading_day(day: date) -> bool:
@@ -209,7 +219,7 @@ if __name__ == "__main__":
         log_msg("=== SCHEDULER STARTED ===")
         if DRY_RUN:
             log_msg("*** DRY-RUN MODE — jobs will NOT be launched ***")
-        allowed, today_ny, now_ny, reason = can_run_now_for_gate()
+        allowed, target_day, today_ny, now_ny, reason = can_run_now_for_gate()
         log_msg(f"NY now: {now_ny.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
         if not allowed:
@@ -218,8 +228,7 @@ if __name__ == "__main__":
             exit_code = 0
             sys.exit(exit_code)
 
-        target_day = today_ny
-        log_msg(f"Today trading: True, Target: {target_day}")
+        log_msg(f"Gate passed ({reason}), Target: {target_day}")
 
         # 3. Skip if already ran for this day
         if already_ran_for(target_day):
