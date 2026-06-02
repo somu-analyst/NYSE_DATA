@@ -637,7 +637,7 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str_db, trade
                     all_strikes = strikes_series.dropna().unique()
                     all_strikes = np.sort(all_strikes)
                     if len(all_strikes) > 0:
-                        window = 20
+                        window = 25
                         nearest_idx = (np.abs(all_strikes - spot)).argmin()
                         low_idx = max(nearest_idx - window, 0)
                         high_idx = min(nearest_idx + window, len(all_strikes) - 1)
