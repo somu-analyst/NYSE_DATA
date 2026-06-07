@@ -1,4 +1,4 @@
-async def group_stock_detail(query, ticker):
+﻿async def group_stock_detail(query, ticker):
     """Show all open option positions for a stock with per-leg advice (close vs keep)."""
     conn = get_conn()
     try:
@@ -244,6 +244,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import norm
+from wall_engine import compute_walls
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, Bot
 from telegram.ext import (
@@ -7923,8 +7924,13 @@ def _generate_live_vs_eod_chart(ticker, live_data_list, eod_date):
                          bbox=dict(boxstyle="round,pad=0.5", facecolor=sig_col, edgecolor="white", alpha=0.93))
 
             # Per-strike analysis for write-up (gamma walls + max pain proxy)
-            _top_call_row = df.loc[df["openInt_Call"].idxmax()] if len(df) > 0 else None
-            _top_put_row  = df.loc[df["openInt_Put"].idxmax()]  if len(df) > 0 else None
+            # Restrict to ±15% of spot so deep-ITM institutional hedges
+            # (e.g. $310 puts on Jun-18 with spot at $376) don't hijack the wall
+            _df_near = df[df["strike"].between(spot * 0.85, spot * 1.15)] if spot else df
+            if _df_near.empty:
+                _df_near = df
+            _top_call_row = _df_near.loc[_df_near["openInt_Call"].idxmax()] if len(_df_near) > 0 else None
+            _top_put_row  = _df_near.loc[_df_near["openInt_Put"].idxmax()]  if len(_df_near) > 0 else None
             _call_wall    = float(_top_call_row["strike"]) if _top_call_row is not None else 0
             _put_wall     = float(_top_put_row["strike"])  if _top_put_row is not None else 0
             _call_wall_oi = int(_top_call_row["openInt_Call"]) if _top_call_row is not None else 0
@@ -11002,6 +11008,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await congress_trades(query)
         elif data == "insider_insider":
             await insider_trades(query)
+        elif data == "insider_shorts":
+            await short_sellers_view(query)
         elif data == "menu_quote":
             await quote_menu(query)
         elif data.startswith("quote_page_"):
@@ -20446,12 +20454,111 @@ async def oi_build_detail(query, ticker):
 async def insider_menu(query):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🏛 Congress", callback_data="insider_congress"),
-         InlineKeyboardButton("👔 Insider", callback_data="insider_insider")],
+         InlineKeyboardButton("👔 Insider",  callback_data="insider_insider")],
+        [InlineKeyboardButton("🩳 Short Sellers", callback_data="insider_shorts")],
         [BACK_BTN],
     ])
     await query.message.reply_text(
         f"{hdr('📈 INSIDER / CONGRESS')}\n\nSelect a category:",
         parse_mode=H, reply_markup=kb)
+
+
+async def short_sellers_view(query):
+    """Top shorted stocks using yfinance short interest data."""
+    _loading = await query.message.reply_text("Fetching short interest data...", parse_mode=H)
+
+    _WATCH = [
+        "TSLA","NVDA","PLTR","COIN","AMZN","META","NFLX","AMD","SMCI","CRWD",
+        "RIVN","LCID","NIO","BYND","GME","UPST","AFRM","MRNA","RXRX","CRSP",
+        "AI","SOUN","SOFI","W","PTON","BE","VST","SNOW","HOOD","RBLX",
+    ]
+
+    rows = []
+    for tk in _WATCH:
+        try:
+            info = yf.Ticker(tk).info
+            spf  = info.get("shortPercentOfFloat")
+            sr   = info.get("shortRatio")
+            ss   = info.get("sharesShort")
+            ssp  = info.get("sharesShortPriorMonth")
+            if spf and spf < 1:
+                spf = spf * 100
+            if spf is None:
+                continue
+            mom = None
+            if ss and ssp and ssp > 0:
+                mom = (ss - ssp) / ssp * 100
+            sc = 0
+            if spf:
+                sc += 4 if spf >= 30 else (3 if spf >= 20 else (2 if spf >= 10 else 1))
+            if sr:
+                sc += 3 if sr >= 10 else (2 if sr >= 5 else 1)
+            if ss and ssp and ss > ssp * 1.10:
+                sc += 2
+            sc = min(10, sc)
+            rows.append({"tk": tk, "spf": spf, "sr": sr, "mom": mom, "sc": sc})
+        except Exception:
+            pass
+
+    rows.sort(key=lambda x: x["spf"] or 0, reverse=True)
+
+    if not rows:
+        await _loading.edit_text("No short data available.")
+        return
+
+    parts = [hdr("SHORT SELLERS TOP SHORTED")]
+    parts.append(f"<i>{len(rows)} stocks scanned</i>\n")
+
+    parts.append(shdr("SHORT % FLOAT RANKING"))
+    tbl = [f"{'Tkr':<6} {'Shrt%':>5} {'Days':>5} {'MoM':>6} {'Sqz':>3}"]
+    tbl.append("-" * 32)
+    for r in rows[:12]:
+        spf_s = f"{r['spf']:.1f}%" if r['spf'] else "  -- "
+        sr_s  = f"{r['sr']:.0f}d"  if r['sr']  else "  -- "
+        mom_s = f"{r['mom']:+.0f}%" if r['mom'] is not None else "   -- "
+        em    = "[HOT]" if r['sc'] >= 7 else ("[!]" if r['sc'] >= 4 else "   ")
+        tbl.append(f"{r['tk']:<6} {spf_s:>5} {sr_s:>5} {mom_s:>6} {r['sc']:>2}{em}")
+    parts.append(mono("\n".join(tbl)))
+
+    squeeze = [r for r in rows if r["sc"] >= 6]
+    if squeeze:
+        parts.append("\n" + shdr("SQUEEZE CANDIDATES (Score 6+/10)"))
+        for r in squeeze[:4]:
+            mom_tag = ""
+            if r["mom"] is not None:
+                if r["mom"] > 10:
+                    mom_tag = f" RISING +{r['mom']:.0f}%"
+                elif r["mom"] < -10:
+                    mom_tag = f" COVERING {r['mom']:.0f}% -- TRIGGER"
+            parts.append(
+                "[HOT] <b>" + r["tk"] + "</b> "
+                + mono(f"Short:{r['spf']:.1f}% Days:{(r['sr'] or 0):.0f}d Sqz:{r['sc']}/10{mom_tag}")
+            )
+
+    covering = sorted([r for r in rows if r["mom"] is not None and r["mom"] < -10], key=lambda x: x["mom"])
+    if covering:
+        parts.append("\n" + shdr("COVERING -- Watch for Rally"))
+        for r in covering[:4]:
+            parts.append("[UP] <b>" + r["tk"] + f"</b> {r['spf']:.1f}% | {r['mom']:+.0f}% MoM")
+
+    rising = sorted([r for r in rows if r["mom"] is not None and r["mom"] > 15],
+                    key=lambda x: x["mom"] or 0, reverse=True)
+    if rising:
+        parts.append("\n" + shdr("RISING SHORTS -- Bearish Conviction"))
+        for r in rising[:4]:
+            parts.append("[DN] <b>" + r["tk"] + f"</b> {r['spf']:.1f}% | +{r['mom']:.0f}% MoM")
+
+    parts.append("\n<i>Shrt%=float sold short | Days=days-to-cover\nSqz=squeeze risk 0-10 | Source:Yahoo bi-monthly</i>")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Insider Menu", callback_data="menu_insider")],
+        [BACK_BTN],
+    ])
+    try:
+        await _loading.delete()
+    except Exception:
+        pass
+    await _safe_reply(query.message, "\n".join(parts), reply_markup=kb)
 
 async def congress_trades(query):
     conn = get_conn()

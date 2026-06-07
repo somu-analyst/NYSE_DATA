@@ -19,6 +19,7 @@ import yfinance as yf
 from scipy.stats import norm
 import math
 import warnings, sys, os
+from wall_engine import compute_walls
 
 warnings.filterwarnings("ignore")
 
@@ -5696,7 +5697,7 @@ elif page == "📈 Insider / Congress / Whales":
         with st.popover("ℹ️"):
             st.markdown(_PAGE_HELP.get(page, ""))
 
-    tab1, tab2, tab3, tab4 = st.tabs(["👤 Insider Trades", "🏛️ Congress Trades", "🐋 Whale Holdings", "🏆 Legendary Investors (13F)"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["👤 Insider Trades", "🏛️ Congress Trades", "🐋 Whale Holdings", "🏆 Legendary Investors (13F)", "🩳 Short Sellers"])
 
     with tab1:
         insiders = q("SELECT * FROM insider_trades ORDER BY transaction_date DESC")
@@ -6273,6 +6274,227 @@ elif page == "📈 Insider / Congress / Whales":
         except Exception:
             pass
 
+
+
+    # ── Tab 5: Short Sellers ────────────────────────────────────
+    with tab5:
+        st.markdown("### 🩳 Short Sellers — Most Shorted Stocks")
+        st.caption("Short interest, days-to-cover, float %, squeeze score. Source: Yahoo Finance (bi-monthly SEC update).")
+
+        _SHORT_UNIVERSE = {
+            "Mega Cap / High Profile": ["TSLA","AAPL","NVDA","AMZN","MSFT","META","GOOGL","NFLX","PLTR","COIN","AMD","SMCI","CRWD","SNOW","UBER"],
+            "EV / Clean Energy":       ["RIVN","LCID","NIO","PLUG","CHPT","BLNK","FSLR","ENPH","ARRY","BE","VST","CEG","NRG"],
+            "Biotech / Pharma":        ["MRNA","BNTX","RXRX","CRSP","NVAX","SAVA","VKTX","GILD","BIIB","SMMT","ACHR","IONS"],
+            "Retail / Consumer":       ["GME","AMC","BYND","LULU","CPNG","W","ETSY","RH","PTON","WOLF","PRTY","REAL"],
+            "Financials / Fintech":    ["UPST","AFRM","OPEN","NAVI","PFSI","UWMC","RKT","SFT","CURO","PRAA","LC","SOFI"],
+            "AI / Tech Mid-Cap":       ["AI","BBAI","SOUN","ARQQ","AMBA","MKSI","FORM","AIOT","AEHR","SPWR","LAZR","MVIS"],
+            "Energy / Commodities":    ["GEVO","AMRC","CLNE","MAXN","NOVA","STEM","TELL","HYLN","HOUS","SPCE","JOBY"],
+            "Your Tickers (DB)":       [],
+        }
+        try:
+            _db_tickers = q("SELECT DISTINCT ticker FROM options_change ORDER BY ticker")["ticker"].tolist()
+            _SHORT_UNIVERSE["Your Tickers (DB)"] = _db_tickers[:30]
+        except Exception:
+            pass
+
+        _sc1, _sc2, _sc3 = st.columns([2, 1, 1])
+        with _sc1:
+            _sel_group = st.selectbox("Stock Group", list(_SHORT_UNIVERSE.keys()), key="short_group")
+        with _sc2:
+            _min_short_pct = st.slider("Min Short % Float", 0, 30, 3, 1, key="short_min_pct")
+        with _sc3:
+            _sort_by = st.selectbox("Sort By", ["Short % Float","Short Ratio","Squeeze Score","MoM Chg %"], key="short_sort")
+
+        _tickers_to_scan = _SHORT_UNIVERSE.get(_sel_group, [])
+        if not _tickers_to_scan:
+            st.info("No tickers in this group.")
+        else:
+            if st.button("🔍 Scan Short Interest", type="primary", key="short_scan_btn"):
+                with st.spinner(f"Fetching short data for {len(_tickers_to_scan)} stocks..."):
+                    _short_rows = []
+                    _prog = st.progress(0)
+                    for _si_i, _stk in enumerate(_tickers_to_scan):
+                        try:
+                            _si = _get_short_data_dash(_stk)
+                            _spf = _si.get("short_pct_float")
+                            _sr  = _si.get("short_ratio")
+                            _ss  = _si.get("shares_short")
+                            _ssp = _si.get("shares_short_prior")
+                            _flt = _si.get("float_shares")
+                            _sc2v= _si.get("squeeze_score", 0)
+                            _sl  = _si.get("squeeze_label", "LOW")
+                            if _spf is None or _spf < _min_short_pct:
+                                continue
+                            _mom = None
+                            if _ss and _ssp and _ssp > 0:
+                                _mom = (_ss - _ssp) / _ssp * 100
+                            try:
+                                _inf = yf.Ticker(_stk).info
+                                _px   = _inf.get("currentPrice") or _inf.get("regularMarketPrice") or 0
+                                _mcap = _inf.get("marketCap") or 0
+                                _name = _inf.get("shortName", _stk)[:22]
+                                _sect = _inf.get("sector", "—")
+                            except Exception:
+                                _px=0; _mcap=0; _name=_stk; _sect="—"
+                            def _fmts(n):
+                                if not n: return "—"
+                                if n>=1e9: return f"{n/1e9:.2f}B"
+                                if n>=1e6: return f"{n/1e6:.1f}M"
+                                return f"{n:,.0f}"
+                            _short_rows.append({
+                                "Ticker":        _stk,
+                                "Name":          _name,
+                                "Sector":        _sect,
+                                "Price":         round(_px,2) if _px else None,
+                                "Mkt Cap":       _fmts(_mcap),
+                                "Short % Float": round(_spf,1) if _spf else None,
+                                "Short Ratio":   round(_sr,1) if _sr else None,
+                                "Shares Short":  _fmts(_ss),
+                                "Float":         _fmts(_flt),
+                                "MoM Chg %":     round(_mom,1) if _mom is not None else None,
+                                "Squeeze Score": _sc2v,
+                                "Squeeze Risk":  _sl,
+                                "_spf":  _spf or 0,
+                                "_sr":   _sr or 0,
+                                "_sc":   _sc2v,
+                                "_mom":  _mom or 0,
+                            })
+                        except Exception:
+                            pass
+                        _prog.progress((_si_i+1)/len(_tickers_to_scan))
+                    _prog.empty()
+
+                st.session_state["_short_df_result"] = _short_rows
+                st.session_state["_short_group_used"] = _sel_group
+
+            # Display if results cached
+            _cached = st.session_state.get("_short_df_result", [])
+            if _cached:
+                _sdf = pd.DataFrame(_cached)
+                _sort_col = {"Short % Float":"_spf","Short Ratio":"_sr","Squeeze Score":"_sc","MoM Chg %":"_mom"}.get(_sort_by,"_spf")
+                _sdf = _sdf.sort_values(_sort_col, ascending=False).reset_index(drop=True)
+
+                # Summary
+                _sm1,_sm2,_sm3,_sm4,_sm5 = st.columns(5)
+                _sm1.metric("Stocks Found", len(_sdf))
+                _sm2.metric("Short % ≥ 20%",  len(_sdf[_sdf["_spf"]>=20]), delta="Heavy shorts")
+                _sm3.metric("Squeeze Risk ≥7", len(_sdf[_sdf["_sc"]>=7]),  delta="🔥 Watch")
+                _sm4.metric("Rising Short ↑",  len(_sdf[_sdf["_mom"]>10]), delta="Bearish signal")
+                _sm5.metric("Covering ↓",      len(_sdf[_sdf["_mom"]<-10]),delta="Squeeze trigger")
+
+                # Styled table
+                def _srow(row):
+                    sc=row.get("Squeeze Score",0) or 0
+                    spf=row.get("Short % Float",0) or 0
+                    mom=row.get("MoM Chg %",0) or 0
+                    if sc>=7:   return ["background-color:#4a1a00;color:#ffddaa;font-weight:700"]*len(row)
+                    if spf>=25: return ["background-color:#3a0a0a;color:#ffcccc;font-weight:600"]*len(row)
+                    if spf>=15: return ["background-color:#2a1a00;color:#ffe0aa"]*len(row)
+                    if mom>15:  return ["background-color:#0a0a2a;color:#aaaaff"]*len(row)
+                    return [""]*len(row)
+
+                _disp_cols = ["Ticker","Name","Sector","Price","Mkt Cap","Short % Float","Short Ratio","Shares Short","MoM Chg %","Squeeze Score","Squeeze Risk"]
+                st.dataframe(
+                    _sdf[_disp_cols].style.apply(_srow,axis=1).format({
+                        "Short % Float": lambda v: f"{v:.1f}%" if v else "—",
+                        "Short Ratio":   lambda v: f"{v:.1f}d"  if v else "—",
+                        "MoM Chg %":     lambda v: f"{v:+.1f}%" if v else "—",
+                        "Price":         lambda v: f"${v:.2f}"  if v else "—",
+                    }),
+                    hide_index=True, use_container_width=True
+                )
+                st.caption("🟧 Orange = Squeeze Score ≥7  |  🟥 Red = Short % ≥25%  |  🟨 Amber = 15-25%  |  🟦 Blue = Rising short interest +15%")
+
+                # Squeeze candidates
+                _sqdf = _sdf[_sdf["_sc"]>=5].head(5)
+                if not _sqdf.empty:
+                    st.markdown("---")
+                    st.markdown("#### 🔥 Squeeze Candidates (Score ≥ 5/10)")
+                    st.caption("High short float + high days-to-cover + rising shorts = squeeze setup to watch.")
+                    for _, _sqr in _sqdf.iterrows():
+                        _spf2=_sqr.get("Short % Float") or 0
+                        _sr2 =_sqr.get("Short Ratio") or 0
+                        _mom2=_sqr.get("MoM Chg %") or 0
+                        _sc2v2=_sqr.get("Squeeze Score") or 0
+                        with st.container(border=True):
+                            _q1,_q2 = st.columns([1,3])
+                            with _q1:
+                                st.markdown(f"### {'🔥' if _sc2v2>=8 else '⚠️'} {_sqr['Ticker']}")
+                                st.markdown(f"Score: **{_sc2v2}/10**")
+                            with _q2:
+                                st.markdown(f"**{_sqr['Name']}** | {_sqr['Sector']}")
+                                _why2=[]
+                                if _spf2>=20: _why2.append(f"**{_spf2:.1f}% of float shorted** — heavily crowded")
+                                if _sr2>=5:   _why2.append(f"**{_sr2:.0f} days to cover** — slow exit = squeeze fuel")
+                                if _mom2>10:  _why2.append(f"Short interest **rising +{_mom2:.0f}% MoM** — conviction growing")
+                                elif _mom2<-10: _why2.append(f"Short interest **falling {_mom2:.0f}% MoM** — COVERING = trigger")
+                                for _w2 in _why2: st.markdown(f"  ▪ {_w2}")
+
+                # Charts
+                st.markdown("---")
+                _ch1,_ch2 = st.columns(2)
+                with _ch1:
+                    st.markdown("#### 📊 Short % of Float — Top 15")
+                    _top_spf = _sdf.nlargest(15,"_spf")[["Ticker","_spf"]].copy()
+                    _fig_spf = px.bar(_top_spf,x="_spf",y="Ticker",orientation="h",
+                                      color="_spf",color_continuous_scale=["#ffd600","#ff6d00","#ff1744"],
+                                      text=_top_spf["_spf"].apply(lambda v: f"{v:.1f}%"),
+                                      labels={"_spf":"Short % Float"})
+                    _fig_spf.update_traces(textposition="outside")
+                    _fig_spf.add_vline(x=10,line=dict(color="#26a69a",dash="dash",width=1),annotation_text="10%",annotation_font_color="#26a69a")
+                    _fig_spf.add_vline(x=20,line=dict(color="#ff5252",dash="dash",width=1),annotation_text="20%",annotation_font_color="#ff5252")
+                    _fig_spf.update_layout(template="plotly_dark",height=380,showlegend=False,coloraxis_showscale=False,
+                                           yaxis={"categoryorder":"total ascending"},margin=dict(t=10,b=10,l=10,r=60))
+                    st.plotly_chart(_fig_spf, use_container_width=True)
+
+                with _ch2:
+                    st.markdown("#### 📅 Days to Cover — Top 15")
+                    _top_sr = _sdf[_sdf["_sr"]>0].nlargest(15,"_sr")[["Ticker","_sr"]].copy()
+                    if not _top_sr.empty:
+                        _fig_sr = px.bar(_top_sr,x="_sr",y="Ticker",orientation="h",
+                                         color="_sr",color_continuous_scale=["#1565C0","#6a1b9a","#b71c1c"],
+                                         text=_top_sr["_sr"].apply(lambda v: f"{v:.1f}d"),
+                                         labels={"_sr":"Days to Cover"})
+                        _fig_sr.update_traces(textposition="outside")
+                        _fig_sr.add_vline(x=5,line=dict(color="#ff5252",dash="dash",width=1),annotation_text="5d",annotation_font_color="#ff5252")
+                        _fig_sr.update_layout(template="plotly_dark",height=380,showlegend=False,coloraxis_showscale=False,
+                                              yaxis={"categoryorder":"total ascending"},margin=dict(t=10,b=10,l=10,r=60))
+                        st.plotly_chart(_fig_sr, use_container_width=True)
+
+                # MoM change chart
+                _mom_df = _sdf[_sdf["_mom"].abs()>0].copy()
+                if not _mom_df.empty:
+                    st.markdown("#### 📈 Month-over-Month Short Interest Change")
+                    st.caption("🔴 Rising = more bears piling in. 🟢 Falling = shorts covering — watch for squeeze trigger.")
+                    _mom_top = pd.concat([_mom_df.nlargest(8,"_mom"),_mom_df.nsmallest(8,"_mom")]).drop_duplicates("Ticker").sort_values("_mom")
+                    _fig_mom = px.bar(_mom_top,x="_mom",y="Ticker",orientation="h",
+                                      color="_mom",color_continuous_scale=["#26a69a","#78909c","#ef5350"],
+                                      color_continuous_midpoint=0,
+                                      text=_mom_top["_mom"].apply(lambda v: f"{v:+.1f}%"),
+                                      labels={"_mom":"MoM Change %"})
+                    _fig_mom.update_traces(textposition="outside")
+                    _fig_mom.add_vline(x=0,line=dict(color="#FFD700",width=1.5))
+                    _fig_mom.update_layout(template="plotly_dark",height=380,showlegend=False,coloraxis_showscale=False,
+                                           yaxis={"categoryorder":"total ascending"},margin=dict(t=10,b=10,l=10,r=70))
+                    st.plotly_chart(_fig_mom, use_container_width=True)
+
+                # Legend
+                st.markdown("---")
+                st.markdown("""
+#### 📖 How to Read Short Data
+| Metric | What it means | Red flag |
+|---|---|---|
+| **Short % Float** | % of freely tradeable shares sold short | ≥20% = heavily crowded |
+| **Short Ratio** | Days to unwind at avg daily volume | ≥5d = squeeze risk |
+| **MoM Change %** | Month-over-month short interest change | +15%↑ = bears increasing |
+| **Squeeze Score** | Combined risk score 0-10 | ≥7 = high squeeze potential |
+
+**Trading signals:**
+- 📈 **Rising shorts + falling price** → Bearish conviction, trend likely continuing
+- 📉 **Rising shorts + rising price** → Short squeeze building, explosive upside risk
+- 🔄 **Falling shorts (covering)** → Covering rally likely, reduce bearish bets
+- ⚠️ **Short % >25%** → Avoid new shorts — too crowded, reversal risk high
+                """)
 
 # ===================================================================
 # ──  LEGENDARY INVESTORS — Standalone page
@@ -6858,30 +7080,11 @@ Professional options desk — dealer GEX analysis, expiry-level walls, position 
                     _avg_c = _ga_oi_work["openInt_Call_now"].mean()
                     _avg_p = _ga_oi_work["openInt_Put_now"].mean()
 
-                    # Call wall = strongest call OI AT or ABOVE spot (acts as ceiling)
-                    _wc_pool = _ga_oi_work[
-                        (_ga_oi_work["openInt_Call_now"] >= _avg_c * 2.5) &
-                        (_ga_oi_work["strike"] >= _spot)
-                    ].sort_values("openInt_Call_now", ascending=False)
-                    if _wc_pool.empty:
-                        _wc_pool = _ga_oi_work[
-                            _ga_oi_work["openInt_Call_now"] >= _avg_c * 2.5
-                        ].sort_values("openInt_Call_now", ascending=False)
-
-                    # Put wall = strongest put OI AT or BELOW spot (acts as floor)
-                    _wp_pool = _ga_oi_work[
-                        (_ga_oi_work["openInt_Put_now"] >= _avg_p * 2.5) &
-                        (_ga_oi_work["strike"] <= _spot)
-                    ].sort_values("openInt_Put_now", ascending=False)
-                    if _wp_pool.empty:
-                        _wp_pool = _ga_oi_work[
-                            _ga_oi_work["openInt_Put_now"] >= _avg_p * 2.5
-                        ].sort_values("openInt_Put_now", ascending=False)
-
-                    _cw  = float(_wc_pool["strike"].iloc[0]) if not _wc_pool.empty else None
-                    _pw  = float(_wp_pool["strike"].iloc[0]) if not _wp_pool.empty else None
-                    _cws = float(_wc_pool["openInt_Call_now"].iloc[0]) / _avg_c if _cw else 0
-                    _pws = float(_wp_pool["openInt_Put_now"].iloc[0])  / _avg_p if _pw else 0
+                    _walls = compute_walls(_ga_oi_work, _spot)
+                    _cw  = _walls["call_wall"]
+                    _pw  = _walls["put_wall"]
+                    _cws = _walls["call_wall_strength"]
+                    _pws = _walls["put_wall_strength"]
 
                     # Expiry label shown in metrics and strategy cards
                     if _sel_ga_expiry:
@@ -6930,26 +7133,14 @@ Professional options desk — dealer GEX analysis, expiry-level walls, position 
                         _eg = _ga_oi[_ga_oi["expiry_date"] == _ex].copy()
                         if len(_eg) < 3:
                             continue
-                        _ea_c = _eg["openInt_Call_now"].mean()
-                        _ea_p = _eg["openInt_Put_now"].mean()
-                        if _ea_c == 0 or _ea_p == 0:
-                            continue
 
-                        # Call wall: highest call OI at or above spot
-                        _wc_ex = _eg[(_eg["openInt_Call_now"] >= _ea_c * 2.5) & (_eg["strike"] >= _spot)]
-                        if _wc_ex.empty:
-                            _wc_ex = _eg[_eg["openInt_Call_now"] >= _ea_c * 2.5]
-                        # Put wall: highest put OI at or below spot
-                        _wp_ex = _eg[(_eg["openInt_Put_now"] >= _ea_p * 2.5) & (_eg["strike"] <= _spot)]
-                        if _wp_ex.empty:
-                            _wp_ex = _eg[_eg["openInt_Put_now"] >= _ea_p * 2.5]
-
-                        _cw_ex = float(_wc_ex.sort_values("openInt_Call_now", ascending=False)["strike"].iloc[0]) if not _wc_ex.empty else None
-                        _pw_ex = float(_wp_ex.sort_values("openInt_Put_now",  ascending=False)["strike"].iloc[0]) if not _wp_ex.empty else None
-                        _cw_oi_ex = float(_wc_ex["openInt_Call_now"].max()) if not _wc_ex.empty else 0
-                        _pw_oi_ex = float(_wp_ex["openInt_Put_now"].max())  if not _wp_ex.empty else 0
-                        _cw_str_ex = round(_cw_oi_ex / _ea_c, 1) if _ea_c > 0 else 0
-                        _pw_str_ex = round(_pw_oi_ex / _ea_p, 1) if _ea_p > 0 else 0
+                        _ex_walls  = compute_walls(_eg, _spot)
+                        _cw_ex     = _ex_walls["call_wall"]
+                        _pw_ex     = _ex_walls["put_wall"]
+                        _cw_oi_ex  = _ex_walls["call_wall_oi"]
+                        _pw_oi_ex  = _ex_walls["put_wall_oi"]
+                        _cw_str_ex = _ex_walls["call_wall_strength"]
+                        _pw_str_ex = _ex_walls["put_wall_strength"]
 
                         try:
                             _ep = _ex.split("-")
@@ -8175,14 +8366,11 @@ Real edge comes from discipline and filters — not a higher strike.
                 for _ex in _all_expiries:
                     _eg = _eoi[_eoi["expiry_date"] == _ex]
                     if len(_eg) < 4: continue
-                    _ea_c = _eg["openInt_Call_now"].mean()
-                    _ea_p = _eg["openInt_Put_now"].mean()
-                    _ew_c = _eg[_eg["openInt_Call_now"] >= _ea_c * 2.5]
-                    _ew_p = _eg[_eg["openInt_Put_now"]  >= _ea_p * 2.5]
-                    _bc = float(_ew_c.sort_values("openInt_Call_now",ascending=False)["strike"].iloc[0]) if not _ew_c.empty else None
-                    _bp = float(_ew_p.sort_values("openInt_Put_now", ascending=False)["strike"].iloc[0]) if not _ew_p.empty else None
-                    _bcs = float(_ew_c["openInt_Call_now"].max()) / _ea_c if _bc else 0
-                    _bps = float(_ew_p["openInt_Put_now"].max())  / _ea_p if _bp else 0
+                    _ex_w = compute_walls(_eg, _spot)
+                    _bc   = _ex_w["call_wall"]
+                    _bp   = _ex_w["put_wall"]
+                    _bcs  = _ex_w["call_wall_strength"]
+                    _bps  = _ex_w["put_wall_strength"]
                     try:
                         _dte = (datetime.strptime(str(_ex), "%Y-%m-%d") - datetime.now()).days
                     except Exception:
