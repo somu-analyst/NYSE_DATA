@@ -1,4 +1,4 @@
-﻿async def group_stock_detail(query, ticker):
+async def group_stock_detail(query, ticker):
     """Show all open option positions for a stock with per-leg advice (close vs keep)."""
     conn = get_conn()
     try:
@@ -244,7 +244,6 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import norm
-from wall_engine import compute_walls
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, Bot
 from telegram.ext import (
@@ -9355,10 +9354,35 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
         log.warning(f"position_monitor send failed: {e}")
 
 
+def _ensure_alert_dedup_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alert_dedup (
+            alert_date TEXT NOT NULL,
+            grp_key    TEXT NOT NULL,
+            atype      TEXT NOT NULL,
+            PRIMARY KEY (alert_date, grp_key, atype)
+        )
+    """)
+    conn.commit()
+
+
+def _alert_already_sent(conn, today_str, grp_key, atype):
+    """Return True if alert was already sent today; insert the key if not."""
+    try:
+        conn.execute(
+            "INSERT INTO alert_dedup (alert_date, grp_key, atype) VALUES (?, ?, ?)",
+            (today_str, grp_key, atype)
+        )
+        conn.commit()
+        return False
+    except sqlite3.IntegrityError:
+        return True
+
+
 async def position_alerts(ctx: ContextTypes.DEFAULT_TYPE):
     """Smart alert job — fires ONLY when a trigger condition is hit.
-    Runs every 5 min during market hours. Deduplicates via bot_data
-    so each alert fires at most once per bot session."""
+    Runs every 5 min during market hours. Deduplicates via SQLite so
+    each alert fires at most once per calendar day (survives restarts)."""
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     if now_utc.weekday() >= 5:
         return
@@ -9368,19 +9392,17 @@ async def position_alerts(ctx: ContextTypes.DEFAULT_TYPE):
     _, chat_id = load_creds()
     conn = get_conn()
     try:
+        _ensure_alert_dedup_table(conn)
         trades = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", conn)
     except Exception:
         conn.close(); return
-    conn.close()
     if trades.empty:
+        conn.close()
         return
 
-    now_et = now_utc - timedelta(hours=5)
-    today  = now_et.date()
-
-    if "alerted" not in ctx.bot_data:
-        ctx.bot_data["alerted"] = set()
-    _alerted = ctx.bot_data["alerted"]
+    now_et   = now_utc - timedelta(hours=5)
+    today    = now_et.date()
+    today_str = today.isoformat()
 
     # Group legs by ticker + expiry — same group = one strategy
     trades["_grp"] = trades["ticker"].str.upper() + "|" + trades["expiry"].astype(str).str[:10]
@@ -9448,10 +9470,8 @@ async def position_alerts(ctx: ContextTypes.DEFAULT_TYPE):
         def _alert(atype, icon, headline, detail,
                    _gk=grp_key, _tk=tk, _es=expiry_s, _ds=dte_s, _sl=strat_label,
                    _sp=spot_line, _lt=legs_text, _nl=net_pnl, _np=net_pnl_pct):
-            key = (_gk, atype)
-            if key in _alerted:
+            if _alert_already_sent(conn, today_str, _gk, atype):
                 return
-            _alerted.add(key)
             alert_msgs.append(
                 f"{icon} <b>ALERT - {_tk}</b> | {_sl}\n"
                 f"Expiry: {_es} | DTE: {_ds} | {_sp}\n"
@@ -9487,6 +9507,7 @@ async def position_alerts(ctx: ContextTypes.DEFAULT_TYPE):
                             f"Stock ${stock_px:.2f} - your short strike is at risk."
                         )
 
+    conn.close()
     for _msg in alert_msgs:
         try:
             await ctx.bot.send_message(chat_id=int(chat_id), text=_msg, parse_mode=H)
