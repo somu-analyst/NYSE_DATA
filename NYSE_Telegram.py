@@ -19,7 +19,27 @@ GENERATE_EXCEL  = True    # turn Excel output on/off
 # -------------------------
 # CONFIG / PATHS
 # -------------------------
-DATA_DIR = r"C:\Users\srini\Options_chain_data"
+import platform
+
+def get_data_dir():
+    # WSL/Linux absolute path (works on Linux/WSL)
+    linux_path = r"/mnt/c/Users/srini/Options_chain_data"
+    # Windows path format (works on native Windows)
+    win_path = r"C:\Users\srini\Options_chain_data"
+    
+    # On Windows native, prefer Windows path
+    if platform.system() == "Windows":
+        if os.path.exists(win_path):
+            return win_path
+    
+    # On Linux/WSL (or if Windows path doesn't exist), use Linux path
+    if os.path.exists(linux_path):
+        return linux_path
+    
+    # Fallback to Windows path
+    return win_path
+
+DATA_DIR = get_data_dir()
 DB_PATH = os.path.join(DATA_DIR, "US_data.db")
 
 TABLE_OPTIONS_DAILY  = "options_daily"
