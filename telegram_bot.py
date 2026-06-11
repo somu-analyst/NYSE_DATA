@@ -244,6 +244,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import norm
+from wall_engine import compute_walls  # gamma wall / max pain engine (sourceless .pyc)
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, Bot
 from telegram.ext import (
@@ -5328,7 +5329,8 @@ def analyze_inst_signals(ticker, conn):
     from datetime import datetime as _dt
     tk = str(ticker).upper()
     result = {"max_pain": [], "gamma_walls": [], "smart_flow": {},
-              "notional": {}, "put_skew": {}, "pin_risk": []}
+              "notional": {}, "put_skew": {}, "pin_risk": [],
+              "wall_df": None, "wall_td": None}
 
     try:
         df = pd.read_sql("""
@@ -5365,6 +5367,16 @@ def analyze_inst_signals(ticker, conn):
         td = _dt.strptime(td_str, "%m-%d-%Y")
     except Exception:
         td = None
+
+    # Stash a slim copy for the compute_walls() engine used in the presentation
+    # layer (call/put walls + strength, max pain, PCR, GEX regime, OI trend).
+    try:
+        result["wall_df"] = df[["strike", "expiry_date", "expiry_sort",
+                                 "openInt_Call_now", "openInt_Put_now",
+                                 "change_OI_Call", "change_OI_Put"]].copy()
+        result["wall_td"] = td
+    except Exception:
+        pass
 
     # ── 1. MAX PAIN ──
     # Strike where aggregate ITM dollar-loss for options holders is MINIMISED
@@ -12914,6 +12926,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import norm
+from wall_engine import compute_walls  # gamma wall / max pain engine (sourceless .pyc)
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, Bot
 from telegram.ext import (
@@ -16785,7 +16798,8 @@ def analyze_inst_signals(ticker, conn):
     from datetime import datetime as _dt
     tk = str(ticker).upper()
     result = {"max_pain": [], "gamma_walls": [], "smart_flow": {},
-              "notional": {}, "put_skew": {}, "pin_risk": []}
+              "notional": {}, "put_skew": {}, "pin_risk": [],
+              "wall_df": None, "wall_td": None}
 
     try:
         df = pd.read_sql("""
@@ -16822,6 +16836,16 @@ def analyze_inst_signals(ticker, conn):
         td = _dt.strptime(td_str, "%m-%d-%Y")
     except Exception:
         td = None
+
+    # Stash a slim copy for the compute_walls() engine used in the presentation
+    # layer (call/put walls + strength, max pain, PCR, GEX regime, OI trend).
+    try:
+        result["wall_df"] = df[["strike", "expiry_date", "expiry_sort",
+                                 "openInt_Call_now", "openInt_Put_now",
+                                 "change_OI_Call", "change_OI_Put"]].copy()
+        result["wall_td"] = td
+    except Exception:
+        pass
 
     # ── 1. MAX PAIN ──
     # Strike where aggregate ITM dollar-loss for options holders is MINIMISED
@@ -17029,21 +17053,75 @@ async def inst_signals_detail(query, ticker):
                      + _pipe_table(("Expiry", "Strike", "DTE", "vs Spot"), _mp_rows, right_cols={1, 2, 3}))
         parts.append("<i>Fade moves away from max pain as expiry nears</i>")
 
-    # 2. Gamma Walls
-    walls = sig.get("gamma_walls", [])
-    # 2. Gamma Walls
-    walls = sig.get("gamma_walls", [])
-    if walls:
-        def _fk_w(n):
-            return f"{n/1000:.0f}K" if n >= 1000 else str(int(n))
-        _gw_rows = []
-        for w in walls[:6]:
-            label = "CEILING" if w["type"] == "CALL" else ("FLOOR" if w["type"] == "PUT" else "WALL")
-            _gw_rows.append((f"${w['strike']:.0f}", label, _fk_w(w["total_oi"]),
-                             _fk_w(w["call_oi"]), _fk_w(w["put_oi"])))
-        parts.append("\n<b>GAMMA WALLS  (Dealer Hedging Levels)</b>\n"
-                     + _pipe_table(("Strike", "Type", "Total OI", "C-OI", "P-OI"), _gw_rows, right_cols={2, 3, 4}))
-        parts.append("<i>Price gravitates toward / stalls at these strikes</i>")
+    # 2. Gamma Walls — compute_walls() engine (call/put walls + strength,
+    #    max pain, PCR, GEX regime, OI-trend) plus a per-expiry wall table.
+    _wdf = sig.get("wall_df")
+    if _wdf is not None and not _wdf.empty and spot > 0:
+        try:
+            _agg = compute_walls(_wdf, spot, tk)
+        except Exception as _we:
+            log.warning(f"compute_walls {tk}: {_we}")
+            _agg = None
+        if _agg:
+            def _wdist(k):
+                return f"{(k - spot) / spot * 100:+.1f}%" if k else "--"
+            def _wtrend(t):
+                return {"building": " BUILD", "unwinding": " UNWIND"}.get(t, "")
+            _cw, _pw = _agg.get("call_wall"), _agg.get("put_wall")
+            _cws, _pws = _agg.get("call_wall_strength", 0) or 0, _agg.get("put_wall_strength", 0) or 0
+            _mp, _pcr = _agg.get("max_pain"), _agg.get("pcr", 0) or 0
+            _gex = _agg.get("gex_regime", "")
+            _ln = ["\n<b>GAMMA WALLS  (Dealer Hedging Levels)</b>"]
+            if _cw:
+                _ln.append(f"⬆ <b>Call Wall</b> ${_cw:.0f}  {_wdist(_cw)}  "
+                           f"{_cws:.1f}×{_wtrend(_agg.get('call_wall_trend',''))}")
+            if _pw:
+                _ln.append(f"⬇ <b>Put Wall</b>  ${_pw:.0f}  {_wdist(_pw)}  "
+                           f"{_pws:.1f}×{_wtrend(_agg.get('put_wall_trend',''))}")
+            _mp_s = f"${_mp:.0f}" if _mp else "--"
+            _ln.append(f"🎯 Max Pain {_mp_s}  |  PCR {_pcr:.2f}")
+            if _gex:
+                _gex_hint = ("amplifies moves" if _gex == "NEGATIVE"
+                             else "dampens / pins" if _gex == "POSITIVE" else "")
+                _ln.append(f"⚙ GEX: <b>{_gex}</b> ({_gex_hint})")
+            for _w in (_agg.get("warnings") or [])[:1]:
+                _ln.append(f"<i>⚠ {_w}</i>")
+            parts.append("\n".join(_ln))
+
+            # Per-expiry walls (future expiries only, compact table)
+            _td2 = sig.get("wall_td")
+            _ex_rows = []
+            try:
+                for _es, _g in _wdf.groupby("expiry_sort"):
+                    if len(_g) < 3:
+                        continue
+                    _elab = str(_g["expiry_date"].iloc[0])
+                    _dte = None
+                    if _td2 is not None:
+                        try:
+                            _dte = (datetime.strptime(_elab, "%m-%d-%Y") - _td2).days
+                        except Exception:
+                            _dte = None
+                    if _dte is not None and _dte < 0:
+                        continue
+                    _ew = compute_walls(_g, spot, tk)
+                    _cwe, _pwe = _ew.get("call_wall"), _ew.get("put_wall")
+                    if not _cwe and not _pwe:
+                        continue
+                    _ex_rows.append((
+                        _elab[:5],
+                        str(_dte) if _dte is not None else "-",
+                        f"${_cwe:.0f}" if _cwe else "--",
+                        f"${_pwe:.0f}" if _pwe else "--",
+                    ))
+            except Exception:
+                pass
+            if _ex_rows:
+                parts.append("\n<b>WALLS BY EXPIRY</b>\n"
+                             + _pipe_table(("Expiry", "DTE", "CallW", "PutW"),
+                                           _ex_rows[:7], right_cols={1, 2, 3}))
+            parts.append("<i>Strength = wall OI vs avg. Price stalls at walls; "
+                         "NEG-GEX → trendy/volatile, POS-GEX → mean-revert/pin.</i>")
 
     # 3. Smart Money Flow
     sf = sig.get("smart_flow", {})
