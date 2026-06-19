@@ -1705,6 +1705,7 @@ with st.sidebar:
         "🧠 High-Prob Engine",
         "🧠 Smart Money Hub",
         "🎯 Gamma Wall Advisor",
+        "📡 Macro/Event Hub",
     ], label_visibility="collapsed")
 
     st.markdown("---")
@@ -12220,7 +12221,7 @@ if page == "🚀 Live Momentum Scanner":
     st.caption("⚠️ All signals are algorithmic based on price momentum and volume. Always verify with OI data, news, and your own analysis before trading. Past momentum does not guarantee future returns.")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PAGE: HIGH-PROB ENGINE (22-model ensemble)
+# PAGE: HIGH-PROB ENGINE (24-model ensemble)
 # ═══════════════════════════════════════════════════════════════════════════
 if page == "🧠 High-Prob Engine":
     import math as _hpmath
@@ -12230,7 +12231,7 @@ if page == "🧠 High-Prob Engine":
         _hpnorm = None
     import numpy as _hpnp
 
-    st.title("🧠 22-Model High-Probability Signal Engine")
+    st.title("🧠 24-Model High-Probability Signal Engine")
     st.caption("VRVP · VWAP · VRP · Put/Call Wall · IV Rank · GEX · PCR-Z · Left Skew · VRP · EM Breach")
 
     # Import model functions from telegram_bot at runtime
@@ -12251,9 +12252,19 @@ if page == "🧠 High-Prob Engine":
             pass
         return mod
 
-    # Safer: extract only the HP functions via exec of the relevant slice
+    # Preferred: import the bot module directly so we get its FULL namespace
+    # (all helpers like get_conn/_safe_float/yf, the engine, and the fixed GEX).
+    # Falls back to the source-slice exec only if the import fails.
     @st.cache_resource(show_spinner=False)
     def _get_hp_ns():
+        try:
+            import telegram_bot as _tb
+            _ns = vars(_tb)
+            if "high_prob_signals_engine" in _ns:
+                return _ns
+        except Exception:
+            pass
+        # Fallback: extract the HP functions via exec of the relevant slice
         import math as _m
         try:
             from scipy.stats import norm as _sn
@@ -12266,7 +12277,9 @@ if page == "🧠 High-Prob Engine":
         with open(r"C:\Users\srini\Options_chain_data\NYSE_DATA\telegram_bot.py", encoding="utf-8") as _f:
             _src = _f.read()
         _start = _src.find("def _bs_gamma_hp")
-        _end   = _src.find("\n\n\ndef main()")
+        _end   = _src.find("\ndef main():", _start)
+        if _end == -1:
+            _end = len(_src)
         _ns = {"_math": _m, "_spnorm": _sn, "np": _np, "pd": _pd,
                "datetime": _dt, "timezone": _tz, "log": _log}
         exec(_src[_start:_end], _ns)
@@ -12299,7 +12312,7 @@ if page == "🧠 High-Prob Engine":
                 run_btn = True
 
     if run_btn and hp_ns:
-        with st.spinner(f"Running 22 models for {sel_ticker}…"):
+        with st.spinner(f"Running 24 models for {sel_ticker}…"):
             try:
                 conn_hp = get_conn()
                 # Get SPY context
@@ -12319,7 +12332,7 @@ if page == "🧠 High-Prob Engine":
                 prob  = res["prob"]
                 conf  = res["conf"]
                 spot  = res["spot"]
-                total_m = res.get("total_m", 22)
+                total_m = res.get("total_m", 24)
 
                 # Header metrics
                 sig_color = {"BULL": "green", "BEAR": "red", "SELL_PREMIUM": "orange", "NEUTRAL": "gray"}.get(sig, "gray")
@@ -12481,7 +12494,7 @@ if page == "🧠 High-Prob Engine":
                     st.warning(f"Volume profile chart error: {_vp_ex}")
                 st.markdown("---")
 
-                # All 22 model results table
+                # All 24 model results table
                 st.markdown("#### 📊 All 22 Model Outputs")
                 _ML_LABELS = {
                     "gex": "GEX Regime", "pcr_z": "PCR Z-Score",
@@ -12549,3 +12562,91 @@ if page == "🧠 High-Prob Engine":
                 st.code(traceback.format_exc())
     elif run_btn and not hp_ns:
         st.error("Could not load model functions. Check that scipy is installed.")
+
+
+# ===================================================================
+# ──  PAGE: MACRO / EVENT HUB
+# ──  Squeeze · OpEx · Events · Briefing · Journal · GEX · Macro
+# ──  Reuses the Telegram bot's engine + formatters (single source of truth).
+# ===================================================================
+if page == "📡 Macro/Event Hub":
+    _page_header("📡 Macro / Event Hub")
+    try:
+        import telegram_bot as _tbmod
+    except Exception as _e:
+        st.error(f"Could not load engine module: {_e}")
+        _tbmod = None
+
+    def _render_tg(_html):
+        st.markdown(f"<div>{_html}</div>",
+                    unsafe_allow_html=True)
+
+    if _tbmod is not None:
+        _hub_conn = get_conn()
+        _tb_brief, _tb_opex, _tb_sq, _tb_gex, _tb_ev, _tb_jr, _tb_mac = st.tabs(
+            ["☀️ Briefing", "🗓️ OpEx", "🩳 Squeeze", "📐 GEX", "🌍 Events", "📓 Journal", "📊 Macro"])
+
+        with _tb_brief:
+            st.caption("Daily macro brief — optimistic / pessimistic / balanced, with live news.")
+            if st.button("🔄 Refresh", key="hub_brief_btn"):
+                st.rerun()
+            try:
+                _render_tg(_tbmod._fmt_briefing(_tbmod.morning_briefing(_hub_conn)))
+            except Exception as e:
+                st.error(f"Briefing error: {e}")
+
+        with _tb_opex:
+            st.caption("Options-expiration radar + post-OpEx playbook.")
+            try:
+                _render_tg(_tbmod._fmt_opex_report(_tbmod.opex_radar(_hub_conn)))
+            except Exception as e:
+                st.error(f"OpEx error: {e}")
+
+        with _tb_sq:
+            st.caption("Short-interest / days-to-cover / short-covering detector (0–5).")
+            _sqt = st.text_input("Ticker", "GME", key="hub_sq_tk").upper().strip()
+            if _sqt:
+                try:
+                    _render_tg(_tbmod._fmt_squeeze_report(_tbmod.short_squeeze_signal(_sqt, _hub_conn)))
+                except Exception as e:
+                    st.error(f"Squeeze error: {e}")
+
+        with _tb_gex:
+            st.caption("Gamma walls / flip / regime + position-aware notes + short interest.")
+            _gxt = st.text_input("Ticker(s), comma-separated (blank = your open positions)",
+                                 "", key="hub_gex_tk")
+            _tks = [x.strip().upper() for x in _gxt.split(",") if x.strip()] or None
+            try:
+                _reps = _tbmod._gex_reports(_hub_conn, _tks)
+                for _r in _reps:
+                    _render_tg(_r)
+                    st.markdown("---")
+            except Exception as e:
+                st.error(f"GEX error: {e}")
+
+        with _tb_ev:
+            st.caption("Macro/geopolitical event → 1st/2nd/3rd-order liquid trades + hedge.")
+            _evk = st.selectbox("Event", sorted(_tbmod.MACRO_EVENT_MAP), key="hub_ev_sel")
+            try:
+                _render_tg(_tbmod._fmt_event_report(_tbmod.event_trade_map(_evk)))
+            except Exception as e:
+                st.error(f"Event error: {e}")
+
+        with _tb_jr:
+            st.caption("Your logged event trades + running hit-rate (verified vs live prices).")
+            try:
+                _render_tg(_tbmod._fmt_journal_review(_hub_conn))
+            except Exception as e:
+                st.error(f"Journal error: {e}")
+
+        with _tb_mac:
+            st.caption("FRED macro indicators + AlphaVantage news sentiment (set keys to enable).")
+            try:
+                _render_tg(_tbmod._fmt_macro_report())
+            except Exception as e:
+                st.error(f"Macro error: {e}")
+
+        try:
+            _hub_conn.close()
+        except Exception:
+            pass
