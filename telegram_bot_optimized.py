@@ -1,3 +1,4 @@
+
 # telegram_bot_optimized.py - single-copy merged build (generated from telegram_bot.py)
 # Removed the 16,476-line dead duplicate copy after the __main__ guard.
 # Folded in from that dead copy so nothing is lost and dead buttons work:
@@ -493,6 +494,9 @@ _ALLOWED_TG_TAGS = {'b','strong','i','em','u','a','code','pre','s'}
 def sanitize_for_telegram(s: str) -> str:
     if not isinstance(s, str):
         return s
+    # Escape stray ampersands not part of a valid HTML entity. Raw & in news URLs
+    # (query params), or text like "E&P" / "S&P" / "P&L", breaks Telegram HTML parsing.
+    s = re.sub(r'&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9A-Fa-f]+);)', '&amp;', s)
     # remove span tags
     s = re.sub(r'</?span[^>]*>', '', s)
     # strip style/class attributes
@@ -2068,6 +2072,9 @@ MAIN_MENU_KB = InlineKeyboardMarkup([
      InlineKeyboardButton("📊 OI",         callback_data="menu_oi")],
     [InlineKeyboardButton("📈 Insider",    callback_data="menu_insider"),
      InlineKeyboardButton("🧩 More",       callback_data="menu_more")],
+    # ── MACRO & EVENTS ───────────────────────────────────────────
+    [InlineKeyboardButton("━━  MACRO & EVENTS  ━━━━━━━━", callback_data="noop")],
+    [InlineKeyboardButton("📡 Macro/Event Hub", callback_data="hub_menu")],
     # ── AI + SETTINGS ────────────────────────────────────────────
     [InlineKeyboardButton("━━  AI & TOOLS  ━━━━━━━━━━━━", callback_data="noop")],
     [InlineKeyboardButton("🤖 Ask AI",     callback_data="menu_ai_chat"),
@@ -3967,7 +3974,7 @@ def _get_earnings_dte(ticker: str) -> "int | None":
         return None
 
 
-def _compute_gex(ticker: str, conn, spot: float) -> dict:
+def _compute_gex(ticker: str, conn, spot: float, expiry=None) -> dict:
     """
     Gamma Exposure (GEX) for the nearest LIQUID expiry, with per-strike implied
     vol backed out from stored option last-prices (HV fallback when unavailable).
@@ -4021,9 +4028,18 @@ def _compute_gex(ticker: str, conn, spot: float) -> dict:
             cand.append((dte, float(e["oi"] or 0), str(e["expiry_date"])))
     if not cand:
         return result
-    near = [c for c in cand if c[0] <= 60]
-    dte_days, _oi_e, expiry_s = (max(near, key=lambda c: c[1]) if near
-                                 else min(cand, key=lambda c: c[0]))
+    if expiry:
+        _m = [c for c in cand if c[2] == expiry]
+        if _m:
+            dte_days, _oi_e, expiry_s = _m[0]
+        else:
+            _pool = [c for c in cand if c[0] >= 1] or cand
+            dte_days, _oi_e, expiry_s = min(_pool, key=lambda c: c[0])
+    else:
+        _pool = [c for c in cand if c[0] >= 1] or cand
+        near = [c for c in _pool if c[0] <= 60]
+        dte_days, _oi_e, expiry_s = (max(near, key=lambda c: c[1]) if near
+                                     else min(_pool, key=lambda c: c[0]))
     T = max(dte_days / 365.0, 1.0 / 365.0)
     result["expiry"] = expiry_s
     result["dte"] = dte_days
@@ -4156,7 +4172,7 @@ def _oi_opportunity_table(ticker: str, conn, df, spot: float) -> str:
     exp_str = ""
     try:
         _edt = pd.read_sql("""SELECT DISTINCT expiry_date FROM options_change WHERE ticker=?
-            AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) >= ?
+            AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) > ?
             ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) LIMIT 1""",
             conn, params=(ticker, datetime.now().strftime("%Y%m%d")))
         if not _edt.empty:
@@ -4700,7 +4716,7 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
             _hv = max(0.10, min(float(_rets.std() * (252**0.5)), 2.0))
         # Nearest expiry DTE
         _edt = pd.read_sql("""SELECT DISTINCT expiry_date FROM options_change WHERE ticker=?
-            AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) >= ?
+            AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) > ?
             ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) LIMIT 1""",
             conn, params=(ticker, datetime.now().strftime("%Y%m%d")))
         if not _edt.empty:
@@ -9587,7 +9603,7 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
                 _card = [
                     f"<b>{_htk_pm}</b> ${_sp_pm:.0f}",
                     f"{_ic_pm} {_hr_pm['signal']}  {_pb_pm:.0f}%  {_cf_pm}",
-                    f"🟢{_bv} 🔴{_rv} 💰{_sv}/23",
+                    f"🟢{_bv} 🔴{_rv} 💰{_sv}/24",
                 ]
                 _vb = _hr_pm.get("vrvp_box", {})
                 if _vb.get("lo"):
@@ -10175,7 +10191,7 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
                                    SUM(change_OI_Put)  AS p_chg
                             FROM options_change
                             WHERE ticker=? AND trade_date_now=?
-                              AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) >= ?
+                              AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) > ?
                             GROUP BY expiry_date
                             ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) ASC
                             LIMIT 2
@@ -10724,6 +10740,37 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         if data == "menu_main":
             await show_main_menu(query)
+        elif data == "brief_refresh":
+            await briefing_view(query)
+        elif data == "opex_refresh":
+            await opex_view(query)
+        elif data.startswith("event_refresh|"):
+            await event_view(query, data.split("|", 1)[1])
+        elif data.startswith("event_mon|"):
+            await event_monitor_btn(query, data.split("|", 1)[1])
+        elif data.startswith("bm|"):
+            _bp = data.split("|")
+            await bookmark_btn(query, _bp[1], _bp[2] if len(_bp) > 2 else "")
+        elif data == "show_bookmarks":
+            await bookmarks_view(query)
+        elif data == "gex_refresh":
+            await gex_view(query)
+        elif data == "hub_menu":
+            await query.message.reply_text("📡 <b>Macro / Event Hub</b> — pick one:", parse_mode=H, reply_markup=HUB_MENU_KB)
+        elif data == "sq_scan":
+            await squeeze_view(query)
+        elif data == "ev_menu":
+            await query.message.reply_text("🌍 <b>Pick an event:</b>", parse_mode=H, reply_markup=_events_kb())
+        elif data == "jr_view":
+            await journal_view(query)
+        elif data == "macro_view":
+            await macro_view(query)
+        elif data == "mom_view":
+            await mom_view(query)
+        elif data == "regime_view":
+            await regime_view(query)
+        elif data == "vanna_view":
+            await vanna_view(query)
         elif data == "noop":
             return
         elif data == "menu_market" or data == "menu_refresh":
@@ -11589,7 +11636,7 @@ async def morning_alert(ctx: ContextTypes.DEFAULT_TYPE):
                 _bv = _hr["bull_v"]; _rv = _hr["bear_v"]; _sv = _hr.get("sell_v", 0)
                 _hp_out.append(f"<b>{_htk}</b> ${_sp_ma:.0f}")
                 _hp_out.append(f"{_he} {_hr['signal']}  {_pb:.0f}%  {_cf}")
-                _hp_out.append(f"🟢{_bv} 🔴{_rv} 💰{_sv}/22")
+                _hp_out.append(f"🟢{_bv} 🔴{_rv} 💰{_sv}/24")
                 _vb = _hr.get("vrvp_box", {})
                 if _vb.get("lo"):
                     _hp_out.append(f"📦 ${_vb['lo']:.0f}–${_vb['hi']:.0f} POC${_vb.get('poc',0):.0f}")
@@ -13332,7 +13379,7 @@ def _hp_model_gex(ticker, conn, spot):
                 p_oi = float(r["p_oi"] or 0)
                 c_px = float(r["c_px"] or 0)
                 try:
-                    exp_dt = datetime.strptime(str(r["expiry_date"]), "%Y-%m-%d")
+                    exp_dt = datetime.strptime(str(r["expiry_date"]), "%m-%d-%Y")
                 except Exception:
                     continue
                 T = max((exp_dt - ref_dt).days / 365.0, 1 / 365.0)
@@ -13512,7 +13559,7 @@ def _hp_model_gamma_pin(ticker, conn, spot):
         nearest, min_dte = None, 999
         for _, er in expiries.iterrows():
             try:
-                exp_dt = datetime.strptime(str(er["expiry_date"]), "%Y-%m-%d")
+                exp_dt = datetime.strptime(str(er["expiry_date"]), "%m-%d-%Y")
                 dte = (exp_dt - today_dt).days
                 if 0 < dte < min_dte:
                     min_dte, nearest = dte, er["expiry_date"]
@@ -13668,7 +13715,7 @@ def _hp_model_iv_skew(ticker, conn, spot):
         nearest, min_dte = None, 999
         for _, er in expiries.iterrows():
             try:
-                exp_dt = datetime.strptime(str(er["expiry_date"]), "%Y-%m-%d")
+                exp_dt = datetime.strptime(str(er["expiry_date"]), "%m-%d-%Y")
                 dte = (exp_dt - today_dt).days
                 if 1 < dte < min_dte:
                     min_dte, nearest = dte, er["expiry_date"]
@@ -14884,9 +14931,9 @@ def _hp_model_put_call_wall(ticker, conn, spot):
 
 def high_prob_signals_engine(ticker, conn, spy_ret=0.0):
     """
-    Run all 23 models (incl. VRVP, VWAP, VRP, Put/Call Wall, Left Skew, EM),
+    Run all 24 models (incl. VRVP, VWAP, VRP, Put/Call Wall, Left Skew, EM),
     apply adaptive weights, return calibrated ensemble signal.
-    Votes: ≥6/23 agree → MEDIUM CONF; ≥9/23 → HIGH CONF.
+    Votes: ≥6/24 agree → MEDIUM CONF; ≥9/24 → HIGH CONF.
     """
     _setup_hp_tables(conn)
     _update_hp_outcomes(ticker, conn)
@@ -14926,6 +14973,8 @@ def high_prob_signals_engine(ticker, conn, spy_ret=0.0):
         "put_call_wall": _hp_model_put_call_wall(ticker, conn, spot),
         # Model 23: short-squeeze / short-covering (Ortex/S3 method)
         "short_squeeze": _hp_model_short_squeeze(ticker, conn, spot),
+        # Model 24: time-series momentum (12-1)
+        "momentum": _hp_model_momentum(ticker, conn, spot),
     }
 
     bull_w = bear_w = 0.0
@@ -14946,7 +14995,7 @@ def high_prob_signals_engine(ticker, conn, spy_ret=0.0):
     total   = len(models)
     mkt     = 2 if spy_ret > 0.5 else (-2 if spy_ret < -0.5 else 0)
 
-    # Scaled thresholds for 23 models
+    # Scaled thresholds for 24 models
     if bull_v >= 9 and bull_w > bear_w * 1.2:
         ens_sig = "BULL";  ens_prob = min(91, 58 + bull_w * 7 + mkt); conf = "HIGH"
     elif bull_v >= 6 and bull_w > bear_w * 1.1:
@@ -15052,9 +15101,9 @@ def high_prob_signals_engine(ticker, conn, spy_ret=0.0):
 
 
 async def high_prob_detail(query, ticker):
-    """Telegram handler — 23-model High-Probability Signal Engine."""
+    """Telegram handler — 24-model High-Probability Signal Engine."""
     tk  = str(ticker).upper()
-    _ld = await query.message.reply_text(f"⚙️ Running 23-model engine for {tk}…", parse_mode=H)
+    _ld = await query.message.reply_text(f"⚙️ Running 24-model engine for {tk}…", parse_mode=H)
     conn = get_conn()
     try:
         try:
@@ -15097,6 +15146,7 @@ async def high_prob_detail(query, ticker):
         "expected_move": "ExpMove",    "left_skew":    "LeftSkew",
         "vrp":           "VRP",        "put_call_wall": "P/C-Wall",
         "short_squeeze": "ShortSqz",
+        "momentum": "Mom12-1",
     }
     _ME = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪", "SELL_PREMIUM": "💰"}
 
@@ -15145,7 +15195,7 @@ async def high_prob_detail(query, ticker):
 
     # Split model table into 3 rows of ~7-8 for mobile
     all_models = list(_ML.items())
-    chunk_labels = ["Models 1-8:", "Models 9-16:", "Models 17-23:"]
+    chunk_labels = ["Models 1-8:", "Models 9-16:", "Models 17-24:"]
     chunks = [all_models[:8], all_models[8:16], all_models[16:]]
     for lbl, chunk in zip(chunk_labels, chunks):
         if not chunk: continue
@@ -15160,7 +15210,7 @@ async def high_prob_detail(query, ticker):
         lines.append(mono("\n".join(tbl)))
         lines.append("")
 
-    # Top signals across all 23 models (sorted by prob, exclude NEUTRAL<55)
+    # Top signals across all 24 models (sorted by prob, exclude NEUTRAL<55)
     ranked = sorted(
         [(nm, r) for nm, r in res["models"].items() if r.get("prob", 50) >= 60],
         key=lambda x: x[1].get("prob", 50), reverse=True)
@@ -15190,7 +15240,7 @@ async def high_prob_detail(query, ticker):
 
     lines += [
         "",
-        "<i>🧠 23-model ensemble · weights auto-calibrate daily.</i>",
+        "<i>🧠 24-model ensemble · weights auto-calibrate daily.</i>",
         f"<i>SPY {spy_ret:+.2f}% · VRVP·VWAP·VRP·Walls·LeftSkew·VRP added.</i>",
         "<i>Sources: Bali·Cremers·Ni·Amin·Sinclair·Xing·Carr·SpotGamma·Dalton</i>",
     ]
@@ -18727,6 +18777,24 @@ async def gamma_positions_view(query):
                     f"  P&L: ${p['pnl_dollar']:.0f} | {p['exit_reason'] or 'CLOSED'}"
                 ))
 
+        # Your MAIN portfolio positions (separate ledger from gamma-wall trades)
+        try:
+            _main = pd.read_sql("SELECT ticker, option_type, strike, quantity FROM trades WHERE status='OPEN'", conn)
+        except Exception:
+            _main = None
+        if _main is not None and not _main.empty:
+            parts.append("")
+            parts.append(f"<b>💼 YOUR PORTFOLIO ({len(_main)} legs)</b>")
+            parts.append("<i>main trades (not gamma-wall) — tap 💼 Positions or /gex for analysis</i>")
+            _grp = {}
+            for _, r in _main.iterrows():
+                _grp.setdefault(str(r['ticker']).upper(), []).append(r)
+            for _tk, _legs in _grp.items():
+                _ls = ", ".join(
+                    f"{'+' if int(l['quantity'] or 1) > 0 else '-'}{str(l['option_type'])[:1].upper()}{float(l['strike'] or 0):.0f}"
+                    for l in _legs)
+                parts.append(mono(f"{_tk}: {_ls}"))
+
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📐 Advisor Scan", callback_data="menu_edge_lab"),
              InlineKeyboardButton("📝 Log Trade",    callback_data="ga_log_NEW")],
@@ -18901,6 +18969,1411 @@ _ALL_HP_MODELS = (
 # ── ENSEMBLE ENGINE ──────────────────────────────────────────────────────
 
 
+# ═══════════════════════════════════════════════════════════════════
+# ── OPEX RADAR  +  MACRO EVENT->TRADE MAP
+# ═══════════════════════════════════════════════════════════════════
+_QUARTER_MONTHS = {3, 6, 9, 12}
+
+def _opex_latest_date(conn, ticker):
+    try:
+        d = pd.read_sql("SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker,))
+        return d["trade_date_now"].iloc[0] if not d.empty else None
+    except Exception:
+        return None
+
+def _opex_spot(conn, ticker):
+    try:
+        s = pd.read_sql("SELECT close FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+            conn, params=(ticker,))
+        if not s.empty and float(s["close"].iloc[0]) > 0:
+            return float(s["close"].iloc[0])
+    except Exception:
+        pass
+    return 0.0
+
+def _opex_parse_date(s):
+    for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(s), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+def opex_radar(conn, tickers=None):
+    """Options-expiration radar: notional rolling off per upcoming expiry + the
+    current dealer-gamma regime. Flags the dominant near-term OpEx (quad-witching
+    in Mar/Jun/Sep/Dec) and emits the post-OpEx vol-expansion playbook.
+    Uses the ETFs/equities you store (no SPX index) -> the equity/ETF slice only."""
+    tickers = tickers or ["SPY", "QQQ", "IWM"]
+    today = datetime.now().date()
+    agg = {}
+    for tk in tickers:
+        d = _opex_latest_date(conn, tk)
+        if not d:
+            continue
+        spot = _opex_spot(conn, tk)
+        try:
+            df = pd.read_sql("SELECT expiry_date, SUM(openInt_Call_now+openInt_Put_now) AS oi"
+                " FROM options_change WHERE ticker=? AND trade_date_now=? GROUP BY expiry_date",
+                conn, params=(tk, d))
+        except Exception:
+            continue
+        if spot <= 0:
+            try:
+                spot = float(pd.read_sql("SELECT AVG(strike) s FROM options_change WHERE ticker=? AND trade_date_now=?",
+                    conn, params=(tk, d))["s"].iloc[0] or 0)
+            except Exception:
+                spot = 0.0
+        if spot <= 0:
+            continue
+        for _, r in df.iterrows():
+            ed = _opex_parse_date(r["expiry_date"])
+            if not ed:
+                continue
+            dte = (ed - today).days
+            if dte < 0:
+                continue
+            oi = float(r["oi"] or 0)
+            a = agg.setdefault(ed, {"notional": 0.0, "oi": 0.0, "dte": dte})
+            a["notional"] += oi * 100.0 * spot
+            a["oi"] += oi
+    if not agg:
+        return {}
+    rows = sorted(({"dt": k, "date": k.strftime("%m-%d-%Y"), **v} for k, v in agg.items()),
+                  key=lambda x: x["dt"])
+    near = [r for r in rows if r["dte"] <= 45] or rows
+    major = dict(max(near, key=lambda x: x["notional"]))
+    major["is_quarterly"] = major["dt"].month in _QUARTER_MONTHS
+    gex = {}
+    try:
+        gex = _compute_gex("SPY", conn, _opex_spot(conn, "SPY"))
+    except Exception:
+        pass
+    return {"rows": rows[:8], "major": major, "gex": gex, "tickers": tickers}
+
+def _opex_notional_str(n):
+    if n >= 1e12:
+        return f"${n/1e12:.2f}T"
+    if n >= 1e9:
+        return f"${n/1e9:.1f}B"
+    if n >= 1e6:
+        return f"${n/1e6:.0f}M"
+    return f"${n:,.0f}"
+
+def _fmt_opex_report(rad):
+    if not rad or not rad.get("rows"):
+        return "No OpEx data found in DB (need SPY/QQQ/IWM options_change rows)."
+    mj = rad["major"]
+    gex = rad.get("gex") or {}
+    lines = ["\U0001F5D3 <b>OPEX RADAR</b>  (" + "+".join(rad["tickers"]) + ")",
+             "<i>ETF/equity slice you store - excludes SPX index headline.</i>", ""]
+    tbl = []
+    for r in rad["rows"]:
+        star = "*" if r["date"] == mj["date"] else " "
+        tbl.append(f"{star}{r['date']} {r['dte']:>3}d {_opex_notional_str(r['notional']):>7}")
+    lines.append("<pre>" + "\n".join(tbl) + "</pre>")
+    q = "QUAD-WITCHING" if mj.get("is_quarterly") else "monthly OpEx"
+    lines.append(f"\U0001F3AF <b>Major: {mj['date']}</b> ({mj['dte']}d) - {q}")
+    lines.append(f"Notional rolling off: <b>{_opex_notional_str(mj['notional'])}</b>")
+    if gex:
+        flip = gex.get("zero_gamma")
+        cw = gex.get("call_wall")
+        pw = gex.get("put_wall")
+        lines.append("")
+        lines.append(f"SPY gamma regime: <b>{gex.get('gex_signal','?')}</b>"
+                     + (f" | flip ${flip:.0f}" if flip else ""))
+        if cw or pw:
+            lines.append(f"Walls: Put ${pw or 0:.0f}  ..  Call ${cw or 0:.0f}")
+    lines += ["",
+        "<b>Post-OpEx playbook:</b>",
+        "- Dealer gamma rolls off after the * date -> pin releases -> realized vol tends to RISE next week.",
+        "- <b>Trade:</b> buy a 1-week-out SPY strangle / VIX call spread on the * day (long vol).",
+        "- <b>Seasonality:</b> week after monthly/quad OpEx is historically weak -> tactical SPY put spread.",
+        "- <b>Hedge/size:</b> vol can stay crushed if macro is calm; keep size small or finance with a spread.",
+        "<i>This is a ~55-60% tendency, not a certainty - size for being wrong.</i>"]
+    return "\n".join(lines)
+
+async def opex_command(update, ctx):
+    """/opex [TICKERS...] - options-expiration radar + post-OpEx playbook."""
+    args = list(getattr(ctx, "args", []) or [])
+    conn = get_conn()
+    try:
+        rad = opex_radar(conn, [a.upper() for a in args] if args else None)
+    finally:
+        conn.close()
+    await update.message.reply_text(_fmt_opex_report(rad), parse_mode=H, reply_markup=_kb_opex())
+
+
+# Macro event -> liquid-trade map. Same idea as _DOWNSTREAM_MAP but for
+# geopolitical/macro events: event -> 1st/2nd/3rd-order effects -> liquid
+# instruments -> defined-risk structure -> hedge. NOT financial advice.
+MACRO_EVENT_MAP = {
+  "iran": {
+    "title": "Iran sanctions relief / reintegration",
+    "thesis": "A deal lifts sanctions -> Iranian crude (~1-1.5M bpd) returns -> MORE global oil supply.",
+    "chain": [
+      ("1st", "More crude supply -> lower oil price", "USO / CL futures / XLE", "SHORT oil, SHORT US E&P",
+       "Long USO put spread or short CL; defined risk"),
+      ("2nd", "Cheaper fuel -> airlines and transports win", "JETS, DAL, LUV, XTN", "LONG airlines",
+       "Long call spread on JETS or DAL"),
+      ("2nd", "Regional trade reopens (Turkey is top partner)", "TUR, Gulf/UAE names", "LONG Turkey/MENA",
+       "Long TUR shares, small size"),
+      ("3rd", "Lower energy -> EM importers relief, disinflation", "EEM, INDA", "LONG EM importers",
+       "Long EEM call spread"),
+    ],
+    "hedge": "Hold a few OTM oil calls - deals collapse often and oil spikes on failure.",
+    "caveat": "DO NOT buy Iranian rial: sanctioned, non-convertible, chronic inflation. Binary headline risk -> use options spreads, size small.",
+  },
+  "oil_spike": {
+    "title": "Oil supply shock / Hormuz disruption (oil spikes)",
+    "thesis": "Supply disruption or war premium -> oil price jumps.",
+    "chain": [
+      ("1st", "Oil up", "XLE, XOM, CVX, OIH, tankers (FRO)", "LONG energy", "Long XLE or call spread"),
+      ("2nd", "Fuel costs hit airlines/transports", "JETS, DAL", "SHORT airlines", "Put spread on JETS"),
+      ("2nd", "Higher inflation -> rate-cut hopes fade", "TLT", "SHORT long bonds", "TLT put spread"),
+      ("3rd", "Risk-off if shock is large", "SPY, VIX", "HEDGE equities", "SPY put / VIX calls"),
+    ],
+    "hedge": "Pair long energy with SPY puts; if shock fades, oil mean-reverts fast.",
+    "caveat": "Oil also driven by OPEC+, demand, SPR releases - spikes can reverse quickly.",
+  },
+  "fed_cut": {
+    "title": "Fed rate cuts / dovish pivot",
+    "thesis": "Lower rates -> cheaper money -> long-duration and rate-sensitive assets rally.",
+    "chain": [
+      ("1st", "Yields fall", "TLT, gold (GLD)", "LONG duration + gold", "Long TLT, GLD"),
+      ("1st", "Growth/small caps re-rate", "QQQ, IWM, ARKK", "LONG growth + small caps", "Long IWM call spread"),
+      ("2nd", "Weaker USD", "DXY, EEM, FXI", "SHORT USD, LONG EM", "Long EEM"),
+      ("3rd", "Housing/REITs relief", "XHB, VNQ", "LONG housing/REITs", "Long XHB"),
+    ],
+    "hedge": "If cuts are because of recession, equities can still fall -> keep some SPY puts.",
+    "caveat": "Distinguish a good cut (soft landing) from a panic cut (recession) - opposite equity outcomes.",
+  },
+  "fed_hike": {
+    "title": "Fed rate hikes / hawkish surprise",
+    "thesis": "Higher rates -> discount rate up -> long-duration and growth de-rate.",
+    "chain": [
+      ("1st", "Yields rise", "TLT", "SHORT long bonds", "TLT put spread"),
+      ("1st", "Growth/small caps fall", "QQQ, IWM", "SHORT growth/small caps", "Put spread on IWM"),
+      ("2nd", "Stronger USD", "UUP, EEM", "LONG USD, SHORT EM", "Long UUP / short EEM"),
+      ("2nd", "Banks net-interest-margin up", "XLF, KRE", "LONG banks (early)", "Long XLF call spread"),
+    ],
+    "hedge": "Banks can also fall if hikes break credit (2023 regional crisis) - watch spreads.",
+    "caveat": "Markets front-run the Fed - position vs the SURPRISE, not the known path.",
+  },
+  "war": {
+    "title": "Middle East / geopolitical escalation",
+    "thesis": "Conflict escalation -> risk-off + energy and defense bid.",
+    "chain": [
+      ("1st", "Oil and gold spike", "XLE, GLD", "LONG energy + gold", "Long GLD, XLE"),
+      ("1st", "Defense names bid", "ITA, LMT, RTX, NOC", "LONG defense", "Long ITA call spread"),
+      ("2nd", "Equities sell, vol spikes", "SPY, VIX", "HEDGE / LONG vol", "SPY put / VIX call spread"),
+      ("2nd", "Flight to USD", "UUP", "LONG USD", "Long UUP"),
+    ],
+    "hedge": "Escalations often de-escalate fast -> use defined-risk spreads, not linear shorts.",
+    "caveat": "The biggest moves come on the SURPRISE; once headlined, much is priced.",
+  },
+  "china_stimulus": {
+    "title": "China stimulus / reopening",
+    "thesis": "Large stimulus -> China demand up -> commodities and China equities rally.",
+    "chain": [
+      ("1st", "China equities re-rate", "FXI, KWEB, MCHI", "LONG China", "Long FXI call spread"),
+      ("1st", "Industrial metals demand", "FCX, copper, BHP, RIO", "LONG metals/miners", "Long FCX"),
+      ("2nd", "Commodity currencies / EM", "EWA, EEM", "LONG commodity EM", "Long EEM"),
+      ("3rd", "China-revenue / luxury names", "China-exposed exporters", "LONG China-exposed", "Selective longs"),
+    ],
+    "hedge": "China stimulus often disappoints in scale -> size small, use call spreads.",
+    "caveat": "Policy follow-through is the key risk - headlines without money move little.",
+  },
+  "usd_up": {
+    "title": "Strong US dollar (DXY breakout)",
+    "thesis": "Rising USD is a global tightening -> headwind for commodities, EM, US multinationals.",
+    "chain": [
+      ("1st", "USD up", "UUP", "LONG USD", "Long UUP"),
+      ("1st", "Commodities and gold pressured", "GLD, GDX, oil", "SHORT commodities", "Put spread on GDX"),
+      ("2nd", "EM under pressure", "EEM, EWZ", "SHORT EM", "EEM put spread"),
+      ("3rd", "US large-cap exporters hit on FX", "multinational-heavy names", "trim exporters", "Hedge with SPY puts"),
+    ],
+    "hedge": "USD reverses hard on a dovish Fed -> watch rate expectations.",
+    "caveat": "USD strength from growth (risk-on) vs from fear (risk-off) leads to different equity outcomes.",
+  },
+}
+
+def event_trade_map(key):
+    if not key:
+        return None
+    k = str(key).lower().strip()
+    if k in MACRO_EVENT_MAP:
+        return MACRO_EVENT_MAP[k]
+    for name, ev in MACRO_EVENT_MAP.items():
+        if k in name or k in ev["title"].lower() or k in ev["thesis"].lower():
+            return ev
+    return None
+
+def _fmt_event_report(ev):
+    if not ev:
+        keys = ", ".join(sorted(MACRO_EVENT_MAP))
+        return f"Unknown event. Available: <code>{keys}</code>\nUsage: <code>/event iran</code>"
+    lines = [f"\U0001F30D <b>{ev['title']}</b>", f"<i>{ev['thesis']}</i>", "",
+             "<b>Causal chain -> trades:</b>"]
+    for order, effect, instr, direction, structure in ev["chain"]:
+        lines.append(f"[{order}] {effect}")
+        lines.append(f"   -> <b>{direction}</b>: {instr}")
+        lines.append(f"   <i>{structure}</i>")
+    lines += ["", f"\U0001F6E1 <b>Hedge:</b> {ev['hedge']}",
+              f"⚠ <b>Caveat:</b> {ev['caveat']}",
+              "", "<i>Educational framework, not financial advice. Let options price the odds.</i>"]
+    return "\n".join(lines)
+
+async def event_command(update, ctx):
+    """/event [name] - macro/geopolitical event -> liquid-trade map."""
+    args = list(getattr(ctx, "args", []) or [])
+    if not args:
+        keys = ", ".join(sorted(MACRO_EVENT_MAP))
+        await update.message.reply_text(
+            "\U0001F30D <b>Macro Event -> Trade Map</b>\nUsage: <code>/event iran</code>\n\n"
+            f"Available: <code>{keys}</code>", parse_mode=H)
+        return
+    await update.message.reply_text(_fmt_event_report(event_trade_map(args[0])), parse_mode=H, reply_markup=_kb_event(args[0]))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── MORNING EVENT BRIEFING  (optimistic / pessimistic / balanced)
+# ═══════════════════════════════════════════════════════════════════
+# Ordered list of the events surfaced in the daily brief. Edit to taste.
+_BRIEFING_EVENTS = ["iran", "war", "oil_spike", "fed_cut", "china_stimulus"]
+
+def morning_briefing(conn, event_keys=None):
+    """Assemble the daily brief: OpEx/gamma regime + a 3-view read on each major
+    macro event (optimistic / pessimistic / balanced) with the lead defined-risk
+    trade and hedge. Pure composition over opex_radar + MACRO_EVENT_MAP."""
+    keys = event_keys or _BRIEFING_EVENTS
+    rad = {}
+    try:
+        rad = opex_radar(conn)
+    except Exception:
+        rad = {}
+    evs = [(k, MACRO_EVENT_MAP[k]) for k in keys if k in MACRO_EVENT_MAP]
+    news = {}
+    try:
+        news = _event_news_google(keys)
+    except Exception:
+        news = {}
+    regime = {}
+    try:
+        regime = _risk_regime()
+    except Exception:
+        regime = {}
+    return {"opex": rad, "events": evs, "news": news, "regime": regime}
+
+def _fmt_briefing(b):
+    from datetime import datetime as _dt
+    news = b.get("news") or {}
+    lines = ["☀️ <b>MORNING BRIEF</b> — " + _dt.now().strftime("%a %d %b %Y"), ""]
+    _rg = b.get("regime") or {}
+    if _rg:
+        lines.append(f"{_rg.get('emoji','')} <b>Regime: {_rg.get('label','?')}</b> (score {_rg.get('score',0):+d})")
+    try:
+        _fc = _fomc_context()
+    except Exception:
+        _fc = None
+    if _fc and _fc.get("pre_drift"):
+        lines.append(f"📅 Pre-FOMC drift (FOMC {_fc['next']}) — historically bullish.")
+    if _rg or (_fc and _fc.get("pre_drift")):
+        lines.append("")
+
+    rad = b.get("opex") or {}
+    mj = rad.get("major") or {}
+    gex = rad.get("gex") or {}
+    if mj:
+        q = "QUAD-WITCHING" if mj.get("is_quarterly") else "monthly OpEx"
+        lines.append(f"\U0001F5D3 Next major OpEx: <b>{mj.get('date','?')}</b> ({mj.get('dte','?')}d, {q})")
+    if gex:
+        flip = gex.get("zero_gamma")
+        lines.append("\U0001F4C8 SPY gamma: <b>" + str(gex.get("gex_signal", "?")) + "</b>"
+                     + (f" | flip ${flip:.0f}" if flip else ""))
+        if gex.get("gex_signal") == "TRENDING":
+            lines.append("<i>Negative gamma -> dealers amplify moves; expect bigger swings.</i>")
+        elif gex.get("gex_signal") == "PINNING":
+            lines.append("<i>Positive gamma -> dealers dampen moves; range/mean-revert bias.</i>")
+    lines.append("")
+    lines.append("<b>\U0001F30D Events to watch</b>  (optimistic / pessimistic / balanced)")
+
+    for key, ev in b.get("events", []):
+        lead = ev["chain"][0] if ev.get("chain") else None
+        lead_trade = (f"{lead[3]} ({lead[2]})" if lead else "")
+        lines.append("")
+        lines.append(f"<b>{ev['title']}</b>  <code>/event {key}</code>")
+        if key in news:
+            lines.append(f"🔥 <i>{news[key][0][:90]}</i>")
+        lines.append(f"\U0001F7E2 <b>Bull:</b> {ev['thesis']}")
+        lines.append(f"\U0001F534 <b>Bear:</b> {ev['caveat']}")
+        if lead:
+            lines.append(f"⚖️ <b>Play:</b> {lead_trade} — <i>{lead[4]}</i>")
+        lines.append(f"\U0001F6E1 <b>Hedge:</b> {ev['hedge']}")
+
+    lines += ["",
+        "<i>Tap /event NAME for the full 1st/2nd/3rd-order chain, or /opex for the expiration radar.</i>",
+        "<i>Educational - not advice. Size for being wrong; let options price the odds.</i>"]
+    return "\n".join(lines)
+
+async def briefing_command(update, ctx):
+    """/briefing - daily macro event brief with optimistic/pessimistic/balanced views."""
+    conn = get_conn()
+    try:
+        b = morning_briefing(conn)
+    finally:
+        conn.close()
+    await update.message.reply_text(_fmt_briefing(b), parse_mode=H, reply_markup=_kb_brief())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── EVENT NEWS TAGGING  +  AUTO MORNING BRIEF  +  EVENT JOURNAL
+# ═══════════════════════════════════════════════════════════════════
+# Keywords that map a live headline to a macro event in MACRO_EVENT_MAP.
+_EVENT_NEWS_KW = {
+    "iran":           ["iran", "tehran", "sanction", "nuclear deal", "jcpoa"],
+    "war":            ["war", "missile", "airstrike", "attack", "conflict", "escalat",
+                       "invasion", "gaza", "israel", "ukraine", "strike on"],
+    "oil_spike":      ["oil", "crude", "opec", "hormuz", "brent", "wti", "barrel"],
+    "fed_cut":        ["rate cut", "dovish", "fed cut", "cut rates", "easing", "pivot"],
+    "fed_hike":       ["rate hike", "hawkish", "hike rates", "raise rates", "tightening"],
+    "china_stimulus": ["china", "beijing", "stimulus", "pboc", "yuan", "reopening"],
+    "usd_up":         ["dollar", "dxy", "greenback"],
+}
+
+# Primary tracking instrument + expected direction per event (for the journal).
+_EVENT_TRACK = {
+    "iran":           ("USO", "SHORT"),
+    "oil_spike":      ("XLE", "LONG"),
+    "fed_cut":        ("TLT", "LONG"),
+    "fed_hike":       ("TLT", "SHORT"),
+    "war":            ("GLD", "LONG"),
+    "china_stimulus": ("FXI", "LONG"),
+    "usd_up":         ("UUP", "LONG"),
+}
+
+def _last_price(ticker):
+    try:
+        h = yf.Ticker(ticker).history(period="5d")
+        if len(h) >= 1 and float(h["Close"].iloc[-1]) > 0:
+            return float(h["Close"].iloc[-1])
+    except Exception:
+        pass
+    return _stooq_price(ticker)
+
+def _fetch_macro_headlines(limit=40):
+    """Pull recent macro headlines from Yahoo RSS (no API key). Returns list of
+    (title, link, when)."""
+    try:
+        import feedparser, html as _h, time as _t
+    except Exception:
+        return []
+    feeds = ["CL=F", "^VIX", "SPY", "GLD", "^TNX", "DX=F", "XLE", "FXI"]
+    seen, out = set(), []
+    for sym in feeds:
+        try:
+            fp = feedparser.parse(
+                f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={sym}&region=US&lang=en-US")
+            for e in fp.entries[:6]:
+                title = _h.unescape(e.get("title", "")).strip()
+                if not title or len(title) < 20:
+                    continue
+                k = title[:55].lower()
+                if k in seen:
+                    continue
+                seen.add(k)
+                pp = e.get("published_parsed", None)
+                when = (_t.strftime("%d%b %H:%M", pp).lstrip("0") if pp else "")
+                out.append((title, e.get("link", "").strip(), when))
+        except Exception:
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
+def _event_news_matches(headlines, keys=None):
+    """Map each event key to its most recent matching headline. {key: (title, link, when)}."""
+    keys = keys or list(_EVENT_NEWS_KW)
+    res = {}
+    for title, link, when in headlines:
+        tl = title.lower()
+        for k in keys:
+            if k in res:
+                continue
+            if any(kw in tl for kw in _EVENT_NEWS_KW.get(k, [])):
+                res[k] = (title, link, when)
+    return res
+
+def _setup_event_journal(conn):
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS event_journal ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT, ticker TEXT,"
+            " direction TEXT, entry_price REAL, entry_date TEXT,"
+            " status TEXT DEFAULT 'OPEN', exit_price REAL, note TEXT)")
+        conn.commit()
+    except Exception:
+        pass
+
+def event_journal_log(conn, event_key, ticker=None, direction=None, note=""):
+    """Log an event-driven idea so its outcome can be tracked. Defaults to the
+    event's primary tracking instrument."""
+    _setup_event_journal(conn)
+    ev = event_trade_map(event_key)
+    if not ev:
+        return None
+    real_key = next((k for k in MACRO_EVENT_MAP if MACRO_EVENT_MAP[k] is ev), event_key)
+    if not ticker or not direction:
+        t_def = _EVENT_TRACK.get(real_key, (None, "LONG"))
+        ticker = ticker or t_def[0]
+        direction = (direction or t_def[1]).upper()
+    if not ticker:
+        return None
+    px = _last_price(ticker)
+    today = datetime.now().strftime("%m-%d-%Y")
+    try:
+        conn.execute(
+            "INSERT INTO event_journal (event_key, ticker, direction, entry_price, entry_date, status, note)"
+            " VALUES (?,?,?,?,?, 'OPEN', ?)",
+            (real_key, ticker.upper(), direction.upper(), px, today, note))
+        conn.commit()
+    except Exception:
+        return None
+    return {"event": real_key, "ticker": ticker.upper(), "direction": direction.upper(),
+            "entry": px, "date": today}
+
+def _fmt_journal_review(conn):
+    _setup_event_journal(conn)
+    try:
+        df = pd.read_sql("SELECT * FROM event_journal ORDER BY id DESC", conn)
+    except Exception:
+        return "Event journal empty. Log one with <code>/logevent iran</code>."
+    if df.empty:
+        return ("\U0001F4D3 <b>EVENT JOURNAL</b>\nNo entries yet.\n"
+                "Log an event idea: <code>/logevent iran</code>")
+    lines = ["\U0001F4D3 <b>EVENT JOURNAL REVIEW</b>", ""]
+    wins = total = 0
+    for _, r in df.iterrows():
+        tkr = str(r["ticker"]); direction = str(r["direction"])
+        entry = float(r["entry_price"] or 0)
+        cur = _last_price(tkr)
+        move = (cur - entry) / entry * 100 if entry > 0 else 0.0
+        working = (move > 0 and direction == "LONG") or (move < 0 and direction == "SHORT")
+        edge = move if direction == "LONG" else -move
+        total += 1
+        if edge > 0:
+            wins += 1
+        ico = "\U0001F7E2" if working else "\U0001F534"
+        lines.append(f"{ico} <b>{str(r['event_key'])}</b> {direction} {tkr}")
+        lines.append(f"   entry ${entry:.2f} → ${cur:.2f}  ({move:+.1f}%, edge {edge:+.1f}%)  {str(r['entry_date'])}")
+    hit = (wins / total * 100) if total else 0
+    _k = _kelly_fraction(wins / total, 1.0) if total else 0.0
+    lines += ["", f"<b>Track record:</b> {wins}/{total} working ({hit:.0f}%)",
+              f"<b>Suggested size:</b> ~{_k*50:.0f}% of risk budget (half-Kelly)",
+              "<i>Edge = move in your direction. This is YOUR realised history, not a prediction.</i>"]
+    return "\n".join(lines)
+
+async def journal_command(update, ctx):
+    """/journal - review your logged event trades + running hit-rate."""
+    conn = get_conn()
+    try:
+        msg = _fmt_journal_review(conn)
+    finally:
+        conn.close()
+    await update.message.reply_text(msg, parse_mode=H)
+
+async def logevent_command(update, ctx):
+    """/logevent EVENT [TICKER] [LONG|SHORT] - log an event-driven trade idea."""
+    args = list(getattr(ctx, "args", []) or [])
+    if not args:
+        await update.message.reply_text(
+            "Usage: <code>/logevent iran</code> or <code>/logevent iran USO SHORT</code>\n"
+            f"Events: <code>{', '.join(sorted(MACRO_EVENT_MAP))}</code>", parse_mode=H)
+        return
+    ek = args[0]
+    tkr = args[1] if len(args) > 1 else None
+    direction = args[2] if len(args) > 2 else None
+    conn = get_conn()
+    try:
+        rec = event_journal_log(conn, ek, tkr, direction)
+    finally:
+        conn.close()
+    if not rec:
+        await update.message.reply_text(
+            f"Unknown event '{ek}'. Try: <code>{', '.join(sorted(MACRO_EVENT_MAP))}</code>", parse_mode=H)
+        return
+    await update.message.reply_text(
+        f"✅ Logged <b>{rec['event']}</b>: {rec['direction']} {rec['ticker']} @ ${rec['entry']:.2f} ({rec['date']}).\n"
+        "Track it any time with /journal.", parse_mode=H)
+
+async def briefing_alert(ctx):
+    """Daily auto-send of the morning event brief (scheduled)."""
+    try:
+        _, chat_id = load_creds()
+        conn = get_conn()
+        try:
+            msg = _fmt_briefing(morning_briefing(conn))
+        finally:
+            conn.close()
+        await ctx.bot.send_message(chat_id=int(chat_id), text=msg, parse_mode=H)
+    except Exception as e:
+        log.warning(f"briefing_alert failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── REFRESH / MONITOR(FREEZE) / BOOKMARK  buttons + handlers
+# ═══════════════════════════════════════════════════════════════════
+def _kb_brief():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="brief_refresh"),
+         InlineKeyboardButton("📌 Bookmark", callback_data="bm|brief|latest")],
+        [InlineKeyboardButton("🔖 Bookmarks", callback_data="show_bookmarks")]])
+
+def _kb_opex():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="opex_refresh"),
+         InlineKeyboardButton("📌 Bookmark", callback_data="bm|opex|latest")]])
+
+def _kb_event(key):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data=f"event_refresh|{key}"),
+         InlineKeyboardButton("❄️ Monitor", callback_data=f"event_mon|{key}")],
+        [InlineKeyboardButton("📌 Bookmark", callback_data=f"bm|event|{key}")]])
+
+def _setup_bookmarks(conn):
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS bookmarks (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                     " kind TEXT, label TEXT, content TEXT, created TEXT)")
+        conn.commit()
+    except Exception:
+        pass
+
+def bookmark_save(conn, kind, label, content):
+    _setup_bookmarks(conn)
+    try:
+        conn.execute("INSERT INTO bookmarks (kind,label,content,created) VALUES (?,?,?,?)",
+                     (kind, label, content, datetime.now().strftime("%m-%d-%Y %H:%M")))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+
+def _fmt_bookmarks(conn):
+    _setup_bookmarks(conn)
+    try:
+        df = pd.read_sql("SELECT * FROM bookmarks ORDER BY id DESC LIMIT 20", conn)
+    except Exception:
+        df = None
+    if df is None or df.empty:
+        return "🔖 No bookmarks yet. Tap 📌 Bookmark on any brief/event/opex."
+    lines = ["🔖 <b>BOOKMARKS</b>", ""]
+    for _, r in df.iterrows():
+        lines.append(f"#{int(r['id'])} <b>{r['kind']}:{r['label']}</b>  <i>{r['created']}</i>")
+    lines += ["", "Open one: <code>/bookmarks ID</code>"]
+    return "\n".join(lines)
+
+async def bookmarks_command(update, ctx):
+    """/bookmarks [ID] - list saved bookmarks, or open one by id."""
+    args = list(getattr(ctx, "args", []) or [])
+    conn = get_conn()
+    try:
+        if args and str(args[0]).isdigit():
+            _setup_bookmarks(conn)
+            df = pd.read_sql("SELECT content FROM bookmarks WHERE id=?", conn, params=(int(args[0]),))
+            msg = df["content"].iloc[0] if not df.empty else "Bookmark not found."
+        else:
+            msg = _fmt_bookmarks(conn)
+    finally:
+        conn.close()
+    await update.message.reply_text(msg, parse_mode=H)
+
+async def bookmarks_view(query):
+    conn = get_conn()
+    try:
+        msg = _fmt_bookmarks(conn)
+    finally:
+        conn.close()
+    await query.message.reply_text(msg, parse_mode=H)
+
+async def briefing_view(query):
+    conn = get_conn()
+    try:
+        msg = _fmt_briefing(morning_briefing(conn))
+    finally:
+        conn.close()
+    await query.message.reply_text(msg, parse_mode=H, reply_markup=_kb_brief())
+
+async def opex_view(query):
+    conn = get_conn()
+    try:
+        msg = _fmt_opex_report(opex_radar(conn))
+    finally:
+        conn.close()
+    await query.message.reply_text(msg, parse_mode=H, reply_markup=_kb_opex())
+
+async def event_view(query, key):
+    await query.message.reply_text(_fmt_event_report(event_trade_map(key)),
+                                   parse_mode=H, reply_markup=_kb_event(key))
+
+async def event_monitor_btn(query, key):
+    conn = get_conn()
+    try:
+        rec = event_journal_log(conn, key)
+    finally:
+        conn.close()
+    if rec:
+        await query.message.reply_text(
+            f"❄️ Monitoring <b>{rec['event']}</b>: {rec['direction']} {rec['ticker']} @ ${rec['entry']:.2f}.\n"
+            "Track it any time with /journal.", parse_mode=H)
+    else:
+        await query.message.reply_text("Could not monitor that event.", parse_mode=H)
+
+async def bookmark_btn(query, kind, key):
+    conn = get_conn()
+    try:
+        if kind == "brief":
+            content = _fmt_briefing(morning_briefing(conn))
+        elif kind == "opex":
+            content = _fmt_opex_report(opex_radar(conn))
+        elif kind == "event":
+            content = _fmt_event_report(event_trade_map(key))
+        elif kind == "gex":
+            try:
+                _df = pd.read_sql("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'", conn)
+                _tks = [str(t).upper() for t in _df["ticker"].tolist()] if not _df.empty else ["SPY"]
+            except Exception:
+                _tks = ["SPY"]
+            content = (chr(10) + chr(10)).join(_gex_reports(conn, _tks))
+        else:
+            content = str(key)
+        ok = bookmark_save(conn, kind, key or kind, content)
+    finally:
+        conn.close()
+    await query.message.reply_text(
+        "📌 Saved to bookmarks. View with /bookmarks." if ok else "Bookmark failed.", parse_mode=H)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── /gex POSITION-AWARE GAMMA  +  GOOGLE-NEWS PER-EVENT
+# ═══════════════════════════════════════════════════════════════════
+_EVENT_NEWS_QUERY = {
+    "iran":           "Iran sanctions oil nuclear deal",
+    "war":            "Middle East war conflict escalation",
+    "oil_spike":      "oil price OPEC crude Hormuz",
+    "fed_cut":        "Federal Reserve interest rate cut",
+    "fed_hike":       "Federal Reserve interest rate hike",
+    "china_stimulus": "China stimulus economy PBOC",
+    "usd_up":         "US dollar DXY strength",
+}
+
+def _event_news_google(keys=None):
+    """Targeted per-event headlines from Google News RSS (no key). {key:(title,link,when)}."""
+    keys = keys or list(_EVENT_NEWS_QUERY)
+    try:
+        import feedparser, html as _h, time as _t, urllib.parse as _u
+    except Exception:
+        return {}
+    res = {}
+    for k in keys:
+        q = _EVENT_NEWS_QUERY.get(k) or k
+        try:
+            fp = feedparser.parse(
+                "https://news.google.com/rss/search?q=" + _u.quote(q) + "&hl=en-US&gl=US&ceid=US:en")
+            for e in fp.entries[:1]:
+                title = _h.unescape(e.get("title", "")).strip()
+                if not title:
+                    continue
+                pp = e.get("published_parsed", None)
+                when = _t.strftime("%d%b %H:%M", pp).lstrip("0") if pp else ""
+                res[k] = (title, e.get("link", "").strip(), when)
+        except Exception:
+            continue
+    return res
+
+def _gex_spot(conn, tk):
+    s = _opex_spot(conn, tk)
+    if s <= 0:
+        s = _last_price(tk)
+    return s
+
+def _fmt_gex_report(g, tk, spot, pos=None):
+    if not g or not g.get("total_gex"):
+        return f"📐 <b>{tk} GEX</b>: no options data in DB for this ticker."
+    reg = g.get("gex_signal", "?")
+    flip = g.get("zero_gamma"); cw = g.get("call_wall"); pw = g.get("put_wall")
+    gm = g.get("total_gex_m", 0.0)
+    lines = [f"📐 <b>{tk} GAMMA / GEX</b>  spot ${spot:.2f}",
+             f"Regime: <b>{reg}</b>  · exp {g.get('expiry','?')} ({g.get('dte','?')}d)",
+             f"Total GEX: {gm:+.1f}M"]
+    wl = []
+    if pw:   wl.append(f"Put wall (support)  ${pw:.0f}")
+    if flip: wl.append(f"Gamma flip          ${flip:.0f}")
+    if cw:   wl.append(f"Call wall (resist)  ${cw:.0f}")
+    if wl:
+        lines.append("<pre>" + "\n".join(wl) + "</pre>")
+    if reg == "TRENDING":
+        lines.append("⚡ <b>Negative gamma:</b> dealers amplify moves — expect bigger swings/trends. "
+                     "Favors LONG options & breakouts; risky to sell premium.")
+    elif reg == "PINNING":
+        lines.append("🧲 <b>Positive gamma:</b> dealers dampen moves — range-bound/pinned. "
+                     "Favors selling premium (iron condor / credit spreads) near the walls.")
+    if flip and spot:
+        lines.append(f"Spot is <b>{'above' if spot >= flip else 'below'}</b> the flip "
+                     + ("→ stabilising bias." if spot >= flip else "→ volatile / trend bias."))
+    if pos is not None and not pos.empty:
+        lines.append("<b>Your legs vs gamma:</b>")
+        for _, p in pos.iterrows():
+            ot = str(p["option_type"]).upper()[:1]
+            k = float(p["strike"] or 0)
+            q = int(p.get("quantity", 1) or 1)
+            side = "short" if q < 0 else "long"
+            if cw and ot == "C" and side == "short":
+                note = (f"short call ${k:.0f} "
+                        + (f"above call wall ${cw:.0f} → low pin risk" if k >= cw
+                           else f"below call wall ${cw:.0f} → capped / pin risk"))
+            elif pw and ot == "P" and side == "long":
+                note = (f"long put ${k:.0f} "
+                        + (f"below put wall ${pw:.0f} → past support" if k <= pw
+                           else f"above put wall ${pw:.0f} → support sits below"))
+            else:
+                ref = cw if ot == "C" else pw
+                note = f"{side} {ot} ${k:.0f}" + (f" vs wall ${ref:.0f}" if ref else "")
+            lines.append(f"• {note}")
+    return "\n".join(lines)
+
+def _kb_gex():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="gex_refresh"),
+         InlineKeyboardButton("📌 Bookmark", callback_data="bm|gex|positions")]])
+
+def _fmt_squeeze_inline(sq):
+    """One-line short-interest / days-to-cover / covering tag for position views."""
+    if not sq or sq.get("short_pct") is None:
+        return "‍Short interest: n/a (no float data)"
+    parts = [f"Short {sq['short_pct']:.0f}% float"]
+    if sq.get("dtc"):
+        parts.append(f"DTC {sq['dtc']:.1f}")
+    if sq.get("si_chg_pct") is not None:
+        parts.append(f"SI {sq['si_chg_pct']:+.0f}% MoM")
+    tag = f"{sq.get('emoji','')} squeeze {sq.get('score',0)}/5 {sq.get('stage','')}"
+    rec = ""
+    if sq.get("score", 0) >= 3:
+        rec = " - covering/squeeze risk: bullish, trim shorts"
+    elif sq.get("si_chg_pct") is not None and sq["si_chg_pct"] < -5:
+        rec = " - shorts already covering"
+    return "🩳 <b>" + " . ".join(parts) + "</b>  [" + tag + "]" + rec
+
+
+def _to_mdy(s):
+    for f in ("%Y-%m-%d", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(str(s)[:10], f).strftime("%m-%d-%Y")
+        except ValueError:
+            continue
+    return None
+
+
+def _gex_reports(conn, tickers=None, position_aware=True):
+    out = []
+    for tk in (tickers or ["SPY"])[:6]:
+        spot = _gex_spot(conn, tk)
+        pos = None
+        if position_aware:
+            try:
+                pos = pd.read_sql(
+                    "SELECT option_type, strike, quantity, expiry FROM trades"
+                    " WHERE status='OPEN' AND UPPER(ticker)=?", conn, params=(tk.upper(),))
+            except Exception:
+                pos = None
+        exps = [None]
+        if pos is not None and not pos.empty:
+            _e = []
+            for ev in sorted(pos["expiry"].dropna().astype(str).unique()):
+                m = _to_mdy(ev)
+                if m and m not in _e:
+                    _e.append(m)
+            if _e:
+                exps = _e
+        for exp in exps:
+            g = _compute_gex(tk, conn, spot, expiry=exp)
+            legs = pos
+            if pos is not None and not pos.empty and exp is not None:
+                legs = pos[pos["expiry"].astype(str).apply(lambda x: _to_mdy(x) == exp)]
+            rep = _fmt_gex_report(g, tk, spot, legs)
+            try:
+                rep += chr(10) + _fmt_squeeze_inline(short_squeeze_signal(tk, conn))
+            except Exception:
+                pass
+            try:
+                _vc = _compute_vanna_charm(tk, conn, spot, want_exp=exp)
+                if _vc.get("vex"):
+                    rep += chr(10) + "🌀 Vanna " + ("+" if _vc["vex"] > 0 else "") + f"{_vc['vex']/1e6:.1f}M — " + _vc["note"]
+            except Exception:
+                pass
+            out.append(rep)
+    return out
+
+async def gex_command(update, ctx):
+    """/gex [TICKERS] - gamma walls/flip/regime + position-aware notes. No arg = open positions."""
+    args = list(getattr(ctx, "args", []) or [])
+    conn = get_conn()
+    try:
+        if args:
+            tks = [a.upper() for a in args]
+        else:
+            try:
+                df = pd.read_sql("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'", conn)
+                tks = [str(t).upper() for t in df["ticker"].tolist()] if not df.empty else []
+            except Exception:
+                tks = []
+            if not tks:
+                tks = ["SPY"]
+        msgs = _gex_reports(conn, tks)
+    finally:
+        conn.close()
+    await update.message.reply_text("\n\n".join(msgs) if msgs else "No GEX data.",
+                                    parse_mode=H, reply_markup=_kb_gex())
+
+async def gex_view(query):
+    conn = get_conn()
+    try:
+        try:
+            df = pd.read_sql("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'", conn)
+            tks = [str(t).upper() for t in df["ticker"].tolist()] if not df.empty else ["SPY"]
+        except Exception:
+            tks = ["SPY"]
+        msgs = _gex_reports(conn, tks)
+    finally:
+        conn.close()
+    await query.message.reply_text("\n\n".join(msgs) if msgs else "No GEX data.",
+                                   parse_mode=H, reply_markup=_kb_gex())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── DATA FEEDS: Stooq price fallback + FRED macro + AlphaVantage sentiment
+# ═══════════════════════════════════════════════════════════════════
+def _stooq_price(ticker):
+    """EOD close from Stooq (free, no key) - yfinance fallback."""
+    try:
+        import urllib.request, csv, io
+        url = f"https://stooq.com/q/l/?s={str(ticker).lower()}.us&f=sd2t2ohlcv&h&e=csv"
+        with urllib.request.urlopen(url, timeout=8) as r:
+            txt = r.read().decode("utf-8", "ignore")
+        rows = list(csv.DictReader(io.StringIO(txt)))
+        if rows:
+            v = rows[0].get("Close")
+            if v not in (None, "", "N/D"):
+                return float(v)
+    except Exception:
+        pass
+    return 0.0
+
+_FRED_SERIES = [
+    ("DGS10",       "10Y Yield",   "%"),
+    ("DFF",         "Fed Funds",   "%"),
+    ("T10Y2Y",      "10Y-2Y",      "%"),
+    ("DCOILWTICO",  "WTI Oil",     "$"),
+    ("UNRATE",      "Unemploy",    "%"),
+    ("VIXCLS",      "VIX",         ""),
+    ("DTWEXBGS",    "USD Index",   ""),
+]
+
+def _fred_latest(series_id, api_key=None):
+    key = api_key or os.environ.get("FRED_API_KEY", "")
+    if not key:
+        return None
+    try:
+        import urllib.request, json as _j
+        url = (f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}"
+               f"&api_key={key}&file_type=json&sort_order=desc&limit=2")
+        with urllib.request.urlopen(url, timeout=8) as r:
+            d = _j.loads(r.read().decode())
+        obs = [o for o in d.get("observations", []) if o.get("value") not in (".", "", None)]
+        if obs:
+            latest = float(obs[0]["value"])
+            prev = float(obs[1]["value"]) if len(obs) > 1 else latest
+            return {"value": latest, "prev": prev, "date": obs[0]["date"]}
+    except Exception:
+        return None
+    return None
+
+def _av_sentiment(tickers="SPY,QQQ", api_key=None):
+    """AlphaVantage NEWS_SENTIMENT average (free key). Returns {avg,label,n,top} or None."""
+    key = api_key or os.environ.get("ALPHAVANTAGE_KEY", "")
+    if not key:
+        return None
+    try:
+        import urllib.request, json as _j
+        url = (f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={tickers}"
+               f"&apikey={key}&limit=20")
+        with urllib.request.urlopen(url, timeout=10) as r:
+            d = _j.loads(r.read().decode())
+        feed = d.get("feed", [])
+        if not feed:
+            return None
+        scores = [float(a.get("overall_sentiment_score", 0)) for a in feed]
+        avg = sum(scores) / len(scores) if scores else 0.0
+        label = "Bullish" if avg > 0.15 else ("Bearish" if avg < -0.15 else "Neutral")
+        return {"avg": avg, "label": label, "n": len(feed), "top": feed[0].get("title", "")}
+    except Exception:
+        return None
+
+def _fmt_macro_report():
+    lines = ["📊 <b>MACRO DASHBOARD</b>", ""]
+    if not os.environ.get("FRED_API_KEY"):
+        lines.append("<i>No FRED_API_KEY set. Free key at fred.stlouisfed.org/docs/api/api_key.html "
+                     "→ set env FRED_API_KEY for live macro.</i>")
+    else:
+        rows = []
+        for sid, name, unit in _FRED_SERIES:
+            d = _fred_latest(sid)
+            if not d:
+                continue
+            chg = d["value"] - d["prev"]
+            arrow = "UP" if chg > 0 else ("DN" if chg < 0 else "--")
+            rows.append(f"{name:<10}{d['value']:>8.2f}{unit:<1} {arrow}")
+        if rows:
+            lines.append("<pre>" + "\n".join(rows) + "</pre>")
+        else:
+            lines.append("Could not fetch FRED data.")
+    sent = _av_sentiment("SPY,QQQ")
+    if sent:
+        lines += ["", f"📰 <b>News sentiment:</b> {sent['label']} ({sent['avg']:+.2f}, {sent['n']} articles)"]
+    elif not os.environ.get("ALPHAVANTAGE_KEY"):
+        lines += ["", "<i>Set ALPHAVANTAGE_KEY for news-sentiment (free at alphavantage.co).</i>"]
+    return "\n".join(lines)
+
+async def macro_command(update, ctx):
+    """/macro - FRED macro indicators + AlphaVantage news sentiment (keys optional)."""
+    await update.message.reply_text(_fmt_macro_report(), parse_mode=H)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── MACRO/EVENT HUB — button menu (no typing needed)
+# ═══════════════════════════════════════════════════════════════════
+HUB_MENU_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("☀️ Briefing", callback_data="brief_refresh"),
+     InlineKeyboardButton("🗓️ OpEx", callback_data="opex_refresh")],
+    [InlineKeyboardButton("📐 GEX (positions)", callback_data="gex_refresh"),
+     InlineKeyboardButton("🩳 Short Interest", callback_data="sq_scan")],
+    [InlineKeyboardButton("🌍 Events", callback_data="ev_menu"),
+     InlineKeyboardButton("📓 Journal", callback_data="jr_view")],
+    [InlineKeyboardButton("📊 Macro", callback_data="macro_view"),
+     InlineKeyboardButton("🔖 Bookmarks", callback_data="show_bookmarks")],
+    [InlineKeyboardButton("🚀 Momentum", callback_data="mom_view"),
+     InlineKeyboardButton("🧭 Regime", callback_data="regime_view"),
+     InlineKeyboardButton("🌀 Vanna", callback_data="vanna_view")],
+    [BACK_BTN],
+])
+
+def _events_kb():
+    rows = []
+    keys = sorted(MACRO_EVENT_MAP)
+    for i in range(0, len(keys), 2):
+        rows.append([InlineKeyboardButton(MACRO_EVENT_MAP[k]["title"][:20],
+                                          callback_data="event_refresh|" + k)
+                     for k in keys[i:i+2]])
+    rows.append([InlineKeyboardButton("⬅️ Hub", callback_data="hub_menu")])
+    return InlineKeyboardMarkup(rows)
+
+async def squeeze_view(query):
+    conn = get_conn()
+    try:
+        try:
+            df = pd.read_sql("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'", conn)
+            tks = [str(t).upper() for t in df["ticker"].tolist()] if not df.empty else []
+        except Exception:
+            tks = []
+        if not tks:
+            tks = DEFAULT_TICKERS[:8]
+        rows = ["🩳 <b>SHORT INTEREST / SQUEEZE</b>",
+                "<i>(open positions, or watchlist if none)</i>", ""]
+        for tk in tks[:8]:
+            try:
+                s = short_squeeze_signal(tk, conn)
+                sp = s.get("short_pct"); dtc = s.get("dtc")
+                if sp is not None:
+                    rows.append(f"{s['emoji']} <b>{tk}</b> {s['score']}/5 {s['stage']} "
+                                f"| SI {sp:.0f}% DTC {dtc or 0:.1f}")
+                else:
+                    rows.append(f"⚪ <b>{tk}</b> — no short-interest data")
+            except Exception:
+                pass
+    finally:
+        conn.close()
+    rows += ["", "<i>Full detail: /squeeze TICKER</i>"]
+    await query.message.reply_text("\n".join(rows), parse_mode=H, reply_markup=HUB_MENU_KB)
+
+async def journal_view(query):
+    conn = get_conn()
+    try:
+        msg = _fmt_journal_review(conn)
+    finally:
+        conn.close()
+    await query.message.reply_text(msg, parse_mode=H, reply_markup=HUB_MENU_KB)
+
+async def macro_view(query):
+    await query.message.reply_text(_fmt_macro_report(), parse_mode=H, reply_markup=HUB_MENU_KB)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── ADVANCED SIGNALS: Vanna/Charm · Momentum(12-1) · Risk Regime · FOMC · Kelly · PEAD
+# ═══════════════════════════════════════════════════════════════════
+
+def _bs_vanna_charm(S, K, T, sigma, r=0.045):
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return (0.0, 0.0)
+    try:
+        srt = sigma * _math.sqrt(T)
+        d1 = (_math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / srt
+        d2 = d1 - srt
+        pdf = float(_spnorm.pdf(d1))
+        vanna = -pdf * d2 / sigma
+        charm = -pdf * (2 * r * T - d2 * srt) / (2 * T * srt)
+        return (vanna, charm)
+    except Exception:
+        return (0.0, 0.0)
+
+def _compute_vanna_charm(ticker, conn, spot, want_exp=None):
+    """Net dealer vanna/charm exposure for the nearest liquid expiry."""
+    out = {"vex": 0.0, "charm": 0.0, "note": "", "expiry": None}
+    if not spot or spot <= 0:
+        return out
+    try:
+        ld = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker,))
+        if ld.empty:
+            return out
+        date_str = ld["trade_date_now"].iloc[0]
+        ref = datetime.strptime(date_str, "%m-%d-%Y").date()
+    except Exception:
+        return out
+    try:
+        edf = pd.read_sql(
+            "SELECT expiry_date, SUM(openInt_Call_now)+SUM(openInt_Put_now) AS oi"
+            " FROM options_change WHERE ticker=? AND trade_date_now=? GROUP BY expiry_date",
+            conn, params=(ticker, date_str))
+    except Exception:
+        return out
+    cand = []
+    for _, e in edf.iterrows():
+        ed = _opex_parse_date(e["expiry_date"])
+        if ed:
+            dte = (ed - ref).days
+            if dte >= 0:
+                cand.append((dte, float(e["oi"] or 0), str(e["expiry_date"])))
+    if not cand:
+        return out
+    if want_exp:
+        _m = [c for c in cand if c[2] == want_exp]
+        if _m:
+            dte, _oi, expiry = _m[0]
+        else:
+            _pool = [c for c in cand if c[0] >= 1] or cand
+            dte, _oi, expiry = min(_pool, key=lambda c: c[0])
+    else:
+        _pool = [c for c in cand if c[0] >= 1] or cand
+        near = [c for c in _pool if c[0] <= 60]
+        dte, _oi, expiry = (max(near, key=lambda c: c[1]) if near else min(_pool, key=lambda c: c[0]))
+    T = max(dte / 365.0, 1.0 / 365.0)
+    out["expiry"] = expiry
+    try:
+        df = pd.read_sql(
+            "SELECT strike, SUM(openInt_Call_now) AS c_oi, SUM(openInt_Put_now) AS p_oi,"
+            " AVG(CASE WHEN lastPrice_Call_now>0 THEN lastPrice_Call_now END) AS c_px"
+            " FROM options_change WHERE ticker=? AND trade_date_now=? AND expiry_date=? GROUP BY strike",
+            conn, params=(ticker, date_str, expiry))
+    except Exception:
+        return out
+    vex = charm = 0.0
+    for _, r in df.iterrows():
+        K = float(r["strike"]); c_oi = float(r["c_oi"] or 0); p_oi = float(r["p_oi"] or 0)
+        if c_oi <= 0 and p_oi <= 0:
+            continue
+        c_px = float(r["c_px"] or 0); sigma = 0.30
+        if c_px > 0.10 and abs(K - spot) / spot < 0.30 and K >= spot * 0.85:
+            try:
+                iv = _implied_vol_hp(c_px, spot, K, T)
+                if iv and 0.03 < iv < 3.0:
+                    sigma = iv
+            except Exception:
+                pass
+        sigma = max(0.05, min(sigma, 3.0))
+        va, ch = _bs_vanna_charm(spot, K, T, sigma)
+        vex += va * (c_oi - p_oi) * spot * 0.01
+        charm += ch * (c_oi - p_oi) * spot * 0.01
+    out["vex"] = vex; out["charm"] = charm
+    out["note"] = ("a vol DROP makes dealers BUY (vanna tailwind / melt-up bias)."
+                   if vex > 0 else "a vol drop makes dealers SELL (vanna headwind).")
+    return out
+
+def _momentum_signal(ticker):
+    try:
+        h = yf.Ticker(ticker).history(period="13mo")
+        c = h["Close"].dropna()
+        if len(c) < 210:
+            return None
+        p_skip = float(c.iloc[-21]); p_year = float(c.iloc[-252]) if len(c) >= 252 else float(c.iloc[0])
+        ret_12_1 = (p_skip - p_year) / p_year * 100 if p_year > 0 else 0.0
+        ret_1m = (float(c.iloc[-1]) - p_skip) / p_skip * 100 if p_skip > 0 else 0.0
+        ma200 = float(c.rolling(200).mean().iloc[-1])
+        above200 = float(c.iloc[-1]) > ma200
+        return {"ret_12_1": ret_12_1, "ret_1m": ret_1m, "above200": above200}
+    except Exception:
+        return None
+
+def _hp_model_momentum(ticker, conn, spot):
+    m = _momentum_signal(ticker)
+    if not m:
+        return {"signal": "NEUTRAL", "prob": 50, "reason": "momentum: n/a"}
+    r = m["ret_12_1"]
+    if r > 20 and m["above200"]:
+        return {"signal": "BULL", "prob": min(80, 58 + r * 0.3), "reason": f"12-1 momentum +{r:.0f}% & >200DMA"}
+    if r < -15 and not m["above200"]:
+        return {"signal": "BEAR", "prob": min(80, 58 + abs(r) * 0.3), "reason": f"12-1 momentum {r:.0f}% & <200DMA"}
+    return {"signal": "NEUTRAL", "prob": 52, "reason": f"12-1 momentum {r:+.0f}%"}
+
+async def momentum_command(update, ctx):
+    """/momentum [TICKERS] - 12-1 momentum ranking (winners/losers)."""
+    args = list(getattr(ctx, "args", []) or [])
+    tks = [a.upper() for a in args] if args else DEFAULT_TICKERS
+    res = []
+    for tk in tks[:15]:
+        m = _momentum_signal(tk)
+        if m:
+            res.append((tk, m))
+    res.sort(key=lambda x: x[1]["ret_12_1"], reverse=True)
+    rows = ["🚀 <b>MOMENTUM (12-1)</b>", "<i>12-mo return, skip last month</i>", ""]
+    for tk, m in res:
+        ic = "🟢" if (m["ret_12_1"] > 20 and m["above200"]) else ("🔴" if m["ret_12_1"] < -15 else "⚪")
+        rows.append(f"{ic} <b>{tk}</b> {m['ret_12_1']:+.0f}%  1m {m['ret_1m']:+.0f}%  {'>200' if m['above200'] else '<200'}DMA")
+    await update.message.reply_text("\n".join(rows), parse_mode=H)
+
+_FOMC_DATES = ["01-28-2026", "03-18-2026", "04-29-2026", "06-17-2026",
+               "07-29-2026", "09-16-2026", "10-28-2026", "12-09-2026"]
+def _fomc_context():
+    today = datetime.now().date()
+    nxt = None
+    for d in _FOMC_DATES:
+        try:
+            dd = datetime.strptime(d, "%m-%d-%Y").date()
+        except Exception:
+            continue
+        if dd >= today:
+            nxt = dd; break
+    if not nxt:
+        return None
+    days = (nxt - today).days
+    return {"next": nxt.strftime("%b %d"), "days": days, "pre_drift": days in (0, 1)}
+
+def _risk_regime():
+    score = 0; parts = []
+    def _last(sym, period="1y"):
+        try:
+            return yf.Ticker(sym).history(period=period)["Close"].dropna()
+        except Exception:
+            return None
+    spy = _last("SPY")
+    if spy is not None and len(spy) >= 200:
+        above = float(spy.iloc[-1]) > float(spy.rolling(200).mean().iloc[-1])
+        score += 1 if above else -1
+        parts.append(("SPY vs 200DMA", "above ✅" if above else "below ❌"))
+    hyg = _last("HYG", "3mo"); lqd = _last("LQD", "3mo")
+    if hyg is not None and lqd is not None and len(hyg) >= 21 and len(lqd) >= 21:
+        ratio = (hyg / lqd).dropna()
+        up = float(ratio.iloc[-1]) > float(ratio.iloc[-21])
+        score += 1 if up else -1
+        parts.append(("Credit HYG/LQD", "improving ✅" if up else "weakening ❌"))
+    try:
+        tnx = float(yf.Ticker("^TNX").history(period="5d")["Close"].iloc[-1])
+        irx = float(yf.Ticker("^IRX").history(period="5d")["Close"].iloc[-1])
+        curve = tnx - irx
+        score += 1 if curve > 0 else -1
+        parts.append(("Curve 10y-3m", f"{curve:+.2f} {'normal ✅' if curve > 0 else 'inverted ❌'}"))
+    except Exception:
+        pass
+    try:
+        vix = float(yf.Ticker("^VIX").history(period="5d")["Close"].iloc[-1])
+        vix3 = float(yf.Ticker("^VIX3M").history(period="5d")["Close"].iloc[-1])
+        contango = vix < vix3
+        score += 1 if contango else -1
+        parts.append(("VIX term", "contango ✅" if contango else "backwardation ❌"))
+    except Exception:
+        pass
+    if score >= 2:
+        label, emoji = "RISK-ON", "🟢"
+    elif score <= -2:
+        label, emoji = "RISK-OFF", "🔴"
+    else:
+        label, emoji = "NEUTRAL", "🟡"
+    return {"score": score, "label": label, "emoji": emoji, "parts": parts}
+
+def _fmt_regime():
+    r = _risk_regime()
+    f = _fomc_context()
+    lines = [f"{r['emoji']} <b>RISK REGIME: {r['label']}</b>  (score {r['score']:+d})", ""]
+    for k, v in r["parts"]:
+        lines.append(f"• {k}: {v}")
+    lines.append("")
+    if r["label"] == "RISK-ON":
+        lines.append("<i>Favors longs/breakouts; size up high-conviction signals.</i>")
+    elif r["label"] == "RISK-OFF":
+        lines.append("<i>Favors hedges/cash; fade rallies, cut risk, buy protection.</i>")
+    else:
+        lines.append("<i>Mixed — be selective, trade smaller.</i>")
+    if f:
+        if f["pre_drift"]:
+            lines.append(f"📅 <b>Pre-FOMC drift window</b> (FOMC {f['next']}) — historically bullish into the meeting.")
+        else:
+            lines.append(f"📅 Next FOMC: {f['next']} ({f['days']}d).")
+    return "\n".join(lines)
+
+async def regime_command(update, ctx):
+    """/regime - risk-on/off master read (breadth, credit, curve, VIX term) + FOMC."""
+    await update.message.reply_text(_fmt_regime(), parse_mode=H)
+
+def _kelly_fraction(win_rate, payoff):
+    """Kelly f* = W - (1-W)/R. Returns fraction (0..1)."""
+    try:
+        w = float(win_rate); b = float(payoff)
+        if b <= 0:
+            return 0.0
+        f = w - (1 - w) / b
+        return max(0.0, min(f, 1.0))
+    except Exception:
+        return 0.0
+
+def _earnings_signal(ticker):
+    """PEAD: next earnings date/days + last surprise + drift lean."""
+    out = {"next": None, "days_to": None, "surprise": None, "lean": "NEUTRAL"}
+    try:
+        tk = yf.Ticker(ticker)
+        nd = None
+        try:
+            cal = tk.calendar
+            if isinstance(cal, dict):
+                ed = cal.get("Earnings Date")
+                nd = (ed[0] if isinstance(ed, (list, tuple)) and ed else ed)
+        except Exception:
+            pass
+        if nd is not None:
+            try:
+                nd2 = pd.Timestamp(nd).date()
+                out["next"] = nd2.strftime("%b %d")
+                out["days_to"] = (nd2 - datetime.now().date()).days
+            except Exception:
+                pass
+        try:
+            edf = tk.get_earnings_dates(limit=8)
+            if edf is not None and len(edf):
+                col = next((c for c in edf.columns if "Surprise" in c), None)
+                if col:
+                    past = edf.dropna(subset=[col])
+                    if len(past):
+                        out["surprise"] = float(past[col].iloc[0])
+        except Exception:
+            pass
+        s = out["surprise"]
+        if s is not None:
+            out["lean"] = "BULLISH drift" if s > 2 else ("BEARISH drift" if s < -2 else "NEUTRAL")
+    except Exception:
+        return out
+    return out
+
+async def earnings_command(update, ctx):
+    """/earnings TICKER - next earnings, last surprise, PEAD drift lean."""
+    args = list(getattr(ctx, "args", []) or [])
+    if not args:
+        await update.message.reply_text("Usage: <code>/earnings NVDA</code>", parse_mode=H)
+        return
+    tk = args[0].upper()
+    e = _earnings_signal(tk)
+    lines = [f"📅 <b>{tk} EARNINGS (PEAD)</b>", ""]
+    if e["next"]:
+        lines.append(f"Next: <b>{e['next']}</b>" + (f" ({e['days_to']}d)" if e['days_to'] is not None else ""))
+    if e["surprise"] is not None:
+        lines.append(f"Last surprise: <b>{e['surprise']:+.1f}%</b> → {e['lean']}")
+        lines.append("<i>PEAD: stocks tend to drift in the direction of the surprise for weeks.</i>")
+    else:
+        lines.append("<i>No recent surprise data.</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode=H)
+
+async def mom_view(query):
+    res = []
+    for tk in DEFAULT_TICKERS[:15]:
+        m = _momentum_signal(tk)
+        if m:
+            res.append((tk, m))
+    res.sort(key=lambda x: x[1]["ret_12_1"], reverse=True)
+    rows = ["🚀 <b>MOMENTUM (12-1)</b>", "<i>12-mo return, skip last month</i>", ""]
+    for tk, m in res:
+        ic = "🟢" if (m["ret_12_1"] > 20 and m["above200"]) else ("🔴" if m["ret_12_1"] < -15 else "⚪")
+        rows.append(f"{ic} <b>{tk}</b> {m['ret_12_1']:+.0f}%  1m {m['ret_1m']:+.0f}%")
+    await query.message.reply_text("\n".join(rows), parse_mode=H, reply_markup=HUB_MENU_KB)
+
+async def regime_view(query):
+    await query.message.reply_text(_fmt_regime(), parse_mode=H, reply_markup=HUB_MENU_KB)
+
+
+# ── Dedicated Vanna / Charm view ──
+def _fmt_vanna_report(ticker, conn, spot):
+    vc = _compute_vanna_charm(ticker, conn, spot)
+    if not vc or not vc.get("vex"):
+        return f"🌀 <b>{ticker} VANNA/CHARM</b>: no options data in DB."
+    lines = [f"🌀 <b>{ticker} VANNA / CHARM</b>  spot ${spot:.2f}",
+             f"<i>nearest expiry {vc.get('expiry','?')}</i>", "",
+             f"Vanna exposure: <b>{vc['vex']/1e6:+.1f}M</b>",
+             f"Charm exposure: <b>{vc['charm']/1e6:+.1f}M</b>", ""]
+    lines.append("🌀 <b>Vanna:</b> " + vc["note"])
+    lines.append("⏳ <b>Charm:</b> " + ("positive — dealer hedging adds upward drift into expiry (OpEx melt-up)."
+                                        if vc["charm"] > 0 else
+                                        "negative — charm flow pressures the downside into expiry."))
+    return "\n".join(lines)
+
+def _vanna_reports(conn, tickers=None):
+    out = []
+    for tk in (tickers or ["SPY"])[:6]:
+        spot = _gex_spot(conn, tk)
+        out.append(_fmt_vanna_report(tk, conn, spot))
+    return out
+
+async def vanna_command(update, ctx):
+    """/vanna [TICKERS] - dealer vanna/charm exposure (blank = open positions)."""
+    args = list(getattr(ctx, "args", []) or [])
+    conn = get_conn()
+    try:
+        if args:
+            tks = [a.upper() for a in args]
+        else:
+            try:
+                df = pd.read_sql("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'", conn)
+                tks = [str(t).upper() for t in df["ticker"].tolist()] if not df.empty else ["SPY"]
+            except Exception:
+                tks = ["SPY"]
+        msgs = _vanna_reports(conn, tks)
+    finally:
+        conn.close()
+    await update.message.reply_text("\n\n".join(msgs), parse_mode=H, reply_markup=HUB_MENU_KB)
+
+async def vanna_view(query):
+    conn = get_conn()
+    try:
+        try:
+            df = pd.read_sql("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'", conn)
+            tks = [str(t).upper() for t in df["ticker"].tolist()] if not df.empty else ["SPY"]
+        except Exception:
+            tks = ["SPY"]
+        msgs = _vanna_reports(conn, tks)
+    finally:
+        conn.close()
+    await query.message.reply_text("\n\n".join(msgs), parse_mode=H, reply_markup=HUB_MENU_KB)
+
+
 def main():
     _acquire_lock()
     token, chat_id = load_creds()
@@ -18914,6 +20387,18 @@ def main():
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_start))
+    app.add_handler(CommandHandler("opex", opex_command))
+    app.add_handler(CommandHandler("event", event_command))
+    app.add_handler(CommandHandler("briefing", briefing_command))
+    app.add_handler(CommandHandler("journal", journal_command))
+    app.add_handler(CommandHandler("logevent", logevent_command))
+    app.add_handler(CommandHandler("bookmarks", bookmarks_command))
+    app.add_handler(CommandHandler("gex", gex_command))
+    app.add_handler(CommandHandler("macro", macro_command))
+    app.add_handler(CommandHandler("momentum", momentum_command))
+    app.add_handler(CommandHandler("regime", regime_command))
+    app.add_handler(CommandHandler("earnings", earnings_command))
+    app.add_handler(CommandHandler("vanna", vanna_command))
     app.add_handler(CommandHandler("squeeze", squeeze_command))
 
     # Button callbacks
@@ -18928,6 +20413,7 @@ def main():
     if job_queue:
         from datetime import time as dt_time
         job_queue.run_daily(morning_alert, time=dt_time(14, 0, 0))  # 9 AM ET = 14:00 UTC
+        job_queue.run_daily(briefing_alert, time=dt_time(14, 5, 0))  # daily brief 9:05 AM ET
         log.info("Scheduled morning alert at 9:00 AM ET daily")
         # 15-min intraday alert (fires every 15 min; function checks market hours internally)
         job_queue.run_repeating(intraday_alert, interval=900, first=30)
