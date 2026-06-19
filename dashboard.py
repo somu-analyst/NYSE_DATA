@@ -12583,8 +12583,8 @@ if page == "📡 Macro/Event Hub":
 
     if _tbmod is not None:
         _hub_conn = get_conn()
-        _tb_brief, _tb_opex, _tb_sq, _tb_gex, _tb_ev, _tb_jr, _tb_mac = st.tabs(
-            ["☀️ Briefing", "🗓️ OpEx", "🩳 Squeeze", "📐 GEX", "🌍 Events", "📓 Journal", "📊 Macro"])
+        _tb_brief, _tb_opex, _tb_sq, _tb_gex, _tb_van, _tb_ev, _tb_jr, _tb_mac = st.tabs(
+            ["☀️ Briefing", "🗓️ OpEx", "🩳 Squeeze", "📐 GEX", "🌀 Vanna", "🌍 Events", "📓 Journal", "📊 Macro"])
 
         with _tb_brief:
             st.caption("Daily macro brief — optimistic / pessimistic / balanced, with live news.")
@@ -12623,6 +12623,16 @@ if page == "📡 Macro/Event Hub":
                     st.markdown("---")
             except Exception as e:
                 st.error(f"GEX error: {e}")
+
+        with _tb_van:
+            st.caption("Dealer vanna/charm (2nd-order greeks) — vanna rally / OpEx melt-up read.")
+            _vt = st.text_input("Ticker(s), comma-separated (blank = open positions)", "SPY", key="hub_van_tk")
+            _vtks = [x.strip().upper() for x in _vt.split(",") if x.strip()] or None
+            try:
+                for _r in _tbmod._vanna_reports(_hub_conn, _vtks):
+                    _render_tg(_r); st.markdown("---")
+            except Exception as e:
+                st.error(f"Vanna error: {e}")
 
         with _tb_ev:
             st.caption("Macro/geopolitical event → 1st/2nd/3rd-order liquid trades + hedge.")
