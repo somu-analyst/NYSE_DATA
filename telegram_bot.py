@@ -3775,93 +3775,164 @@ def _get_earnings_dte(ticker: str) -> "int | None":
 
 def _compute_gex(ticker: str, conn, spot: float) -> dict:
     """
-    Gamma Exposure (GEX) = Σ (gamma_call × call_OI - gamma_put × put_OI) × spot² × 0.01
-    Positive GEX: dealers long gamma → buy dips/sell rallies → suppress vol (pinning).
-    Negative GEX: dealers short gamma → amplify moves (trending/volatile).
-    Returns dict with keys: total_gex, zero_gamma, gex_signal, top_strikes, regime.
+    Gamma Exposure (GEX) for the nearest LIQUID expiry, with per-strike implied
+    vol backed out from stored option last-prices (HV fallback when unavailable).
+    Net GEX/strike = gamma x (call_OI - put_OI) x spot^2 x 0.01   (calls +, puts -).
+    Positive GEX: dealers long gamma -> suppress vol (pinning / mean-revert).
+    Negative GEX: dealers short gamma -> amplify moves (trending / volatile).
+    Gamma flip (zero_gamma) = price where TOTAL GEX crosses zero, found by
+    recomputing GEX across a price grid (not a crude cumulative-sum crossing).
+    Returns: total_gex, total_gex_m, zero_gamma, gex_signal, regime, top_strikes,
+             call_wall, put_wall, expiry, dte.
     """
     result = {"total_gex": 0.0, "zero_gamma": None, "gex_signal": "UNKNOWN",
-              "top_strikes": [], "regime": "UNKNOWN"}
-    try:
-        df = pd.read_sql("""
-            SELECT strike,
-                   SUM(openInt_Call_now) AS call_oi,
-                   SUM(openInt_Put_now)  AS put_oi
-            FROM options_change
-            WHERE ticker=?
-              AND trade_date_now=(SELECT trade_date_now FROM options_change WHERE ticker=?
-                  ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1)
-            GROUP BY strike ORDER BY strike
-        """, conn, params=(ticker, ticker))
-    except Exception:
-        return result
-    if df.empty or spot <= 0:
+              "top_strikes": [], "regime": "UNKNOWN", "total_gex_m": 0.0,
+              "call_wall": None, "put_wall": None, "expiry": None, "dte": None}
+    if not spot or spot <= 0:
         return result
 
-    # HV as IV proxy
+    # Latest snapshot date for this ticker
+    try:
+        _ld = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker,))
+        if _ld.empty:
+            return result
+        date_str = _ld["trade_date_now"].iloc[0]
+        ref_dt = datetime.strptime(date_str, "%m-%d-%Y")
+    except Exception:
+        return result
+
+    # Pick nearest LIQUID expiry: max OI among 0..60 DTE expiries, else nearest future
+    try:
+        edf = pd.read_sql(
+            "SELECT expiry_date, SUM(openInt_Call_now)+SUM(openInt_Put_now) AS oi"
+            " FROM options_change WHERE ticker=? AND trade_date_now=? GROUP BY expiry_date",
+            conn, params=(ticker, date_str))
+    except Exception:
+        return result
+    cand = []
+    for _, e in edf.iterrows():
+        try:
+            _es = str(e["expiry_date"])
+            try:
+                ed = datetime.strptime(_es, "%m-%d-%Y")
+            except ValueError:
+                ed = datetime.strptime(_es, "%Y-%m-%d")
+        except Exception:
+            continue
+        dte = (ed - ref_dt).days
+        if dte >= 0:
+            cand.append((dte, float(e["oi"] or 0), str(e["expiry_date"])))
+    if not cand:
+        return result
+    near = [c for c in cand if c[0] <= 60]
+    dte_days, _oi_e, expiry_s = (max(near, key=lambda c: c[1]) if near
+                                 else min(cand, key=lambda c: c[0]))
+    T = max(dte_days / 365.0, 1.0 / 365.0)
+    result["expiry"] = expiry_s
+    result["dte"] = dte_days
+
+    # HV fallback (annualised) for strikes whose IV can't be backed out
     hv = 0.30
     try:
-        _hsd = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 25""",
+        _hsd = pd.read_sql(
+            "SELECT close FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 25",
             conn, params=(ticker,))
         if len(_hsd) >= 10:
             _rets = _hsd["close"].astype(float).pct_change().dropna()
-            hv = float(_rets.std() * (252**0.5))
-            hv = max(0.10, min(hv, 2.0))
+            hv = max(0.10, min(float(_rets.std() * (252 ** 0.5)), 2.0))
     except Exception:
         pass
 
-    T = 30 / 365.0  # assume 30-day average
-    r = 0.045
-    sigma = max(hv, 0.15)
-
-    gex_by_strike = []
-    for _, row in df.iterrows():
-        strike = float(row["strike"])
-        c_oi   = float(row["call_oi"] or 0)
-        p_oi   = float(row["put_oi"]  or 0)
-        try:
-            gc = bs_greeks(spot, strike, T, r, sigma, "call")["gamma"]
-            gp = bs_greeks(spot, strike, T, r, sigma, "put")["gamma"]
-        except Exception:
-            continue
-        # Dealer GEX: sold call → long gamma; sold put → long gamma too
-        # Net GEX = (call_oi × gamma_c - put_oi × gamma_p) × spot² × 100
-        gex_s = (gc * c_oi - gp * p_oi) * spot**2 * 0.01
-        gex_by_strike.append((strike, gex_s, gc * c_oi * spot**2 * 0.01, gp * p_oi * spot**2 * 0.01))
-
-    if not gex_by_strike:
+    # Per-strike OI + call last-price for the chosen expiry
+    try:
+        df = pd.read_sql(
+            "SELECT strike,"
+            " SUM(openInt_Call_now) AS c_oi, SUM(openInt_Put_now) AS p_oi,"
+            " AVG(CASE WHEN lastPrice_Call_now>0 THEN lastPrice_Call_now END) AS c_px"
+            " FROM options_change WHERE ticker=? AND trade_date_now=? AND expiry_date=?"
+            " GROUP BY strike ORDER BY strike",
+            conn, params=(ticker, date_str, expiry_s))
+    except Exception:
         return result
+    if df.empty:
+        return result
+
+    # Build per-strike (strike, call_oi, put_oi, sigma) with real IV from call price
+    strikes = []
+    for _, row in df.iterrows():
+        K = float(row["strike"])
+        c_oi = float(row["c_oi"] or 0)
+        p_oi = float(row["p_oi"] or 0)
+        if c_oi <= 0 and p_oi <= 0:
+            continue
+        c_px = float(row["c_px"] or 0)
+        sigma = hv
+        mny = abs(K - spot) / spot
+        # Back out IV from a non-deep-ITM call (has real time value); else HV proxy
+        if c_px > 0.10 and mny < 0.30 and K >= spot * 0.85:
+            try:
+                iv = _implied_vol_hp(c_px, spot, K, T)
+                if iv and 0.03 < iv < 3.0:
+                    sigma = iv
+            except Exception:
+                pass
+        sigma = max(0.05, min(sigma, 3.0))
+        strikes.append((K, c_oi, p_oi, sigma))
+
+    if not strikes:
+        return result
+
+    # GEX at current spot, per strike
+    gex_by_strike = []
+    for K, c_oi, p_oi, sig in strikes:
+        g = _bs_gamma_hp(spot, K, T, sig)
+        net = (c_oi - p_oi) * g * spot * spot * 0.01
+        c_g = c_oi * g * spot * spot * 0.01
+        p_g = p_oi * g * spot * spot * 0.01
+        gex_by_strike.append((K, net, c_g, p_g))
 
     total_gex = sum(g[1] for g in gex_by_strike)
     result["total_gex"] = total_gex
+    result["total_gex_m"] = total_gex / 1e6
 
-    # Zero-gamma level: strike where cumulative GEX flips sign
-    cumulative = 0.0
+    # Walls: most positive net GEX = call wall (resistance); most negative = put wall (support)
+    cw = max(gex_by_strike, key=lambda x: x[1])
+    pw = min(gex_by_strike, key=lambda x: x[1])
+    result["call_wall"] = cw[0] if cw[1] > 0 else None
+    result["put_wall"]  = pw[0] if pw[1] < 0 else None
+
+    # Gamma flip: recompute TOTAL gex across a price grid, find the zero crossing
+    lo, hi = spot * 0.80, spot * 1.20
+    n = 80
     zero_g = None
-    prev_s = None
-    for s, g, _, _ in sorted(gex_by_strike, key=lambda x: x[0]):
-        cumulative += g
-        if prev_s is not None and zero_g is None:
-            if (cumulative >= 0 and cumulative - g < 0) or (cumulative < 0 and cumulative - g >= 0):
-                zero_g = (prev_s + s) / 2
-        prev_s = s
+    prev = None
+    for i in range(n + 1):
+        S = lo + (hi - lo) * i / n
+        tot = 0.0
+        for K, c_oi, p_oi, sig in strikes:
+            tot += (c_oi - p_oi) * _bs_gamma_hp(S, K, T, sig) * S * S * 0.01
+        if prev is not None and (tot >= 0) != (prev[1] >= 0):
+            zero_g = round((prev[0] + S) / 2, 2)
+            break
+        prev = (S, tot)
     result["zero_gamma"] = zero_g
 
-    # GEX signal
-    total_gex_b = total_gex / 1e6  # in $M for display
+    # Regime from sign of total GEX at spot
     if total_gex > 0:
         result["gex_signal"] = "PINNING"
-        result["regime"] = "Low vol — dealers suppress moves, mean revert"
+        result["regime"] = "Low vol - dealers suppress moves, mean revert"
     else:
         result["gex_signal"] = "TRENDING"
-        result["regime"] = "High vol — dealers amplify direction, trend follow"
+        result["regime"] = "High vol - dealers amplify direction, trend follow"
 
-    # Top 5 strikes by absolute GEX
+    # Top 5 strikes by |net GEX|
     top = sorted(gex_by_strike, key=lambda x: -abs(x[1]))[:5]
-    result["top_strikes"] = [{"strike": s, "gex_m": g/1e6, "c_gex": cg/1e6, "p_gex": pg/1e6}
-                              for s, g, cg, pg in top]
-    result["total_gex_m"] = total_gex_b
+    result["top_strikes"] = [{"strike": s, "gex_m": g / 1e6, "c_gex": cg / 1e6, "p_gex": pg / 1e6}
+                             for s, g, cg, pg in top]
     return result
 
 
@@ -9321,7 +9392,7 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
                 _card = [
                     f"<b>{_htk_pm}</b> ${_sp_pm:.0f}",
                     f"{_ic_pm} {_hr_pm['signal']}  {_pb_pm:.0f}%  {_cf_pm}",
-                    f"🟢{_bv} 🔴{_rv} 💰{_sv}/22",
+                    f"🟢{_bv} 🔴{_rv} 💰{_sv}/23",
                 ]
                 _vb = _hr_pm.get("vrvp_box", {})
                 if _vb.get("lo"):
@@ -9518,6 +9589,26 @@ async def position_alerts(ctx: ContextTypes.DEFAULT_TYPE):
                             f"SPOT WITHIN 3% OF SHORT STRIKE ${_ss:.0f}",
                             f"Stock ${stock_px:.2f} - your short strike is at risk."
                         )
+
+        # Short-squeeze risk — only for legs hurt by a rally (short calls / long puts)
+        has_bearish = any(
+            (str(tr.get("option_type", "")).upper().startswith("C") and _safe_int(tr.get("quantity", 1), 1) < 0)
+            or (str(tr.get("option_type", "")).upper().startswith("P") and _safe_int(tr.get("quantity", 1), 1) > 0)
+            for _, tr in grp.iterrows()
+        )
+        if has_bearish:
+            try:
+                _sq = short_squeeze_signal(tk, conn)
+            except Exception:
+                _sq = None
+            if _sq and _sq.get("score", 0) >= 3:
+                _det = " | ".join(_sq.get("reasons", [])[:3])
+                _alert(
+                    "squeeze", "🔥",
+                    f"SHORT-SQUEEZE RISK [{_sq['score']}/5] — {_sq['stage']}",
+                    f"{tk} {_sq['label']}. Your bearish leg(s) fight a rally — "
+                    f"consider trimming/hedging.\n{_det}"
+                )
 
     conn.close()
     for _msg in alert_msgs:
@@ -12630,6 +12721,2293 @@ async def exit_ticker_cards(query, ticker):
         ])
     )
 
+
+# ═══════════════════════════════════════════════════════════════════
+# ── SHORT-SQUEEZE / SHORT-COVERING DETECTOR  (free data: yfinance + OI)
+# ═══════════════════════════════════════════════════════════════════
+# US single-name method (NOT the futures OI matrix):
+#   1. FUEL    — short interest % float + days-to-cover (Ortex/S3 method)
+#   2. TRIGGER — price breakout on a volume spike (>1.5x avg)
+#   3. CONFIRM — call writers buying back (call OI falling on an up-day)
+# Scored 0–5; >=3 = active signal. CTB/Utilization need a paid feed.
+
+def short_squeeze_signal(ticker, conn=None):
+    """US short-squeeze / short-covering detector. Returns a scored dict (0–5)."""
+    tk = str(ticker).upper().strip()
+    out = {"ticker": tk, "score": 0, "max": 5, "reasons": [],
+           "stage": "NONE", "label": "No squeeze", "emoji": "⚪",
+           "short_pct": None, "dtc": None, "si_chg_pct": None,
+           "price_chg": None, "vol_ratio": None,
+           "call_oi_chg": None, "put_oi_chg": None}
+    score = 0
+
+    # ---- 1+2+3. Short-interest fuel (yfinance .info) ----
+    short_pct = dtc = si_now = si_prev = None
+    try:
+        info = yf.Ticker(tk).info or {}
+        short_pct = info.get("shortPercentOfFloat")   # fraction, e.g. 0.18
+        dtc       = info.get("shortRatio")             # days to cover
+        si_now    = info.get("sharesShort")
+        si_prev   = info.get("sharesShortPriorMonth")
+    except Exception:
+        pass
+
+    spct = (short_pct or 0) * 100.0
+    if spct >= 25:
+        score += 1; out["reasons"].append(f"🔴 Short {spct:.0f}% of float — EXTREME squeeze fuel")
+    elif spct >= 15:
+        score += 1; out["reasons"].append(f"🟠 Short {spct:.0f}% of float — high squeeze fuel")
+    elif spct > 0:
+        out["reasons"].append(f"Short {spct:.0f}% of float — low fuel")
+
+    if dtc and dtc >= 5:
+        score += 1; out["reasons"].append(f"⏳ Days-to-cover {dtc:.1f} — shorts hard to exit")
+    elif dtc:
+        out["reasons"].append(f"Days-to-cover {dtc:.1f} — easy exit")
+
+    si_chg_pct = None
+    if si_now and si_prev and si_prev > 0:
+        si_chg_pct = (si_now - si_prev) / si_prev * 100.0
+        if si_now < si_prev:
+            score += 1; out["reasons"].append(f"📉 Short interest {si_chg_pct:+.0f}% MoM — shorts covering")
+        else:
+            out["reasons"].append(f"📈 Short interest {si_chg_pct:+.0f}% MoM — shorts still building")
+
+    # ---- 4. Trigger: price + volume ----
+    price_chg = vol_ratio = None
+    try:
+        h = yf.Ticker(tk).history(period="40d")
+        if len(h) >= 5:
+            price_now  = float(h["Close"].iloc[-1])
+            price_prev = float(h["Close"].iloc[-2])
+            price_chg  = (price_now - price_prev) / price_prev * 100.0 if price_prev else 0.0
+            tvol = float(h["Volume"].iloc[-1])
+            avol = float(h["Volume"].iloc[-21:-1].mean()) if len(h) >= 21 else float(h["Volume"].mean())
+            vol_ratio = tvol / avol if avol > 0 else 1.0
+    except Exception:
+        pass
+
+    trigger = (price_chg is not None and vol_ratio is not None
+               and price_chg >= 2.0 and vol_ratio >= 1.5)
+    if trigger:
+        score += 1
+        out["reasons"].append(f"🚀 +{price_chg:.1f}% on {vol_ratio:.1f}x volume — squeeze firing")
+    elif price_chg is not None and vol_ratio is not None:
+        out["reasons"].append(f"Px {price_chg:+.1f}% on {vol_ratio:.1f}x vol — no ignition yet")
+
+    # ---- 5. Confirmation: call writers covering (options OI) ----
+    call_oi_chg = put_oi_chg = None
+    own = conn is None
+    if own:
+        try: conn = get_conn()
+        except Exception: conn = None
+    if conn is not None:
+        try:
+            row = pd.read_sql(
+                "SELECT SUM(change_OI_Call) c, SUM(change_OI_Put) p FROM options_change "
+                "WHERE ticker=? AND trade_date_now=("
+                "  SELECT trade_date_now FROM options_change WHERE ticker=? "
+                "  ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1)",
+                conn, params=(tk, tk))
+            if not row.empty:
+                _c = row["c"].iloc[0]; _p = row["p"].iloc[0]
+                call_oi_chg = _safe_float(_c, None) if _c is not None else None
+                put_oi_chg  = _safe_float(_p, None) if _p is not None else None
+        except Exception:
+            pass
+    if own and conn is not None:
+        try: conn.close()
+        except Exception: pass
+
+    if call_oi_chg is not None and call_oi_chg < 0 and (price_chg or 0) > 0:
+        score += 1
+        out["reasons"].append(f"🔄 Call OI {call_oi_chg:+,.0f} on up-day — call writers buying back")
+    elif call_oi_chg is not None:
+        out["reasons"].append(f"Call OI {call_oi_chg:+,.0f} — no writer covering")
+
+    # ---- Finalise ----
+    score = min(score, 5)
+    out["score"]      = score
+    out["short_pct"]  = round(spct, 1) if short_pct is not None else None
+    out["dtc"]        = round(dtc, 1) if dtc else None
+    out["si_chg_pct"] = round(si_chg_pct, 1) if si_chg_pct is not None else None
+    out["price_chg"]  = round(price_chg, 2) if price_chg is not None else None
+    out["vol_ratio"]  = round(vol_ratio, 2) if vol_ratio is not None else None
+    out["call_oi_chg"] = call_oi_chg
+    out["put_oi_chg"]  = put_oi_chg
+
+    fuel = (spct >= 15) or bool(dtc and dtc >= 5)
+    if trigger and fuel:
+        out["stage"] = "FIRING"
+    elif fuel:
+        out["stage"] = "SETUP"
+    else:
+        out["stage"] = "NONE"
+
+    if score >= 4:
+        out["emoji"] = "🔴"; out["label"] = "HIGH squeeze / strong covering"
+    elif score == 3:
+        out["emoji"] = "🟠"; out["label"] = "MODERATE squeeze building"
+    elif score == 2:
+        out["emoji"] = "🟡"; out["label"] = "Low — watch"
+    else:
+        out["emoji"] = "⚪"; out["label"] = "No squeeze"
+    return out
+
+
+def _fmt_squeeze_report(sig) -> str:
+    """Mobile-friendly HTML report for one ticker's squeeze signal."""
+    if not sig:
+        return "❌ No squeeze data available."
+    tk = sig["ticker"]; sc = sig["score"]
+    bars = "█" * sc + "░" * (5 - sc)
+    lines = [f"{sig['emoji']} <b>{tk} SHORT-SQUEEZE</b>",
+             f"Score: <b>{sc}/5</b> [{bars}]",
+             f"Stage: <b>{sig['stage']}</b> — {sig['label']}", ""]
+    t = []
+    if sig.get("short_pct")  is not None: t.append(f"Short%Flt {sig['short_pct']:>5.1f}%")
+    if sig.get("dtc")        is not None: t.append(f"DaysCover {sig['dtc']:>5.1f}")
+    if sig.get("si_chg_pct") is not None: t.append(f"SI MoM    {sig['si_chg_pct']:>+5.0f}%")
+    if sig.get("price_chg")  is not None: t.append(f"Price     {sig['price_chg']:>+5.1f}%")
+    if sig.get("vol_ratio")  is not None: t.append(f"Volume    {sig['vol_ratio']:>5.1f}x")
+    if t:
+        lines.append("<pre>" + "\n".join(t) + "</pre>")
+    lines.append("<b>Why:</b>")
+    lines.extend("• " + r for r in sig["reasons"])
+    lines.append("")
+    if sc >= 3:
+        lines.append("<i>↗ Bullish for the stock. Short-side legs (long puts / short calls) "
+                     "fight a rally — consider trimming/hedging. Longs can run with a stop "
+                     "under the breakout.</i>")
+    else:
+        lines.append("<i>No actionable squeeze. Re-check on a volume-backed up-day.</i>")
+    return "\n".join(lines)
+
+
+async def squeeze_command(update, ctx):
+    """/squeeze [TICKER] — one-ticker report, or scan the watchlist (score >=3)."""
+    import asyncio
+    args = list(getattr(ctx, "args", []) or [])
+    if args:
+        tk = str(args[0]).upper().strip()
+        loading = await update.message.reply_text(f"⏳ Analyzing {tk} short-squeeze…", parse_mode=H)
+        try:
+            sig = await asyncio.to_thread(short_squeeze_signal, tk)
+        except Exception:
+            sig = short_squeeze_signal(tk)
+        try: await loading.delete()
+        except Exception: pass
+        await update.message.reply_text(_fmt_squeeze_report(sig), parse_mode=H)
+        return
+
+    loading = await update.message.reply_text(
+        "⏳ Scanning watchlist for short squeezes… (~30s)", parse_mode=H)
+    results = []
+    for tk in DEFAULT_TICKERS:
+        try:
+            sig = await asyncio.to_thread(short_squeeze_signal, tk)
+            if sig and sig.get("score", 0) >= 3:
+                results.append(sig)
+        except Exception:
+            continue
+    try: await loading.delete()
+    except Exception: pass
+
+    if not results:
+        await update.message.reply_text(
+            "⚪ No active short-squeeze signals (score ≥3) in the watchlist right now.\n"
+            "<i>Send /squeeze TICKER to check any symbol.</i>", parse_mode=H)
+        return
+    results.sort(key=lambda s: s["score"], reverse=True)
+    rows = ["🔥 <b>SHORT-SQUEEZE SCAN</b>", "Active signals (score ≥3/5):", ""]
+    for s in results:
+        line = f"{s['emoji']} <b>{s['ticker']}</b> {s['score']}/5 — {s['stage']}"
+        if s.get("short_pct") is not None: line += f" | SI {s['short_pct']:.0f}%"
+        if s.get("price_chg") is not None: line += f" | {s['price_chg']:+.1f}%"
+        rows.append(line)
+    rows += ["", "<i>Send /squeeze TICKER for full detail.</i>"]
+    await update.message.reply_text("\n".join(rows), parse_mode=H)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── 23-MODEL HIGH-PROBABILITY SIGNAL ENGINE  (ported into live copy)
+# ── Models 1-22 (research ensemble) + Model 23 short-squeeze.
+# ═══════════════════════════════════════════════════════════════════
+
+def _bs_gamma_hp(S, K, T, sigma, r=0.05):
+    """Black-Scholes gamma."""
+    if sigma <= 0 or T <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    try:
+        d1 = (_math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * _math.sqrt(T))
+        return float(_spnorm.pdf(d1)) / (S * sigma * _math.sqrt(T))
+    except Exception:
+        return 0.0
+
+
+def _bs_call_hp(S, K, T, sigma, r=0.05):
+    """Black-Scholes call price."""
+    if sigma <= 0 or T <= 0:
+        return max(S - K, 0.0)
+    try:
+        d1 = (_math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * _math.sqrt(T))
+        d2 = d1 - sigma * _math.sqrt(T)
+        return S * float(_spnorm.cdf(d1)) - K * _math.exp(-r * T) * float(_spnorm.cdf(d2))
+    except Exception:
+        return max(S - K, 0.0)
+
+
+def _implied_vol_hp(price, S, K, T, r=0.05, tol=1e-4):
+    """Bisection IV solver — returns IV or 0.30 default."""
+    if price <= 0 or T <= 0 or S <= 0 or K <= 0:
+        return 0.30
+    intrinsic = max(S - K, 0.0)
+    if price <= intrinsic + 1e-5:
+        return 0.001
+    lo, hi = 0.01, 5.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        val = _bs_call_hp(S, K, T, mid, r)
+        if abs(val - price) < tol:
+            return mid
+        if val < price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def _setup_hp_tables(conn):
+    """Create signal_accuracy and signal_weights tables if not present."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signal_accuracy (
+            ticker TEXT,
+            trade_date TEXT,
+            model_name TEXT,
+            signal TEXT,
+            prob REAL,
+            actual_ret REAL,
+            correct INTEGER DEFAULT -1,
+            PRIMARY KEY (ticker, trade_date, model_name)
+        )""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signal_weights (
+            ticker TEXT,
+            model_name TEXT,
+            accuracy_20d REAL DEFAULT 0.5,
+            weight REAL DEFAULT 1.0,
+            last_updated TEXT,
+            PRIMARY KEY (ticker, model_name)
+        )""")
+    conn.commit()
+
+
+def _update_hp_outcomes(ticker, conn):
+    """Fill actual_ret + correct for prior predictions; recalc adaptive weights."""
+    try:
+        _setup_hp_tables(conn)
+        px = pd.read_sql(
+            "SELECT trade_date, close FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)",
+            conn, params=(ticker.upper(),))
+        if len(px) < 2:
+            return
+        px["close"] = pd.to_numeric(px["close"], errors="coerce")
+        px["next_ret"] = px["close"].shift(-1) / px["close"] - 1
+
+        preds = pd.read_sql(
+            "SELECT ticker, trade_date, model_name, signal FROM signal_accuracy"
+            " WHERE ticker=? AND correct=-1",
+            conn, params=(ticker.upper(),))
+        for _, row in preds.iterrows():
+            m = px[px["trade_date"] == row["trade_date"]]
+            if m.empty or pd.isna(m.iloc[0]["next_ret"]):
+                continue
+            ret = float(m.iloc[0]["next_ret"])
+            if row["signal"] == "BULL":
+                correct = 1 if ret > 0.003 else 0
+            elif row["signal"] == "BEAR":
+                correct = 1 if ret < -0.003 else 0
+            elif row["signal"] == "NEUTRAL":
+                correct = 1 if abs(ret) < 0.012 else 0
+            else:
+                correct = 0
+            conn.execute(
+                "UPDATE signal_accuracy SET actual_ret=?, correct=?"
+                " WHERE ticker=? AND trade_date=? AND model_name=?",
+                (round(ret, 5), correct, ticker.upper(), row["trade_date"], row["model_name"]))
+        conn.commit()
+
+        for model in ("gex", "pcr_z", "oi_momentum", "gamma_pin", "vol_flow", "iv_skew",
+                      "rv_iv", "oi_term_struct", "maxpain_vel", "iv_rank",
+                      "pcp_dev", "vol_regime", "multi_expiry", "smart_uoa", "hhi_pin", "pcr_vel",
+                      "vrvp", "vwap_dev", "expected_move", "left_skew", "vrp", "put_call_wall"):
+            rows = pd.read_sql(
+                "SELECT correct FROM signal_accuracy WHERE ticker=? AND model_name=?"
+                " AND correct>=0 ORDER BY"
+                " substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 20",
+                conn, params=(ticker.upper(), model))
+            if len(rows) >= 5:
+                acc = float(rows["correct"].mean())
+                weight = max(0.2, min(1.8, (acc - 0.5) * 2.0 + 1.0))
+                today_s = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%m-%d-%Y")
+                conn.execute(
+                    "INSERT OR REPLACE INTO signal_weights"
+                    " (ticker, model_name, accuracy_20d, weight, last_updated)"
+                    " VALUES (?,?,?,?,?)",
+                    (ticker.upper(), model, round(acc, 3), round(weight, 3), today_s))
+        conn.commit()
+    except Exception as e:
+        log.debug(f"_update_hp_outcomes {ticker}: {e}")
+
+
+def _get_hp_weights(ticker, conn):
+    """Adaptive per-model weights based on recent 20-day accuracy."""
+    defaults = {m: 1.0 for m in (
+        "gex", "pcr_z", "oi_momentum", "gamma_pin", "vol_flow", "iv_skew",
+        "rv_iv", "oi_term_struct", "maxpain_vel", "iv_rank",
+        "pcp_dev", "vol_regime", "multi_expiry", "smart_uoa", "hhi_pin", "pcr_vel",
+        "vrvp", "vwap_dev", "expected_move", "left_skew", "vrp", "put_call_wall",
+    )}
+    try:
+        df = pd.read_sql("SELECT model_name, weight FROM signal_weights WHERE ticker=?",
+                         conn, params=(ticker.upper(),))
+        for _, r in df.iterrows():
+            defaults[r["model_name"]] = float(r["weight"])
+    except Exception:
+        pass
+    return defaults
+
+
+def _hp_model_gex(ticker, conn, spot):
+    try:
+        dates = pd.read_sql(
+            "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 3",
+            conn, params=(ticker.upper(),))
+        if len(dates) < 2 or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "gex": 0, "regime": "unknown",
+                    "reason": "Insufficient data for GEX"}
+
+        today_d = dates.iloc[0]["trade_date_now"]
+        prev_d  = dates.iloc[1]["trade_date_now"]
+
+        def _gex(date_str):
+            df = pd.read_sql(
+                "SELECT strike, expiry_date,"
+                " SUM(openInt_Call_now) AS c_oi, SUM(openInt_Put_now) AS p_oi,"
+                " AVG(CASE WHEN lastPrice_Call_now>0 THEN lastPrice_Call_now END) AS c_px"
+                " FROM options_change WHERE ticker=? AND trade_date_now=?"
+                " GROUP BY strike, expiry_date",
+                conn, params=(ticker.upper(), date_str))
+            if df.empty:
+                return 0.0
+            ref_dt = datetime.strptime(date_str, "%m-%d-%Y")
+            total = 0.0
+            for _, r in df.iterrows():
+                K = float(r["strike"])
+                c_oi = float(r["c_oi"] or 0)
+                p_oi = float(r["p_oi"] or 0)
+                c_px = float(r["c_px"] or 0)
+                try:
+                    exp_dt = datetime.strptime(str(r["expiry_date"]), "%Y-%m-%d")
+                except Exception:
+                    continue
+                T = max((exp_dt - ref_dt).days / 365.0, 1 / 365.0)
+                moneyness = abs(K - spot) / spot
+                sigma = (_implied_vol_hp(c_px, spot, K, T)
+                         if (moneyness < 0.06 and c_px > 0.05) else 0.30)
+                sigma = max(0.05, min(sigma, 3.0))
+                gamma = _bs_gamma_hp(spot, K, T, sigma)
+                total += (c_oi - p_oi) * gamma * 100 * spot
+            return total
+
+        gex_now  = _gex(today_d)
+        gex_prev = _gex(prev_d)
+        flip = (gex_prev > 0) != (gex_now > 0)
+
+        if gex_now > 0:
+            regime = "POSITIVE"
+            signal, prob = ("BEAR", 71) if flip else ("NEUTRAL", 62)
+        else:
+            regime = "NEGATIVE"
+            signal, prob = ("BULL", 72) if flip else ("BULL", 58)
+
+        reason = (
+            f"GEX {gex_now/1e6:+.1f}M (prev {gex_prev/1e6:+.1f}M) | regime: {regime} GEX"
+            + (" | ⚡ FLIP — direction change!" if flip else "")
+        )
+        return {"signal": signal, "prob": prob, "gex": gex_now, "gex_prev": gex_prev,
+                "regime": regime, "flip": flip, "reason": reason}
+    except Exception as e:
+        log.debug(f"_hp_model_gex {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "gex": 0, "regime": "error", "reason": str(e)[:60]}
+
+
+def _hp_model_pcr_z(ticker, conn):
+    try:
+        sd = pd.read_sql(
+            "SELECT trade_date, pcr_oi FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 25",
+            conn, params=(ticker.upper(),))
+        if len(sd) < 10:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Insufficient PCR history"}
+        sd["pcr_oi"] = pd.to_numeric(sd["pcr_oi"], errors="coerce")
+        sd = sd.dropna(subset=["pcr_oi"])
+        if len(sd) < 8:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Too many null PCRs"}
+
+        pcr_today = float(sd["pcr_oi"].iloc[0])
+        if ticker.upper() == "SPY" and pcr_today > 5.0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "SPY expiry spike ignored"}
+
+        hist = sd["pcr_oi"].iloc[1:21]
+        mean, std = float(hist.mean()), float(hist.std())
+        if std < 0.001:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "PCR variance too low"}
+
+        z = (pcr_today - mean) / std
+        top3 = sd["pcr_oi"].iloc[:3].tolist()
+        trend = "falling" if top3[0] < top3[2] else "rising"
+
+        if z >= 2.5 and trend == "falling":
+            signal, prob = "BULL", 79
+            reason = f"PCR z={z:+.2f} EXTREME FEAR + trend falling = Peak Fear reversal"
+        elif z >= 1.8 and trend == "falling":
+            signal, prob = "BULL", 69
+            reason = f"PCR z={z:+.2f} oversold + PCR unwinding"
+        elif z >= 1.5:
+            signal, prob = "BULL", 60
+            reason = f"PCR z={z:+.2f} elevated fear — early bull signal"
+        elif z <= -2.5 and trend == "rising":
+            signal, prob = "BEAR", 77
+            reason = f"PCR z={z:+.2f} EXTREME COMPLACENCY + trend rising = top warning"
+        elif z <= -1.8 and trend == "rising":
+            signal, prob = "BEAR", 68
+            reason = f"PCR z={z:+.2f} overbought + PCR rising again"
+        elif z <= -1.5:
+            signal, prob = "BEAR", 59
+            reason = f"PCR z={z:+.2f} low PCR = complacency"
+        else:
+            signal, prob = "NEUTRAL", 50
+            reason = f"PCR z={z:+.2f} — neutral zone (need |z|>1.5)"
+
+        return {"signal": signal, "prob": prob, "z": round(z, 2),
+                "pcr": round(pcr_today, 3), "trend": trend, "reason": reason}
+    except Exception as e:
+        log.debug(f"_hp_model_pcr_z {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_oi_momentum(ticker, conn, spot):
+    try:
+        dates = pd.read_sql(
+            "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 5",
+            conn, params=(ticker.upper(),))
+        if len(dates) < 4:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 4 days"}
+
+        px = pd.read_sql(
+            "SELECT trade_date, close FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 5",
+            conn, params=(ticker.upper(),))
+        px["close"] = pd.to_numeric(px["close"], errors="coerce")
+
+        daily = []
+        for _, dr in dates.iterrows():
+            d = dr["trade_date_now"]
+            r = pd.read_sql(
+                "SELECT SUM(openInt_Call_now) AS c, SUM(openInt_Put_now) AS p"
+                " FROM options_change WHERE ticker=? AND trade_date_now=?",
+                conn, params=(ticker.upper(), d))
+            daily.append({"date": d, "c": float(r["c"].iloc[0] or 0), "p": float(r["p"].iloc[0] or 0)})
+
+        extreme = False
+        for i in range(min(3, len(px) - 1)):
+            try:
+                ret = abs(float(px["close"].iloc[i]) / float(px["close"].iloc[i + 1]) - 1)
+                if ret > 0.03:
+                    extreme = True; break
+            except Exception:
+                pass
+        if extreme:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Extreme day (>3%) in window — filtered"}
+
+        changes = [{"c_chg": daily[i]["c"] - daily[i+1]["c"],
+                    "p_chg": daily[i]["p"] - daily[i+1]["p"]} for i in range(3)]
+        c_bull = sum(1 for c in changes if c["c_chg"] > c["p_chg"] and c["c_chg"] > 0)
+        p_bear = sum(1 for c in changes if c["p_chg"] > c["c_chg"] and c["p_chg"] > 0)
+        net_c = sum(c["c_chg"] for c in changes)
+        net_p = sum(c["p_chg"] for c in changes)
+
+        price_move = 0.0
+        try:
+            price_move = (float(px["close"].iloc[0]) - float(px["close"].iloc[3])) / float(px["close"].iloc[3])
+        except Exception:
+            pass
+
+        if c_bull >= 3 and net_c > abs(net_p) * 1.3:
+            if price_move <= 0.01:
+                signal, prob = "BULL", 76
+                reason = f"3/3 days calls +{net_c:,.0f} while price {price_move*100:+.1f}% — SMART MONEY LONG"
+            else:
+                signal, prob = "BULL", 64
+                reason = f"3/3 days calls +{net_c:,.0f} + price up {price_move*100:.1f}% — momentum confirm"
+        elif p_bear >= 3 and net_p > abs(net_c) * 1.3:
+            if price_move >= -0.01:
+                signal, prob = "BEAR", 75
+                reason = f"3/3 days puts +{net_p:,.0f} while price {price_move*100:+.1f}% — SMART MONEY SHORT"
+            else:
+                signal, prob = "BEAR", 63
+                reason = f"3/3 days puts +{net_p:,.0f} + price down {abs(price_move)*100:.1f}% — confirm"
+        elif c_bull >= 2:
+            signal, prob = "BULL", 57
+            reason = f"2/3 days call OI building (+{net_c:,.0f}) — moderate positioning"
+        elif p_bear >= 2:
+            signal, prob = "BEAR", 57
+            reason = f"2/3 days put OI building (+{net_p:,.0f}) — moderate bear positioning"
+        else:
+            signal, prob = "NEUTRAL", 50
+            reason = f"Mixed OI (C:{net_c:+,.0f} P:{net_p:+,.0f}) — no clear 3d pattern"
+
+        return {"signal": signal, "prob": prob, "c_bull": c_bull, "p_bear": p_bear,
+                "price_3d": round(price_move * 100, 2), "reason": reason}
+    except Exception as e:
+        log.debug(f"_hp_model_oi_momentum {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_gamma_pin(ticker, conn, spot):
+    try:
+        expiries = pd.read_sql(
+            "SELECT DISTINCT expiry_date FROM options_change WHERE ticker=? ORDER BY expiry_date ASC",
+            conn, params=(ticker.upper(),))
+        if expiries.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No expiry data"}
+
+        today_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        nearest, min_dte = None, 999
+        for _, er in expiries.iterrows():
+            try:
+                exp_dt = datetime.strptime(str(er["expiry_date"]), "%Y-%m-%d")
+                dte = (exp_dt - today_dt).days
+                if 0 < dte < min_dte:
+                    min_dte, nearest = dte, er["expiry_date"]
+            except Exception:
+                pass
+        if nearest is None:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No valid expiry"}
+
+        latest = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker.upper(),))
+        if latest.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No latest date"}
+        lat_d = latest.iloc[0]["trade_date_now"]
+
+        df = pd.read_sql(
+            "SELECT strike, SUM(openInt_Call_now) AS c_oi, SUM(openInt_Put_now) AS p_oi"
+            " FROM options_change WHERE ticker=? AND expiry_date=? AND trade_date_now=?"
+            " GROUP BY strike ORDER BY strike",
+            conn, params=(ticker.upper(), nearest, lat_d))
+        if len(df) < 3:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Too few strikes"}
+
+        df["c_oi"] = pd.to_numeric(df["c_oi"], errors="coerce").fillna(0)
+        df["p_oi"] = pd.to_numeric(df["p_oi"], errors="coerce").fillna(0)
+        df["tot"]  = df["c_oi"] + df["p_oi"]
+
+        strikes = sorted(df["strike"].unique())
+        mp_pain, mp_k = float("inf"), spot
+        for tk in strikes:
+            pain = (df[df["strike"] < tk]["c_oi"] * (tk - df[df["strike"] < tk]["strike"])).sum() + \
+                   (df[df["strike"] > tk]["p_oi"] * (df[df["strike"] > tk]["strike"] - tk)).sum()
+            if pain < mp_pain:
+                mp_pain, mp_k = pain, tk
+
+        mu, sig2 = float(df["tot"].mean()), float(df["tot"].std())
+        walls = df[df["tot"] >= mu + 2.5 * sig2]["strike"].tolist()
+        dist_mp = (mp_k - spot) / spot * 100
+
+        if min_dte <= 7:
+            ad = abs(dist_mp)
+            if ad <= 1.5:
+                signal, prob = "NEUTRAL", 83
+                reason = f"DTE={min_dte} | MP ${mp_k:.0f} ({dist_mp:+.1f}%) STRONG PIN — sell straddle"
+            elif ad <= 3.0:
+                signal = "BULL" if dist_mp > 0 else "BEAR"
+                prob = 73
+                reason = f"DTE={min_dte} | MP ${mp_k:.0f} ({dist_mp:+.1f}%) — drift toward max pain"
+            else:
+                signal = "BULL" if dist_mp > 0 else "BEAR"
+                prob = 59
+                reason = f"DTE={min_dte} | MP ${mp_k:.0f} ({dist_mp:+.1f}%) — moderate pull"
+        else:
+            above = [w for w in walls if w > spot]
+            below = [w for w in walls if w < spot]
+            if above and below:
+                ceil_w = min(above); floor_w = max(below)
+                dc = (ceil_w - spot) / spot * 100
+                df2 = (spot - floor_w) / spot * 100
+                if dc < 2.0 and df2 > 3.0:
+                    signal, prob = "BEAR", 66
+                    reason = f"DTE={min_dte} | Gamma ceiling ${ceil_w:.0f} (+{dc:.1f}%) — resistance"
+                elif df2 < 2.0 and dc > 3.0:
+                    signal, prob = "BULL", 65
+                    reason = f"DTE={min_dte} | Gamma floor ${floor_w:.0f} (-{df2:.1f}%) — support"
+                else:
+                    signal, prob = "NEUTRAL", 54
+                    reason = f"DTE={min_dte} | Ceil ${ceil_w:.0f}(+{dc:.1f}%) Floor ${floor_w:.0f}(-{df2:.1f}%)"
+            else:
+                signal, prob = "NEUTRAL", 52
+                reason = f"DTE={min_dte} | MP ${mp_k:.0f} ({dist_mp:+.1f}%)"
+
+        return {"signal": signal, "prob": prob, "dte": min_dte, "max_pain": round(mp_k, 2),
+                "dist_mp": round(dist_mp, 2), "walls": [round(w, 2) for w in walls[:4]], "reason": reason}
+    except Exception as e:
+        log.debug(f"_hp_model_gamma_pin {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_vol_flow(ticker, conn):
+    try:
+        dates = pd.read_sql(
+            "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 8",
+            conn, params=(ticker.upper(),))
+        if len(dates) < 6:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 6 days for vol avg"}
+
+        daily = []
+        for _, dr in dates.iterrows():
+            d = dr["trade_date_now"]
+            r = pd.read_sql(
+                "SELECT SUM(vol_Call_now) AS cv, SUM(vol_Put_now) AS pv,"
+                " SUM(openInt_Call_now) AS co, SUM(openInt_Put_now) AS po"
+                " FROM options_change WHERE ticker=? AND trade_date_now=?",
+                conn, params=(ticker.upper(), d))
+            daily.append({"cv": float(r["cv"].iloc[0] or 0), "pv": float(r["pv"].iloc[0] or 0),
+                           "co": float(r["co"].iloc[0] or 0), "po": float(r["po"].iloc[0] or 0)})
+
+        today, hist = daily[0], daily[1:6]
+        avg_cv = sum(d["cv"] for d in hist) / max(len(hist), 1)
+        avg_pv = sum(d["pv"] for d in hist) / max(len(hist), 1)
+        cr = today["cv"] / max(avg_cv, 1)
+        pr = today["pv"] / max(avg_pv, 1)
+        c_chg = today["co"] - daily[1]["co"] if len(daily) >= 2 else 0
+        p_chg = today["po"] - daily[1]["po"] if len(daily) >= 2 else 0
+        vpcr = today["pv"] / max(today["cv"], 1)
+
+        if cr >= 2.0 and c_chg > 0 and cr > pr * 1.3:
+            signal, prob = "BULL", (74 if cr >= 3.0 else 64)
+            reason = f"Call vol {cr:.1f}×avg + OI +{c_chg:,.0f} — institutional CALL buying"
+        elif pr >= 2.0 and p_chg > 0 and pr > cr * 1.3:
+            signal, prob = "BEAR", (73 if pr >= 3.0 else 63)
+            reason = f"Put vol {pr:.1f}×avg + OI +{p_chg:,.0f} — institutional PUT buying"
+        elif cr >= 2.0 and c_chg < 0:
+            signal, prob = "BEAR", 61
+            reason = f"Call vol {cr:.1f}×avg BUT OI falling {c_chg:,.0f} — longs EXITING"
+        elif pr >= 2.0 and p_chg < 0:
+            signal, prob = "BULL", 60
+            reason = f"Put vol {pr:.1f}×avg BUT OI falling {p_chg:,.0f} — bears COVERING"
+        elif vpcr < 0.33:
+            signal, prob = "BULL", 57
+            reason = f"Vol PCR {vpcr:.2f} very low (call-heavy flow) — bullish tilt"
+        elif vpcr > 1.6:
+            signal, prob = "BEAR", 57
+            reason = f"Vol PCR {vpcr:.2f} elevated (put-heavy flow) — bearish tilt"
+        else:
+            signal, prob = "NEUTRAL", 50
+            reason = f"Vol PCR {vpcr:.2f} | C:{cr:.1f}× P:{pr:.1f}× — no extreme flow"
+
+        return {"signal": signal, "prob": prob, "cr": round(cr, 2), "pr": round(pr, 2),
+                "vpcr": round(vpcr, 3), "c_chg": int(c_chg), "p_chg": int(p_chg), "reason": reason}
+    except Exception as e:
+        log.debug(f"_hp_model_vol_flow {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_iv_skew(ticker, conn, spot):
+    try:
+        latest = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker.upper(),))
+        if latest.empty or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No data"}
+        lat_d = latest.iloc[0]["trade_date_now"]
+
+        expiries = pd.read_sql(
+            "SELECT DISTINCT expiry_date FROM options_change WHERE ticker=? ORDER BY expiry_date",
+            conn, params=(ticker.upper(),))
+        today_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        nearest, min_dte = None, 999
+        for _, er in expiries.iterrows():
+            try:
+                exp_dt = datetime.strptime(str(er["expiry_date"]), "%Y-%m-%d")
+                dte = (exp_dt - today_dt).days
+                if 1 < dte < min_dte:
+                    min_dte, nearest = dte, er["expiry_date"]
+            except Exception:
+                pass
+        if nearest is None or min_dte < 2:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No valid expiry for IV"}
+
+        df = pd.read_sql(
+            "SELECT strike,"
+            " AVG(CASE WHEN lastPrice_Call_now>0 THEN lastPrice_Call_now END) AS c_px,"
+            " AVG(CASE WHEN lastPrice_Put_now>0 THEN lastPrice_Put_now END) AS p_px"
+            " FROM options_change WHERE ticker=? AND expiry_date=? AND trade_date_now=?"
+            " GROUP BY strike ORDER BY strike",
+            conn, params=(ticker.upper(), nearest, lat_d))
+        if df.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No strike data"}
+
+        T = max(min_dte / 365.0, 1 / 365.0)
+        df["c_px"] = pd.to_numeric(df["c_px"], errors="coerce").fillna(0)
+        df["p_px"] = pd.to_numeric(df["p_px"], errors="coerce").fillna(0)
+        df["dist"]  = (df["strike"] - spot).abs()
+
+        atm_ivs = []
+        for _, r in df.nsmallest(3, "dist").iterrows():
+            K = float(r["strike"])
+            if float(r["c_px"]) > 0.1:
+                iv = _implied_vol_hp(float(r["c_px"]), spot, K, T)
+                if 0.05 < iv < 3.0:
+                    atm_ivs.append(iv)
+        atm_iv = float(np.mean(atm_ivs)) if atm_ivs else 0.30
+
+        otm_c_iv, otm_p_iv = [], []
+        for _, r in df.iterrows():
+            K = float(r["strike"])
+            if spot * 1.05 <= K <= spot * 1.13 and float(r["c_px"]) > 0.05:
+                iv = _implied_vol_hp(float(r["c_px"]), spot, K, T)
+                if 0.05 < iv < 3.0: otm_c_iv.append(iv)
+            if spot * 0.87 <= K <= spot * 0.95 and float(r["p_px"]) > 0.05:
+                iv = _implied_vol_hp(float(r["p_px"]), spot, K, T)
+                if 0.05 < iv < 3.0: otm_p_iv.append(iv)
+
+        avg_civ = float(np.mean(otm_c_iv)) if otm_c_iv else atm_iv
+        avg_piv = float(np.mean(otm_p_iv)) if otm_p_iv else atm_iv
+        skew = avg_piv / max(avg_civ, 0.01)
+        iv_pct = atm_iv * 100
+
+        if skew >= 2.0:
+            signal, prob = "BULL", 72
+            reason = f"Put/Call skew {skew:.2f}× EXTREME FEAR — contrarian bull (sell puts)"
+        elif skew >= 1.5:
+            signal, prob = "BULL", 62
+            reason = f"Put/Call skew {skew:.2f}× elevated fear — mild bull lean"
+        elif skew <= 0.7:
+            signal, prob = "BEAR", 66
+            reason = f"Put/Call skew {skew:.2f}× (call skew) — complacency → bear/sell calls"
+        elif iv_pct >= 40:
+            signal, prob = "NEUTRAL", 70
+            reason = f"ATM IV {iv_pct:.0f}% HIGH → sell premium (IC/straddle) | skew {skew:.2f}"
+        elif iv_pct <= 15:
+            signal, prob = "NEUTRAL", 55
+            reason = f"ATM IV {iv_pct:.0f}% low → buy options cheap | skew {skew:.2f}"
+        else:
+            signal, prob = "NEUTRAL", 52
+            reason = f"ATM IV {iv_pct:.0f}% normal | skew {skew:.2f} — no IV edge"
+
+        return {"signal": signal, "prob": prob, "atm_iv": round(iv_pct, 1),
+                "skew": round(skew, 2), "put_iv": round(avg_piv * 100, 1),
+                "call_iv": round(avg_civ * 100, 1), "reason": reason}
+    except Exception as e:
+        log.debug(f"_hp_model_iv_skew {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_walk_forward_backtest(ticker, conn, extreme_filter=0.03):
+    """
+    Walk-forward backtest on historical data.
+    PCR-Z, Vol-Flow, OI-Trend computable from daily aggregates.
+    Removes extreme days (>3% next-day move) per user guidance.
+    """
+    try:
+        sd = pd.read_sql(
+            "SELECT trade_date, close, pcr_oi FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) ASC",
+            conn, params=(ticker.upper(),))
+        oi = pd.read_sql(
+            "SELECT trade_date_now, SUM(vol_Call_now) AS cv, SUM(vol_Put_now) AS pv,"
+            " SUM(openInt_Call_now) AS co, SUM(openInt_Put_now) AS po"
+            " FROM options_change WHERE ticker=? GROUP BY trade_date_now"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) ASC",
+            conn, params=(ticker.upper(),))
+
+        sd["close"]    = pd.to_numeric(sd["close"],  errors="coerce")
+        sd["pcr_oi"]   = pd.to_numeric(sd["pcr_oi"], errors="coerce")
+        sd["next_ret"] = sd["close"].shift(-1) / sd["close"] - 1
+        merged = sd.merge(oi, left_on="trade_date", right_on="trade_date_now", how="inner")
+        merged = merged.dropna(subset=["close", "next_ret", "pcr_oi"]).reset_index(drop=True)
+
+        n_total   = len(merged)
+        ext_mask  = merged["next_ret"].abs() > extreme_filter
+        n_extreme = int(ext_mask.sum())
+        clean     = merged[~ext_mask].reset_index(drop=True)
+
+        if len(clean) < 15:
+            return {"meta": {"n_total": n_total, "n_extreme": n_extreme, "n_clean": len(clean)}}
+
+        N = 20
+        res = {m: [] for m in ("pcr_z", "vol_flow", "oi_trend", "ensemble")}
+
+        for i in range(N, len(clean)):
+            row  = clean.iloc[i]
+            hist = clean.iloc[max(0, i - N):i]
+            actual = 1 if float(row["next_ret"]) > 0.003 else (-1 if float(row["next_ret"]) < -0.003 else 0)
+            if actual == 0:
+                continue
+            sigs = []
+
+            # PCR-Z
+            pm, ps = float(hist["pcr_oi"].mean()), float(hist["pcr_oi"].std())
+            if ps > 0:
+                z = (float(row["pcr_oi"]) - pm) / ps
+                if z >= 1.5:
+                    sigs.append(1); res["pcr_z"].append(1 == actual)
+                elif z <= -1.5:
+                    sigs.append(-1); res["pcr_z"].append(-1 == actual)
+
+            # Vol flow
+            acv = float(hist["cv"].mean()) or 1
+            apv = float(hist["pv"].mean()) or 1
+            cr  = float(row["cv"]) / acv
+            pr  = float(row["pv"]) / apv
+            c_chg = float(row["co"]) - float(hist["co"].iloc[-1])
+            p_chg = float(row["po"]) - float(hist["po"].iloc[-1])
+            if cr >= 2.0 and c_chg > 0 and cr > pr * 1.3:
+                sigs.append(1); res["vol_flow"].append(1 == actual)
+            elif pr >= 2.0 and p_chg > 0 and pr > cr * 1.3:
+                sigs.append(-1); res["vol_flow"].append(-1 == actual)
+
+            # OI 3-day trend
+            if i >= N + 2:
+                c3 = [float(clean["co"].iloc[j]) for j in (i, i-1, i-2, i-3)]
+                p3 = [float(clean["po"].iloc[j]) for j in (i, i-1, i-2, i-3)]
+                cc = [c3[k] - c3[k+1] for k in range(3)]
+                pc = [p3[k] - p3[k+1] for k in range(3)]
+                cb = sum(1 for k in range(3) if cc[k] > pc[k] and cc[k] > 0)
+                pb = sum(1 for k in range(3) if pc[k] > cc[k] and pc[k] > 0)
+                if cb >= 3:
+                    sigs.append(1); res["oi_trend"].append(1 == actual)
+                elif pb >= 3:
+                    sigs.append(-1); res["oi_trend"].append(-1 == actual)
+
+            if len(sigs) >= 2:
+                vote = sum(sigs)
+                es = 1 if vote > 0 else (-1 if vote < 0 else 0)
+                if es != 0:
+                    res["ensemble"].append(es == actual)
+
+        out = {}
+        for m, hits in res.items():
+            if len(hits) >= 5:
+                out[m] = {"acc": round(sum(hits) / len(hits) * 100, 1), "n": len(hits)}
+        out["meta"] = {"n_total": n_total, "n_extreme": n_extreme, "n_clean": len(clean)}
+        return out
+    except Exception as e:
+        log.debug(f"_hp_walk_forward {ticker}: {e}")
+        return {}
+
+
+def _hp_model_rv_iv(ticker, conn, spot):
+    try:
+        from datetime import datetime as _dt2
+        prices = pd.read_sql(
+            "SELECT close FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 35",
+            conn, params=(ticker.upper(),))
+        if len(prices) < 22 or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Insufficient history"}
+        rets = prices["close"].pct_change().dropna()
+        rv30 = float(rets.std() * _math.sqrt(252) * 100)
+
+        latest = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker.upper(),))
+        if latest.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No options data"}
+        ld = latest.iloc[0, 0]
+        today = _dt2.now().date()
+
+        opts = pd.read_sql(
+            "SELECT strike, expiry_date, lastPrice_Call_now FROM options_change"
+            " WHERE ticker=? AND trade_date_now=? AND lastPrice_Call_now>0.5"
+            " AND ABS(strike-?)/? < 0.04",
+            conn, params=(ticker.upper(), ld, spot, spot))
+        if opts.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No ATM options", "rv": round(rv30, 1)}
+
+        ivs = []
+        for _, row in opts.iterrows():
+            try:
+                exp = _dt2.strptime(row["expiry_date"], "%m-%d-%Y").date()
+                T   = max((exp - today).days / 365.0, 1/365.0)
+                iv  = _implied_vol_hp(float(row["lastPrice_Call_now"]), spot, float(row["strike"]), T)
+                if 0.05 < iv < 3.0:
+                    ivs.append(iv * 100)
+            except Exception:
+                pass
+        if not ivs:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "IV calc failed", "rv": round(rv30, 1)}
+
+        atm_iv = float(np.median(ivs))
+        spread = atm_iv - rv30
+
+        if spread >= 10:
+            return {"signal": "NEUTRAL", "prob": 74,
+                    "atm_iv": round(atm_iv, 1), "rv": round(rv30, 1), "spread": round(spread, 1),
+                    "reason": f"IV {atm_iv:.0f}% >> RV {rv30:.0f}% (+{spread:.0f}pp) → SELL PREMIUM (Bali 2009)"}
+        elif spread >= 5:
+            return {"signal": "NEUTRAL", "prob": 63,
+                    "atm_iv": round(atm_iv, 1), "rv": round(rv30, 1), "spread": round(spread, 1),
+                    "reason": f"IV {atm_iv:.0f}% > RV {rv30:.0f}% (+{spread:.0f}pp) → mild premium edge"}
+        elif spread <= -8:
+            return {"signal": "BULL", "prob": 65,
+                    "atm_iv": round(atm_iv, 1), "rv": round(rv30, 1), "spread": round(spread, 1),
+                    "reason": f"RV {rv30:.0f}% >> IV {atm_iv:.0f}% → options cheap, buy gamma/direction"}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50,
+                    "atm_iv": round(atm_iv, 1), "rv": round(rv30, 1), "spread": round(spread, 1),
+                    "reason": f"IV {atm_iv:.0f}% ≈ RV {rv30:.0f}% (spread {spread:+.0f}pp)"}
+    except Exception as e:
+        log.debug(f"_hp_model_rv_iv {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_oi_term_structure(ticker, conn):
+    try:
+        from datetime import datetime as _dt2
+        today = _dt2.now().date()
+        ld = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker.upper(),))
+        if ld.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No options data"}
+        latest = ld.iloc[0, 0]
+
+        df = pd.read_sql(
+            "SELECT expiry_date, SUM(openInt_Call_now) AS co, SUM(openInt_Put_now) AS po"
+            " FROM options_change WHERE ticker=? AND trade_date_now=?"
+            " GROUP BY expiry_date",
+            conn, params=(ticker.upper(), latest))
+        if df.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No expiry data"}
+
+        near_c = near_p = far_c = far_p = 0.0
+        for _, r in df.iterrows():
+            try:
+                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                dte = (exp - today).days
+                if dte < 1:
+                    continue
+                if dte <= 21:
+                    near_c += float(r["co"] or 0); near_p += float(r["po"] or 0)
+                elif dte >= 45:
+                    far_c  += float(r["co"] or 0); far_p  += float(r["po"] or 0)
+            except Exception:
+                pass
+
+        near_pcr = (near_p / near_c) if near_c > 0 else 1.0
+        far_pcr  = (far_p  / far_c)  if far_c  > 0 else 1.0
+        ts_ratio = near_pcr / far_pcr if far_pcr > 0 else 1.0
+
+        if near_pcr > 1.8 and ts_ratio > 1.5:
+            return {"signal": "BEAR", "prob": 68, "near_pcr": round(near_pcr, 2), "far_pcr": round(far_pcr, 2),
+                    "reason": f"Near PCR {near_pcr:.2f} >> Far {far_pcr:.2f} → panic hedging, BEAR"}
+        elif near_pcr < 0.6 and ts_ratio < 0.7:
+            return {"signal": "BULL", "prob": 65, "near_pcr": round(near_pcr, 2), "far_pcr": round(far_pcr, 2),
+                    "reason": f"Near PCR {near_pcr:.2f} << Far {far_pcr:.2f} → near-term call buying, BULL"}
+        elif far_pcr > 1.5 and near_pcr < 1.0:
+            return {"signal": "BULL", "prob": 62, "near_pcr": round(near_pcr, 2), "far_pcr": round(far_pcr, 2),
+                    "reason": f"Far-term put build ({far_pcr:.2f}) with calm near ({near_pcr:.2f}) → institutional BULL"}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "near_pcr": round(near_pcr, 2), "far_pcr": round(far_pcr, 2),
+                    "reason": f"Term struct balanced: near PCR {near_pcr:.2f} / far {far_pcr:.2f}"}
+    except Exception as e:
+        log.debug(f"_hp_model_oi_term_structure {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_maxpain_velocity(ticker, conn, spot):
+    try:
+        from datetime import datetime as _dt2
+        dates = pd.read_sql(
+            "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 4",
+            conn, params=(ticker.upper(),))
+        if len(dates) < 3 or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need ≥3 days data"}
+
+        def _mp(dt_str):
+            df = pd.read_sql(
+                "SELECT strike, SUM(openInt_Call_now) AS co, SUM(openInt_Put_now) AS po"
+                " FROM options_change WHERE ticker=? AND trade_date_now=? GROUP BY strike",
+                conn, params=(ticker.upper(), dt_str))
+            if df.empty:
+                return None
+            strikes = df["strike"].tolist()
+            best_s, best_loss = strikes[0], float("inf")
+            for test in strikes:
+                loss = sum(max(test - s, 0) * float(row_r["co"]) + max(s - test, 0) * float(row_r["po"])
+                           for s, row_r in zip(strikes, df.to_dict("records")))
+                if loss < best_loss:
+                    best_loss = loss; best_s = test
+            return float(best_s)
+
+        mps = [_mp(d) for d in dates.iloc[:, 0].tolist()]
+        mps = [m for m in mps if m is not None]
+        if len(mps) < 3:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Max pain calc insufficient"}
+
+        v1 = mps[0] - mps[1]   # most recent change
+        v2 = mps[1] - mps[2]   # prior change
+        trend_up   = v1 > 0 and v2 > 0
+        trend_down = v1 < 0 and v2 < 0
+        pct_move   = abs(v1) / spot * 100 if spot > 0 else 0
+
+        if trend_up and pct_move >= 0.3:
+            return {"signal": "BULL", "prob": 66, "mp_now": mps[0], "mp_vel": round(v1, 2),
+                    "reason": f"Max pain rising {mps[2]:.0f}→{mps[1]:.0f}→{mps[0]:.0f} → dealer hedge BULL"}
+        elif trend_down and pct_move >= 0.3:
+            return {"signal": "BEAR", "prob": 66, "mp_now": mps[0], "mp_vel": round(v1, 2),
+                    "reason": f"Max pain falling {mps[2]:.0f}→{mps[1]:.0f}→{mps[0]:.0f} → dealer hedge BEAR"}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "mp_now": mps[0], "mp_vel": round(v1, 2),
+                    "reason": f"Max pain stable ≈${mps[0]:.0f} (vel {v1:+.2f})"}
+    except Exception as e:
+        log.debug(f"_hp_model_maxpain_velocity {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_iv_rank(ticker, conn, spot):
+    try:
+        from datetime import datetime as _dt2
+        today = _dt2.now().date()
+
+        dates = pd.read_sql(
+            "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 65",
+            conn, params=(ticker.upper(),))
+        if len(dates) < 20 or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 20+ days for IV rank"}
+
+        def _atm_iv(dt_str):
+            opts = pd.read_sql(
+                "SELECT strike, expiry_date, lastPrice_Call_now FROM options_change"
+                " WHERE ticker=? AND trade_date_now=? AND lastPrice_Call_now>0.3"
+                " AND ABS(strike-?)/? < 0.05",
+                conn, params=(ticker.upper(), dt_str, spot, spot))
+            ivs = []
+            for _, r in opts.iterrows():
+                try:
+                    exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                    T   = max((exp - today).days / 365.0, 1/365.0)
+                    iv  = _implied_vol_hp(float(r["lastPrice_Call_now"]), spot, float(r["strike"]), T)
+                    if 0.05 < iv < 3.0:
+                        ivs.append(iv * 100)
+                except Exception:
+                    pass
+            return float(np.median(ivs)) if ivs else None
+
+        iv_series = []
+        for dt_str in dates.iloc[:, 0].tolist():
+            iv = _atm_iv(dt_str)
+            if iv is not None:
+                iv_series.append(iv)
+            if len(iv_series) >= 60:
+                break
+
+        if len(iv_series) < 15:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Insufficient IV history"}
+
+        curr_iv = iv_series[0]
+        hist_iv = iv_series[1:]
+        iv_rank = (sum(1 for x in hist_iv if x < curr_iv) / len(hist_iv)) * 100
+
+        if iv_rank >= 80:
+            return {"signal": "NEUTRAL", "prob": 75, "iv_rank": round(iv_rank, 0), "atm_iv": round(curr_iv, 1),
+                    "reason": f"IV Rank {iv_rank:.0f}% (top decile) → SELL PREMIUM (tastytrade filter)"}
+        elif iv_rank >= 60:
+            return {"signal": "NEUTRAL", "prob": 63, "iv_rank": round(iv_rank, 0), "atm_iv": round(curr_iv, 1),
+                    "reason": f"IV Rank {iv_rank:.0f}% (above avg) → mild premium-sell edge"}
+        elif iv_rank <= 20:
+            return {"signal": "BULL", "prob": 62, "iv_rank": round(iv_rank, 0), "atm_iv": round(curr_iv, 1),
+                    "reason": f"IV Rank {iv_rank:.0f}% (bottom quintile) → options cheap, buy direction"}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "iv_rank": round(iv_rank, 0), "atm_iv": round(curr_iv, 1),
+                    "reason": f"IV Rank {iv_rank:.0f}% — normal range, no premium edge"}
+    except Exception as e:
+        log.debug(f"_hp_model_iv_rank {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_pcp_deviation(ticker, conn, spot):
+    try:
+        from datetime import datetime as _dt2
+        today = _dt2.now().date()
+        ld = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker.upper(),))
+        if ld.empty or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No data"}
+        latest = ld.iloc[0, 0]
+
+        opts = pd.read_sql(
+            "SELECT strike, expiry_date, lastPrice_Call_now, lastPrice_Put_now"
+            " FROM options_change WHERE ticker=? AND trade_date_now=?"
+            " AND lastPrice_Call_now>0.3 AND lastPrice_Put_now>0.3"
+            " AND ABS(strike-?)/? BETWEEN 0.01 AND 0.08",
+            conn, params=(ticker.upper(), latest, spot, spot))
+        if opts.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No near-ATM pairs found"}
+
+        deviations = []
+        for _, r in opts.iterrows():
+            try:
+                K   = float(r["strike"]); C = float(r["lastPrice_Call_now"]); P = float(r["lastPrice_Put_now"])
+                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                T   = max((exp - today).days / 365.0, 1/365.0)
+                r_  = 0.05
+                parity = spot - K * _math.exp(-r_ * T)   # C - P should equal this
+                dev    = (C - P) - parity                  # positive = calls expensive
+                deviations.append(dev / spot * 100)        # as % of spot
+            except Exception:
+                pass
+
+        if not deviations:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "PCP calc failed"}
+
+        avg_dev = float(np.mean(deviations))
+        pct_pos = sum(1 for d in deviations if d > 0) / len(deviations)
+
+        if avg_dev > 0.4 and pct_pos > 0.65:
+            return {"signal": "BULL", "prob": 67, "pcp_dev": round(avg_dev, 3),
+                    "reason": f"PCP dev +{avg_dev:.2f}% ({pct_pos:.0%} pairs) → informed call buying (Cremers 2010)"}
+        elif avg_dev < -0.4 and pct_pos < 0.35:
+            return {"signal": "BEAR", "prob": 67, "pcp_dev": round(avg_dev, 3),
+                    "reason": f"PCP dev {avg_dev:.2f}% ({1-pct_pos:.0%} pairs) → informed put buying (Cremers 2010)"}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "pcp_dev": round(avg_dev, 3),
+                    "reason": f"PCP deviation {avg_dev:+.3f}% — within normal bounds"}
+    except Exception as e:
+        log.debug(f"_hp_model_pcp_deviation {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_vol_regime(ticker, conn):
+    try:
+        prices = pd.read_sql(
+            "SELECT close FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 30",
+            conn, params=(ticker.upper(),))
+        if len(prices) < 22:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 22+ days for HV regime"}
+
+        rets = prices["close"].pct_change().dropna().tolist()
+        hv5  = float(np.std(rets[:5])  * _math.sqrt(252) * 100) if len(rets) >= 5  else 0
+        hv20 = float(np.std(rets[:20]) * _math.sqrt(252) * 100) if len(rets) >= 20 else 0
+
+        if hv20 < 0.1:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Near-zero 20d HV"}
+
+        ratio = hv5 / hv20
+
+        if ratio < 0.6:
+            return {"signal": "NEUTRAL", "prob": 68, "hv5": round(hv5, 1), "hv20": round(hv20, 1), "ratio": round(ratio, 2),
+                    "reason": f"5d HV {hv5:.1f}% << 20d {hv20:.1f}% (ratio {ratio:.2f}) → vol coiling → SELL STRADDLE (Sinclair)"}
+        elif ratio > 1.5:
+            return {"signal": "BULL", "prob": 62, "hv5": round(hv5, 1), "hv20": round(hv20, 1), "ratio": round(ratio, 2),
+                    "reason": f"5d HV {hv5:.1f}% >> 20d {hv20:.1f}% (ratio {ratio:.2f}) → vol expanding → buy direction"}
+        elif ratio > 1.2:
+            return {"signal": "NEUTRAL", "prob": 55, "hv5": round(hv5, 1), "hv20": round(hv20, 1), "ratio": round(ratio, 2),
+                    "reason": f"5d/20d HV {ratio:.2f} — mild vol expansion, monitor breakout"}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "hv5": round(hv5, 1), "hv20": round(hv20, 1), "ratio": round(ratio, 2),
+                    "reason": f"Vol regime normal: 5d {hv5:.1f}% / 20d {hv20:.1f}% (ratio {ratio:.2f})"}
+    except Exception as e:
+        log.debug(f"_hp_model_vol_regime {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_multi_expiry_oi(ticker, conn):
+    try:
+        from datetime import datetime as _dt2
+        today = _dt2.now().date()
+        dates = pd.read_sql(
+            "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 3",
+            conn, params=(ticker.upper(),))
+        if len(dates) < 2:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 2+ days"}
+
+        today_d = dates.iloc[0, 0]; prev_d = dates.iloc[1, 0]
+
+        now_exp = pd.read_sql(
+            "SELECT expiry_date, SUM(openInt_Call_now) AS co, SUM(openInt_Put_now) AS po"
+            " FROM options_change WHERE ticker=? AND trade_date_now=? GROUP BY expiry_date",
+            conn, params=(ticker.upper(), today_d))
+        prv_exp = pd.read_sql(
+            "SELECT expiry_date, SUM(openInt_Call_now) AS co, SUM(openInt_Put_now) AS po"
+            " FROM options_change WHERE ticker=? AND trade_date_now=? GROUP BY expiry_date",
+            conn, params=(ticker.upper(), prev_d))
+        if now_exp.empty or prv_exp.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Missing expiry data"}
+
+        merged = now_exp.merge(prv_exp, on="expiry_date", suffixes=("_n", "_p"))
+        bull_exp = bear_exp = 0
+        for _, r in merged.iterrows():
+            try:
+                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                if (exp - today).days < 3:
+                    continue
+                dc = float(r["co_n"] or 0) - float(r["co_p"] or 0)
+                dp = float(r["po_n"] or 0) - float(r["po_p"] or 0)
+                if dc > 0 and dc > abs(dp) * 1.3:
+                    bull_exp += 1
+                elif dp > 0 and dp > abs(dc) * 1.3:
+                    bear_exp += 1
+            except Exception:
+                pass
+
+        if bull_exp >= 2 and bull_exp > bear_exp:
+            return {"signal": "BULL", "prob": 70, "bull_exp": bull_exp, "bear_exp": bear_exp,
+                    "reason": f"Call OI building in {bull_exp} expiries simultaneously → institutional BULL (Ni 2008)"}
+        elif bear_exp >= 2 and bear_exp > bull_exp:
+            return {"signal": "BEAR", "prob": 70, "bull_exp": bull_exp, "bear_exp": bear_exp,
+                    "reason": f"Put OI building in {bear_exp} expiries simultaneously → institutional BEAR (Ni 2008)"}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "bull_exp": bull_exp, "bear_exp": bear_exp,
+                    "reason": f"OI mixed across expiries (bull:{bull_exp} / bear:{bear_exp})"}
+    except Exception as e:
+        log.debug(f"_hp_model_multi_expiry_oi {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_smart_money_uoa(ticker, conn):
+    try:
+        dates = pd.read_sql(
+            "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 12",
+            conn, params=(ticker.upper(),))
+        if len(dates) < 5:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 5+ days for UOA baseline"}
+
+        today_d = dates.iloc[0, 0]
+        hist_dates = dates.iloc[1:, 0].tolist()
+
+        def _voi(dt_str):
+            r = pd.read_sql(
+                "SELECT SUM(vol_Call_now) AS cv, SUM(vol_Put_now) AS pv,"
+                " SUM(openInt_Call_now) AS co, SUM(openInt_Put_now) AS po"
+                " FROM options_change WHERE ticker=? AND trade_date_now=?",
+                conn, params=(ticker.upper(), dt_str))
+            if r.empty or r.iloc[0]["co"] is None:
+                return None
+            row = r.iloc[0]
+            co = float(row["co"] or 1); po = float(row["po"] or 1)
+            cv = float(row["cv"] or 0); pv = float(row["pv"] or 0)
+            return {"c_voi": cv / co, "p_voi": pv / po, "cv": cv, "pv": pv, "co": co, "po": po}
+
+        curr = _voi(today_d)
+        if curr is None:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No today data"}
+
+        hist = [_voi(d) for d in hist_dates]
+        hist = [h for h in hist if h is not None]
+        if len(hist) < 4:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Insufficient baseline"}
+
+        avg_c_voi = float(np.mean([h["c_voi"] for h in hist]))
+        avg_p_voi = float(np.mean([h["p_voi"] for h in hist]))
+        c_surge = curr["c_voi"] / avg_c_voi if avg_c_voi > 0 else 1.0
+        p_surge = curr["p_voi"] / avg_p_voi if avg_p_voi > 0 else 1.0
+        c_oi_growing = curr["co"] > float(np.mean([h["co"] for h in hist[:3]]))
+        p_oi_growing = curr["po"] > float(np.mean([h["po"] for h in hist[:3]]))
+
+        if c_surge >= 2.5 and c_oi_growing and c_surge > p_surge * 1.5:
+            return {"signal": "BULL", "prob": 73, "c_surge": round(c_surge, 1), "p_surge": round(p_surge, 1),
+                    "reason": f"Call Vol/OI {c_surge:.1f}x avg + OI growing → smart money calls (Amin 2004)"}
+        elif p_surge >= 2.5 and p_oi_growing and p_surge > c_surge * 1.5:
+            return {"signal": "BEAR", "prob": 73, "c_surge": round(c_surge, 1), "p_surge": round(p_surge, 1),
+                    "reason": f"Put Vol/OI {p_surge:.1f}x avg + OI growing → smart money puts (Amin 2004)"}
+        elif c_surge >= 1.8 and c_surge > p_surge:
+            return {"signal": "BULL", "prob": 60, "c_surge": round(c_surge, 1), "p_surge": round(p_surge, 1),
+                    "reason": f"Moderate call activity surge {c_surge:.1f}x — watch for confirmation"}
+        elif p_surge >= 1.8 and p_surge > c_surge:
+            return {"signal": "BEAR", "prob": 60, "c_surge": round(c_surge, 1), "p_surge": round(p_surge, 1),
+                    "reason": f"Moderate put activity surge {p_surge:.1f}x — watch for confirmation"}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "c_surge": round(c_surge, 1), "p_surge": round(p_surge, 1),
+                    "reason": f"Normal activity: call {c_surge:.1f}x / put {p_surge:.1f}x baseline"}
+    except Exception as e:
+        log.debug(f"_hp_model_smart_money_uoa {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_hhi_pin(ticker, conn, spot):
+    try:
+        ld = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker.upper(),))
+        if ld.empty or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No data"}
+        latest = ld.iloc[0, 0]
+
+        df = pd.read_sql(
+            "SELECT strike, SUM(openInt_Call_now+openInt_Put_now) AS total_oi"
+            " FROM options_change WHERE ticker=? AND trade_date_now=?"
+            " GROUP BY strike ORDER BY strike",
+            conn, params=(ticker.upper(), latest))
+        if df.empty or df["total_oi"].sum() == 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No OI data"}
+
+        tot = float(df["total_oi"].sum())
+        shares = [(float(r["total_oi"]) / tot) for _, r in df.iterrows()]
+        hhi = sum(s * s for s in shares)  # 0=max dispersion, 1=all OI in one strike
+
+        # Check if high-OI strikes are near spot
+        near = df[df["strike"].between(spot * 0.97, spot * 1.03)]
+        near_oi_pct = float(near["total_oi"].sum()) / tot * 100 if not near.empty else 0
+
+        if hhi >= 0.20 and near_oi_pct >= 30:
+            return {"signal": "NEUTRAL", "prob": 76, "hhi": round(hhi, 3), "near_pct": round(near_oi_pct, 0),
+                    "reason": f"HHI {hhi:.3f} concentrated: {near_oi_pct:.0f}% OI within ±3% spot → strong pin (Kiema 2019)"}
+        elif hhi >= 0.12 and near_oi_pct >= 20:
+            return {"signal": "NEUTRAL", "prob": 64, "hhi": round(hhi, 3), "near_pct": round(near_oi_pct, 0),
+                    "reason": f"HHI {hhi:.3f}: moderate concentration near spot → mild pin potential"}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "hhi": round(hhi, 3), "near_pct": round(near_oi_pct, 0),
+                    "reason": f"OI dispersed (HHI {hhi:.3f}, near-spot {near_oi_pct:.0f}%) — no pin signal"}
+    except Exception as e:
+        log.debug(f"_hp_model_hhi_pin {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_pcr_velocity(ticker, conn):
+    try:
+        df = pd.read_sql(
+            "SELECT trade_date, pcr_oi FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 10",
+            conn, params=(ticker.upper(),))
+        if len(df) < 5:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 5+ days for PCR velocity"}
+
+        df["pcr_oi"] = pd.to_numeric(df["pcr_oi"], errors="coerce")
+        df = df.dropna(subset=["pcr_oi"]).reset_index(drop=True)
+        if len(df) < 4:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Not enough valid PCR rows"}
+
+        # Velocity = linear slope of PCR over last 5 days
+        y = df["pcr_oi"].iloc[:5].tolist()[::-1]  # oldest→newest
+        n = len(y)
+        x = list(range(n))
+        xm, ym = sum(x) / n, sum(y) / n
+        slope = sum((xi - xm) * (yi - ym) for xi, yi in zip(x, y)) / (sum((xi - xm) ** 2 for xi in x) + 1e-9)
+
+        curr_pcr = float(df["pcr_oi"].iloc[0])
+        avg_pcr  = float(df["pcr_oi"].iloc[:10].mean())
+        z = (curr_pcr - avg_pcr) / (float(df["pcr_oi"].std()) + 1e-9)
+
+        if slope <= -0.08 and curr_pcr < avg_pcr:
+            return {"signal": "BULL", "prob": 68, "slope": round(slope, 3), "pcr": round(curr_pcr, 2),
+                    "reason": f"PCR dropping fast (slope {slope:.3f}, z={z:.1f}) → call buying surge → BULL"}
+        elif slope >= 0.08 and curr_pcr > avg_pcr:
+            return {"signal": "BEAR", "prob": 68, "slope": round(slope, 3), "pcr": round(curr_pcr, 2),
+                    "reason": f"PCR rising fast (slope {slope:.3f}, z={z:.1f}) → put buying surge → BEAR"}
+        elif slope <= -0.04:
+            return {"signal": "BULL", "prob": 58, "slope": round(slope, 3), "pcr": round(curr_pcr, 2),
+                    "reason": f"PCR moderately declining (slope {slope:.3f}) — mild bullish momentum"}
+        elif slope >= 0.04:
+            return {"signal": "BEAR", "prob": 58, "slope": round(slope, 3), "pcr": round(curr_pcr, 2),
+                    "reason": f"PCR moderately rising (slope {slope:.3f}) — mild bearish momentum"}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "slope": round(slope, 3), "pcr": round(curr_pcr, 2),
+                    "reason": f"PCR flat (slope {slope:.3f}, curr {curr_pcr:.2f})"}
+    except Exception as e:
+        log.debug(f"_hp_model_pcr_velocity {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_vrvp(ticker, conn, spot):
+    try:
+        px = pd.read_sql(
+            "SELECT high, low, close, volume FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 60",
+            conn, params=(ticker.upper(),))
+        if len(px) < 20 or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 20+ days for VRVP"}
+
+        for col in ['high', 'low', 'close', 'volume']:
+            px[col] = pd.to_numeric(px[col], errors='coerce')
+        px = px.dropna().reset_index(drop=True)
+
+        price_min = float(px['low'].min())
+        price_max = float(px['high'].max())
+        if price_max <= price_min:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "VRVP: zero price range"}
+
+        # Build 40-bucket volume profile
+        N_BINS = 40
+        bucket_size = (price_max - price_min) / N_BINS
+        vol_profile = np.zeros(N_BINS)
+
+        for _, row in px.iterrows():
+            h = float(row['high']); l = float(row['low']); v = float(row['volume'])
+            if h <= l or v <= 0: continue
+            # Distribute volume uniformly across the day's high-low range
+            lo_bin = max(0, int((l - price_min) / bucket_size))
+            hi_bin = min(N_BINS - 1, int((h - price_min) / bucket_size))
+            n_bins = hi_bin - lo_bin + 1
+            for b in range(lo_bin, hi_bin + 1):
+                vol_profile[b] += v / n_bins
+
+        # Identify HVN, LVN, POC
+        mean_vol  = float(np.mean(vol_profile[vol_profile > 0]))
+        std_vol   = float(np.std(vol_profile[vol_profile > 0]))
+        hvn_thresh = mean_vol + 0.8 * std_vol    # HVN = thick bars
+        lvn_thresh = mean_vol - 0.5 * std_vol    # LVN = thin bars
+        poc_bin   = int(np.argmax(vol_profile))
+        poc_price = price_min + (poc_bin + 0.5) * bucket_size
+
+        # Value area (70% of total volume)
+        total_vol = vol_profile.sum()
+        va_target = total_vol * 0.70
+        va_lo = va_hi = poc_bin
+        va_accum = vol_profile[poc_bin]
+        while va_accum < va_target and (va_lo > 0 or va_hi < N_BINS - 1):
+            expand_lo = vol_profile[va_lo - 1] if va_lo > 0 else 0
+            expand_hi = vol_profile[va_hi + 1] if va_hi < N_BINS - 1 else 0
+            if expand_lo >= expand_hi and va_lo > 0:
+                va_lo -= 1; va_accum += expand_lo
+            elif va_hi < N_BINS - 1:
+                va_hi += 1; va_accum += expand_hi
+            else:
+                break
+        val_price = price_min + (va_lo + 0.5) * bucket_size   # Value Area Low
+        vah_price = price_min + (va_hi + 0.5) * bucket_size   # Value Area High
+
+        # Find nearest HVN to current spot
+        spot_bin = max(0, min(N_BINS - 1, int((spot - price_min) / bucket_size)))
+        curr_vol = vol_profile[spot_bin]
+
+        # Search for nearest HVN within ±8%
+        search_radius = max(1, int(N_BINS * 0.08))
+        nearby_hvn = []
+        for b in range(max(0, spot_bin - search_radius), min(N_BINS, spot_bin + search_radius + 1)):
+            if vol_profile[b] >= hvn_thresh:
+                bp = price_min + (b + 0.5) * bucket_size
+                dist_pct = abs(bp - spot) / spot * 100
+                nearby_hvn.append((dist_pct, bp, vol_profile[b]))
+        nearby_hvn.sort()
+
+        hvn_zone  = curr_vol >= hvn_thresh
+        lvn_zone  = curr_vol <= lvn_thresh
+        in_va     = val_price <= spot <= vah_price
+        poc_dist  = abs(spot - poc_price) / spot * 100
+
+        # Signal logic
+        if hvn_zone and poc_dist <= 2.5:
+            return {
+                "signal": "SELL_PREMIUM", "prob": 79,
+                "poc": round(poc_price, 2), "val": round(val_price, 2), "vah": round(vah_price, 2),
+                "hvn_level": round(poc_price, 2),
+                "box_lo": round(val_price, 2), "box_hi": round(vah_price, 2),
+                "reason": (f"Price at POC ${poc_price:.2f} (HVN thickness"
+                           f" {curr_vol/mean_vol:.1f}x avg) — strong pin zone. "
+                           f"Sell strangle: put at ${val_price:.0f} / call at ${vah_price:.0f}")
+            }
+        elif hvn_zone:
+            return {
+                "signal": "SELL_PREMIUM", "prob": 72,
+                "poc": round(poc_price, 2), "val": round(val_price, 2), "vah": round(vah_price, 2),
+                "hvn_level": round(spot, 2),
+                "box_lo": round(spot * 0.985, 2), "box_hi": round(spot * 1.015, 2),
+                "reason": (f"Price in HVN zone ({curr_vol/mean_vol:.1f}x avg vol). "
+                           f"VA box ${val_price:.0f}-${vah_price:.0f}. "
+                           f"SELL PREMIUM — IC strikes outside VA.")
+            }
+        elif nearby_hvn and nearby_hvn[0][0] <= 1.5:
+            dist, hvn_p, hvn_v = nearby_hvn[0]
+            direction = "approaching from below" if hvn_p > spot else "approaching from above"
+            return {
+                "signal": "SELL_PREMIUM", "prob": 68,
+                "poc": round(poc_price, 2), "val": round(val_price, 2), "vah": round(vah_price, 2),
+                "hvn_level": round(hvn_p, 2),
+                "box_lo": round(min(spot, hvn_p) * 0.99, 2),
+                "box_hi": round(max(spot, hvn_p) * 1.01, 2),
+                "reason": (f"HVN at ${hvn_p:.2f} ({hvn_v/mean_vol:.1f}x avg) only {dist:.1f}% away "
+                           f"({direction}). POC=${poc_price:.2f}. Price will stall here — SELL.")
+            }
+        elif lvn_zone:
+            # Price in thin zone — expect fast move
+            nearest_hvn_above = next((hp for (d, hp, hv) in nearby_hvn if hp > spot), None)
+            nearest_hvn_below = next((hp for (d, hp, hv) in sorted(nearby_hvn) if hp < spot), None)
+            target = nearest_hvn_above or (spot * 1.03)
+            return {
+                "signal": "BULL", "prob": 62,
+                "poc": round(poc_price, 2), "val": round(val_price, 2), "vah": round(vah_price, 2),
+                "hvn_level": round(target, 2),
+                "reason": (f"Price in LVN (thin zone {curr_vol/mean_vol:.1f}x avg) — "
+                           f"expect fast move toward HVN ${target:.2f}. POC=${poc_price:.2f}.")
+            }
+        elif in_va:
+            return {
+                "signal": "SELL_PREMIUM", "prob": 65,
+                "poc": round(poc_price, 2), "val": round(val_price, 2), "vah": round(vah_price, 2),
+                "hvn_level": round(poc_price, 2),
+                "box_lo": round(val_price, 2), "box_hi": round(vah_price, 2),
+                "reason": (f"Price inside Value Area ${val_price:.0f}-${vah_price:.0f} "
+                           f"(70% of volume). POC=${poc_price:.2f}. Sell IC with strikes at VA edges.")
+            }
+        elif spot > vah_price:
+            # Price broke above value area → bullish breakout
+            dist_above = (spot - vah_price) / spot * 100
+            if dist_above <= 4.0:
+                return {
+                    "signal": "BULL", "prob": 64,
+                    "poc": round(poc_price, 2), "val": round(val_price, 2), "vah": round(vah_price, 2),
+                    "reason": (f"Price {dist_above:.1f}% above VA top ${vah_price:.0f}. "
+                               f"Breakout above HVN — BULL momentum. POC=${poc_price:.2f}.")
+                }
+            else:
+                # Far above VA — look for near HVN as short-term sell zone
+                return {
+                    "signal": "SELL_PREMIUM", "prob": 62,
+                    "poc": round(poc_price, 2), "val": round(val_price, 2), "vah": round(vah_price, 2),
+                    "box_lo": round(spot * 0.97, 2), "box_hi": round(spot * 1.02, 2),
+                    "reason": (f"Price {dist_above:.1f}% above 60d VA — extended. "
+                               f"SELL OTM strangle near current range, POC=${poc_price:.2f}.")
+                }
+        elif spot < val_price:
+            dist_below = (val_price - spot) / spot * 100
+            if dist_below <= 4.0:
+                return {
+                    "signal": "BEAR", "prob": 64,
+                    "poc": round(poc_price, 2), "val": round(val_price, 2), "vah": round(vah_price, 2),
+                    "reason": (f"Price {dist_below:.1f}% below VA bottom ${val_price:.0f}. "
+                               f"Breakdown below HVN — BEAR momentum.")
+                }
+            else:
+                return {
+                    "signal": "NEUTRAL", "prob": 50,
+                    "poc": round(poc_price, 2), "val": round(val_price, 2), "vah": round(vah_price, 2),
+                    "reason": (f"Price ${spot:.0f} far below 60d VA ${val_price:.0f}-${vah_price:.0f}. "
+                               f"POC=${poc_price:.2f}.")
+                }
+        else:
+            return {
+                "signal": "NEUTRAL", "prob": 50,
+                "poc": round(poc_price, 2), "val": round(val_price, 2), "vah": round(vah_price, 2),
+                "reason": (f"No clear VRVP signal. VA ${val_price:.0f}-${vah_price:.0f} "
+                           f"POC=${poc_price:.2f}")
+            }
+    except Exception as e:
+        log.debug(f"_hp_model_vrvp {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_vwap_dev(ticker, conn, spot):
+    try:
+        px = pd.read_sql(
+            "SELECT high, low, close, volume FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 25",
+            conn, params=(ticker.upper(),))
+        if len(px) < 15 or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 15+ days for VWAP"}
+        for col in ['high','low','close','volume']:
+            px[col] = pd.to_numeric(px[col], errors='coerce')
+        px = px.dropna()
+        typical = (px['high'] + px['low'] + px['close']) / 3
+        vwap    = float((typical * px['volume']).sum() / px['volume'].sum())
+        # Rolling σ of (close - vwap)
+        diffs   = px['close'] - vwap
+        sigma   = float(diffs.std())
+        if sigma <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "VWAP sigma = 0"}
+        z = (spot - vwap) / sigma
+        upper2 = vwap + 2 * sigma; lower2 = vwap - 2 * sigma
+        upper1 = vwap + 1 * sigma; lower1 = vwap - 1 * sigma
+
+        if abs(z) >= 2.5:
+            return {"signal": "SELL_PREMIUM", "prob": 76,
+                    "vwap": round(vwap, 2), "z": round(z, 2), "sigma": round(sigma, 2),
+                    "box_lo": round(lower1, 2), "box_hi": round(upper1, 2),
+                    "reason": (f"Price {z:+.1f}σ from 20d VWAP ${vwap:.2f} — extreme stretch. "
+                               f"SELL PREMIUM: IC strikes at ±1σ (${lower1:.0f}-${upper1:.0f})")}
+        elif abs(z) >= 1.8:
+            return {"signal": "SELL_PREMIUM", "prob": 68,
+                    "vwap": round(vwap, 2), "z": round(z, 2), "sigma": round(sigma, 2),
+                    "box_lo": round(lower2, 2), "box_hi": round(upper2, 2),
+                    "reason": (f"Price {z:+.1f}σ from VWAP ${vwap:.2f} — stretched. "
+                               f"SELL premium outside ±2σ band (${lower2:.0f}-${upper2:.0f})")}
+        elif abs(z) <= 0.4:
+            return {"signal": "SELL_PREMIUM", "prob": 64,
+                    "vwap": round(vwap, 2), "z": round(z, 2), "sigma": round(sigma, 2),
+                    "box_lo": round(lower2, 2), "box_hi": round(upper2, 2),
+                    "reason": (f"Price at VWAP equilibrium (z={z:.2f}). "
+                               f"IC sell zone: ${lower2:.0f}-${upper2:.0f} (±2σ)")}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50,
+                    "vwap": round(vwap, 2), "z": round(z, 2), "sigma": round(sigma, 2),
+                    "reason": f"VWAP z={z:.2f} — neutral zone ${lower1:.0f}-${upper1:.0f}"}
+    except Exception as e:
+        log.debug(f"_hp_model_vwap_dev {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_expected_move(ticker, conn, spot):
+    try:
+        from datetime import datetime as _dt2
+        today = _dt2.now().date()
+        ld = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker.upper(),))
+        if ld.empty or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No options data"}
+        latest = ld.iloc[0, 0]
+
+        # ATM straddle price = call + put at nearest-to-spot strike, shortest expiry
+        atm = pd.read_sql(
+            "SELECT strike, expiry_date, lastPrice_Call_now, lastPrice_Put_now"
+            " FROM options_change WHERE ticker=? AND trade_date_now=?"
+            " AND lastPrice_Call_now > 0.2 AND lastPrice_Put_now > 0.2"
+            " AND ABS(strike - ?) / ? < 0.025"
+            " ORDER BY ABS(strike - ?) ASC LIMIT 10",
+            conn, params=(ticker.upper(), latest, spot, spot, spot))
+        if atm.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No ATM options for EM calc"}
+
+        # Prefer shortest DTE
+        best_row = None; best_dte = 9999
+        for _, r in atm.iterrows():
+            try:
+                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                dte = (exp - today).days
+                if 1 <= dte < best_dte:
+                    best_dte = dte; best_row = r
+            except Exception:
+                pass
+        if best_row is None:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No valid expiry for EM"}
+
+        straddle  = float(best_row["lastPrice_Call_now"]) + float(best_row["lastPrice_Put_now"])
+        em_pct    = straddle / spot * 100   # 1σ expected move %
+
+        # Check actual prior day return
+        px2 = pd.read_sql(
+            "SELECT close FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 2",
+            conn, params=(ticker.upper(),))
+        if len(px2) < 2:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 2 price days"}
+        actual_move = abs(float(px2["close"].iloc[0]) / float(px2["close"].iloc[1]) - 1) * 100
+
+        breach_ratio = actual_move / em_pct if em_pct > 0 else 0
+
+        if breach_ratio >= 1.5:
+            return {"signal": "SELL_PREMIUM", "prob": 74,
+                    "em_pct": round(em_pct, 1), "actual_move": round(actual_move, 1),
+                    "straddle": round(straddle, 2), "dte": best_dte,
+                    "reason": (f"Prior move {actual_move:.1f}% = {breach_ratio:.1f}x EM ({em_pct:.1f}%). "
+                               f"Vol likely to compress — SELL straddle ${straddle:.2f} ({best_dte}DTE)")}
+        elif breach_ratio >= 1.0:
+            return {"signal": "SELL_PREMIUM", "prob": 64,
+                    "em_pct": round(em_pct, 1), "actual_move": round(actual_move, 1),
+                    "reason": (f"Move {actual_move:.1f}% at EM boundary ({em_pct:.1f}%). "
+                               f"Mild reversion signal — sell OTM strangle")}
+        elif em_pct >= 3.0:
+            return {"signal": "SELL_PREMIUM", "prob": 60,
+                    "em_pct": round(em_pct, 1), "actual_move": round(actual_move, 1),
+                    "straddle": round(straddle, 2), "dte": best_dte,
+                    "reason": (f"Straddle ${straddle:.2f} implies {em_pct:.1f}% EM ({best_dte}DTE). "
+                               f"High IV environment — sell premium")}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50,
+                    "em_pct": round(em_pct, 1), "actual_move": round(actual_move, 1),
+                    "reason": (f"EM {em_pct:.1f}% / actual {actual_move:.1f}% — no EM breach")}
+    except Exception as e:
+        log.debug(f"_hp_model_expected_move {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_left_skew(ticker, conn, spot):
+    try:
+        from datetime import datetime as _dt2
+        today = _dt2.now().date()
+        ld = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker.upper(),))
+        if ld.empty or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No data"}
+        latest = ld.iloc[0, 0]
+
+        # OTM puts: 5-10% below spot
+        puts = pd.read_sql(
+            "SELECT strike, expiry_date, lastPrice_Put_now FROM options_change"
+            " WHERE ticker=? AND trade_date_now=? AND lastPrice_Put_now > 0.3"
+            " AND (? - strike) / ? BETWEEN 0.04 AND 0.12",
+            conn, params=(ticker.upper(), latest, spot, spot))
+        # OTM calls: 5-10% above spot
+        calls = pd.read_sql(
+            "SELECT strike, expiry_date, lastPrice_Call_now FROM options_change"
+            " WHERE ticker=? AND trade_date_now=? AND lastPrice_Call_now > 0.3"
+            " AND (strike - ?) / ? BETWEEN 0.04 AND 0.12",
+            conn, params=(ticker.upper(), latest, spot, spot))
+        if puts.empty or calls.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Insufficient OTM options"}
+
+        p_ivs = []; c_ivs = []
+        for _, r in puts.iterrows():
+            try:
+                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                T   = max((exp - today).days / 365.0, 1/365.0)
+                K   = float(r["strike"]); P = float(r["lastPrice_Put_now"])
+                # Put IV via call-put parity: P = C + K*e^(-rT) - S
+                c_equiv = P - K * _math.exp(-0.05 * T) + spot
+                if c_equiv > 0:
+                    iv = _implied_vol_hp(max(c_equiv, 0.01), spot, K, T)
+                    if 0.05 < iv < 4.0: p_ivs.append(iv * 100)
+            except Exception: pass
+        for _, r in calls.iterrows():
+            try:
+                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                T   = max((exp - today).days / 365.0, 1/365.0)
+                iv  = _implied_vol_hp(float(r["lastPrice_Call_now"]), spot, float(r["strike"]), T)
+                if 0.05 < iv < 4.0: c_ivs.append(iv * 100)
+            except Exception: pass
+
+        if not p_ivs or not c_ivs:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "IV calc failed for skew"}
+
+        avg_put_iv  = float(np.mean(p_ivs))
+        avg_call_iv = float(np.mean(c_ivs))
+        skew_ratio  = avg_put_iv / avg_call_iv if avg_call_iv > 0 else 1.0
+
+        if skew_ratio >= 1.8:
+            return {"signal": "BULL", "prob": 71, "skew": round(skew_ratio, 2),
+                    "put_iv": round(avg_put_iv, 1), "call_iv": round(avg_call_iv, 1),
+                    "reason": (f"Left skew {skew_ratio:.2f} (put IV {avg_put_iv:.0f}% / "
+                               f"call IV {avg_call_iv:.0f}%) — extreme fear = contrarian BULL (Xing 2010)")}
+        elif skew_ratio >= 1.4:
+            return {"signal": "BULL", "prob": 61, "skew": round(skew_ratio, 2),
+                    "put_iv": round(avg_put_iv, 1), "call_iv": round(avg_call_iv, 1),
+                    "reason": f"Elevated put skew {skew_ratio:.2f} — mild contrarian BULL signal"}
+        elif skew_ratio <= 0.8:
+            return {"signal": "BEAR", "prob": 62, "skew": round(skew_ratio, 2),
+                    "put_iv": round(avg_put_iv, 1), "call_iv": round(avg_call_iv, 1),
+                    "reason": (f"Reverse skew {skew_ratio:.2f} (call IV > put IV) — "
+                               f"complacency / gamma squeeze risk = BEAR")}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "skew": round(skew_ratio, 2),
+                    "reason": f"Normal skew {skew_ratio:.2f} (put {avg_put_iv:.0f}%/call {avg_call_iv:.0f}%)"}
+    except Exception as e:
+        log.debug(f"_hp_model_left_skew {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_vrp(ticker, conn, spot):
+    try:
+        from datetime import datetime as _dt2
+        today = _dt2.now().date()
+
+        # Realized vol: 10-day HV
+        px = pd.read_sql(
+            "SELECT close FROM stock_daily WHERE ticker=?"
+            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 15",
+            conn, params=(ticker.upper(),))
+        if len(px) < 11 or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 11+ days for VRP"}
+        rets = px["close"].pct_change().dropna()
+        rv10 = float(rets.std() * _math.sqrt(252) * 100)
+
+        # IV from nearest ATM straddle
+        ld = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker.upper(),))
+        if ld.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No options data"}
+        latest = ld.iloc[0, 0]
+
+        atm = pd.read_sql(
+            "SELECT strike, expiry_date, lastPrice_Call_now, lastPrice_Put_now"
+            " FROM options_change WHERE ticker=? AND trade_date_now=?"
+            " AND lastPrice_Call_now > 0.3 AND lastPrice_Put_now > 0.3"
+            " AND ABS(strike - ?) / ? < 0.025"
+            " ORDER BY ABS(strike - ?) ASC LIMIT 6",
+            conn, params=(ticker.upper(), latest, spot, spot, spot))
+        if atm.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No ATM data for VRP"}
+
+        ivs = []
+        for _, r in atm.iterrows():
+            try:
+                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                T   = max((exp - today).days / 365.0, 1/365.0)
+                iv  = _implied_vol_hp(float(r["lastPrice_Call_now"]), spot, float(r["strike"]), T)
+                if 0.05 < iv < 3.0: ivs.append(iv * 100)
+            except Exception: pass
+        if not ivs:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "IV calc failed"}
+
+        iv30  = float(np.median(ivs))
+        vrp   = iv30 - rv10  # positive = sellers' edge
+
+        if vrp >= 8:
+            return {"signal": "SELL_PREMIUM", "prob": 77, "vrp": round(vrp, 1),
+                    "iv": round(iv30, 1), "rv": round(rv10, 1),
+                    "reason": (f"VRP +{vrp:.0f}pp (IV {iv30:.0f}% vs RV {rv10:.0f}%) — "
+                               f"fat sellers' edge. SELL PREMIUM (Carr & Wu 2009)")}
+        elif vrp >= 4:
+            return {"signal": "SELL_PREMIUM", "prob": 66, "vrp": round(vrp, 1),
+                    "iv": round(iv30, 1), "rv": round(rv10, 1),
+                    "reason": f"VRP +{vrp:.0f}pp → moderate premium-selling edge"}
+        elif vrp <= -5:
+            return {"signal": "BULL", "prob": 63, "vrp": round(vrp, 1),
+                    "iv": round(iv30, 1), "rv": round(rv10, 1),
+                    "reason": (f"Negative VRP {vrp:.0f}pp (RV {rv10:.0f}% >> IV {iv30:.0f}%) — "
+                               f"options cheap relative to realized vol, buy gamma")}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50, "vrp": round(vrp, 1),
+                    "reason": f"VRP {vrp:+.0f}pp (IV {iv30:.0f}% / RV {rv10:.0f}%) — normal"}
+    except Exception as e:
+        log.debug(f"_hp_model_vrp {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def _hp_model_put_call_wall(ticker, conn, spot):
+    try:
+        ld = pd.read_sql(
+            "SELECT trade_date_now FROM options_change WHERE ticker=?"
+            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(ticker.upper(),))
+        if ld.empty or spot <= 0:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No data"}
+        latest = ld.iloc[0, 0]
+
+        df = pd.read_sql(
+            "SELECT strike, SUM(openInt_Call_now) AS co, SUM(openInt_Put_now) AS po"
+            " FROM options_change WHERE ticker=? AND trade_date_now=?"
+            " GROUP BY strike ORDER BY strike",
+            conn, params=(ticker.upper(), latest))
+        if df.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "No OI data"}
+
+        df['co'] = pd.to_numeric(df['co'], errors='coerce').fillna(0)
+        df['po'] = pd.to_numeric(df['po'], errors='coerce').fillna(0)
+        mean_co = float(df['co'].mean()); mean_po = float(df['po'].mean())
+
+        # Call wall: max call OI above spot
+        above = df[df['strike'] > spot]
+        below = df[df['strike'] < spot]
+        if above.empty or below.empty:
+            return {"signal": "NEUTRAL", "prob": 50, "reason": "Not enough strikes above/below"}
+
+        call_wall_idx = above['co'].idxmax()
+        put_wall_idx  = below['po'].idxmax()
+        call_wall = float(df.loc[call_wall_idx, 'strike'])
+        put_wall  = float(df.loc[put_wall_idx,  'strike'])
+        call_oi   = float(df.loc[call_wall_idx, 'co'])
+        put_oi    = float(df.loc[put_wall_idx,  'po'])
+
+        dist_cw = (call_wall - spot) / spot * 100
+        dist_pw = (spot - put_wall)  / spot * 100
+
+        cw_strength = call_oi / mean_co if mean_co > 0 else 1
+        pw_strength = put_oi  / mean_po if mean_po > 0 else 1
+
+        # Near put wall + strong OI = support → sell put credit spread
+        if dist_pw <= 1.5 and pw_strength >= 2.5:
+            return {"signal": "SELL_PREMIUM", "prob": 74,
+                    "put_wall": round(put_wall, 2), "call_wall": round(call_wall, 2),
+                    "pw_str": round(pw_strength, 1), "cw_str": round(cw_strength, 1),
+                    "reason": (f"Put Wall at ${put_wall:.0f} ({pw_strength:.1f}x avg, {dist_pw:.1f}% away). "
+                               f"SELL PUT CREDIT SPREAD: short ${put_wall:.0f}P / long ${put_wall*0.97:.0f}P")}
+        # Near call wall = resistance → sell call credit spread
+        elif dist_cw <= 1.5 and cw_strength >= 2.5:
+            return {"signal": "SELL_PREMIUM", "prob": 72,
+                    "put_wall": round(put_wall, 2), "call_wall": round(call_wall, 2),
+                    "pw_str": round(pw_strength, 1), "cw_str": round(cw_strength, 1),
+                    "reason": (f"Call Wall at ${call_wall:.0f} ({cw_strength:.1f}x avg, {dist_cw:.1f}% away). "
+                               f"SELL CALL SPREAD: short ${call_wall:.0f}C / long ${call_wall*1.03:.0f}C")}
+        # Price well inside walls = IC zone
+        elif dist_pw >= 2 and dist_cw >= 2 and pw_strength >= 2.0 and cw_strength >= 2.0:
+            return {"signal": "SELL_PREMIUM", "prob": 66,
+                    "put_wall": round(put_wall, 2), "call_wall": round(call_wall, 2),
+                    "pw_str": round(pw_strength, 1), "cw_str": round(cw_strength, 1),
+                    "reason": (f"Walls: Put ${put_wall:.0f} ({dist_pw:.1f}% below) / "
+                               f"Call ${call_wall:.0f} ({dist_cw:.1f}% above). "
+                               f"SELL IC: P/C walls as outer strikes")}
+        else:
+            return {"signal": "NEUTRAL", "prob": 50,
+                    "put_wall": round(put_wall, 2), "call_wall": round(call_wall, 2),
+                    "reason": (f"Walls thin: Put ${put_wall:.0f} ({pw_strength:.1f}x) / "
+                               f"Call ${call_wall:.0f} ({cw_strength:.1f}x) — no strong wall signal")}
+    except Exception as e:
+        log.debug(f"_hp_model_put_call_wall {ticker}: {e}")
+        return {"signal": "NEUTRAL", "prob": 50, "reason": str(e)[:60]}
+
+
+def high_prob_signals_engine(ticker, conn, spy_ret=0.0):
+    """
+    Run all 23 models (incl. VRVP, VWAP, VRP, Put/Call Wall, Left Skew, EM),
+    apply adaptive weights, return calibrated ensemble signal.
+    Votes: ≥6/23 agree → MEDIUM CONF; ≥9/23 → HIGH CONF.
+    """
+    _setup_hp_tables(conn)
+    _update_hp_outcomes(ticker, conn)
+    weights = _get_hp_weights(ticker, conn)
+
+    spot_df = pd.read_sql(
+        "SELECT close FROM stock_daily WHERE ticker=?"
+        " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+        conn, params=(ticker.upper(),))
+    spot = float(spot_df["close"].iloc[0]) if not spot_df.empty else 0.0
+
+    models = {
+        # Original 6 models
+        "gex":          _hp_model_gex(ticker, conn, spot),
+        "pcr_z":        _hp_model_pcr_z(ticker, conn),
+        "oi_momentum":  _hp_model_oi_momentum(ticker, conn, spot),
+        "gamma_pin":    _hp_model_gamma_pin(ticker, conn, spot),
+        "vol_flow":     _hp_model_vol_flow(ticker, conn),
+        "iv_skew":      _hp_model_iv_skew(ticker, conn, spot),
+        # Research models 7-16
+        "rv_iv":        _hp_model_rv_iv(ticker, conn, spot),
+        "oi_term_struct": _hp_model_oi_term_structure(ticker, conn),
+        "maxpain_vel":  _hp_model_maxpain_velocity(ticker, conn, spot),
+        "iv_rank":      _hp_model_iv_rank(ticker, conn, spot),
+        "pcp_dev":      _hp_model_pcp_deviation(ticker, conn, spot),
+        "vol_regime":   _hp_model_vol_regime(ticker, conn),
+        "multi_expiry": _hp_model_multi_expiry_oi(ticker, conn),
+        "smart_uoa":    _hp_model_smart_money_uoa(ticker, conn),
+        "hhi_pin":      _hp_model_hhi_pin(ticker, conn, spot),
+        "pcr_vel":      _hp_model_pcr_velocity(ticker, conn),
+        # Volume Profile + high-prob add-ons 17-22
+        "vrvp":         _hp_model_vrvp(ticker, conn, spot),
+        "vwap_dev":     _hp_model_vwap_dev(ticker, conn, spot),
+        "expected_move": _hp_model_expected_move(ticker, conn, spot),
+        "left_skew":    _hp_model_left_skew(ticker, conn, spot),
+        "vrp":          _hp_model_vrp(ticker, conn, spot),
+        "put_call_wall": _hp_model_put_call_wall(ticker, conn, spot),
+        # Model 23: short-squeeze / short-covering (Ortex/S3 method)
+        "short_squeeze": _hp_model_short_squeeze(ticker, conn, spot),
+    }
+
+    bull_w = bear_w = 0.0
+    for name, res in models.items():
+        w    = weights.get(name, 1.0)
+        s    = res.get("signal", "NEUTRAL")
+        p    = res.get("prob", 50)
+        edge = (p - 50) / 50.0
+        if s == "BULL":
+            bull_w += w * edge
+        elif s == "BEAR":
+            bear_w += w * abs(edge)
+
+    bull_v  = sum(1 for r in models.values() if r.get("signal") == "BULL")
+    bear_v  = sum(1 for r in models.values() if r.get("signal") == "BEAR")
+    sell_v  = sum(1 for r in models.values() if r.get("signal") == "SELL_PREMIUM")
+    neut_v  = sum(1 for r in models.values() if r.get("signal") == "NEUTRAL")
+    total   = len(models)
+    mkt     = 2 if spy_ret > 0.5 else (-2 if spy_ret < -0.5 else 0)
+
+    # Scaled thresholds for 23 models
+    if bull_v >= 9 and bull_w > bear_w * 1.2:
+        ens_sig = "BULL";  ens_prob = min(91, 58 + bull_w * 7 + mkt); conf = "HIGH"
+    elif bull_v >= 6 and bull_w > bear_w * 1.1:
+        ens_sig = "BULL";  ens_prob = min(83, 54 + bull_w * 5 + mkt); conf = "MEDIUM"
+    elif bear_v >= 9 and bear_w > bull_w * 1.2:
+        ens_sig = "BEAR";  ens_prob = min(91, 58 + bear_w * 7 - mkt); conf = "HIGH"
+    elif bear_v >= 6 and bear_w > bull_w * 1.1:
+        ens_sig = "BEAR";  ens_prob = min(83, 54 + bear_w * 5 - mkt); conf = "MEDIUM"
+    elif bull_v >= 4 and bull_w > bear_w:
+        ens_sig = "BULL";  ens_prob = min(70, 52 + bull_w * 4);        conf = "LOW"
+    elif bear_v >= 4 and bear_w > bull_w:
+        ens_sig = "BEAR";  ens_prob = min(70, 52 + bear_w * 4);        conf = "LOW"
+    else:
+        ens_sig = "NEUTRAL"; ens_prob = 50.0; conf = "LOW"
+
+    # ── Premium-selling overlays (now with VRVP, VWAP, VRP, Walls) ──
+    gp       = models["gamma_pin"]
+    iv_m     = models["iv_skew"]
+    rv_m     = models["rv_iv"]
+    ivr_m    = models["iv_rank"]
+    hhi_m    = models["hhi_pin"]
+    vrvp_m   = models["vrvp"]
+    vwap_m   = models["vwap_dev"]
+    vrp_m    = models["vrp"]
+    wall_m   = models["put_call_wall"]
+    em_m     = models["expected_move"]
+
+    pin_ok     = (gp.get("signal") == "NEUTRAL" and gp.get("dte", 99) <= 7 and gp.get("prob", 0) >= 78)
+    high_iv    = (iv_m.get("atm_iv", 0) >= 35 or ivr_m.get("iv_rank", 0) >= 80
+                  or rv_m.get("spread", 0) >= 8)
+    strong_pin = hhi_m.get("prob", 0) >= 76
+    vrvp_sell  = vrvp_m.get("signal") == "SELL_PREMIUM"
+    vwap_sell  = vwap_m.get("signal") == "SELL_PREMIUM"
+    vrp_sell   = vrp_m.get("signal")  == "SELL_PREMIUM"
+    wall_sell  = wall_m.get("signal") == "SELL_PREMIUM"
+    em_sell    = em_m.get("signal")   == "SELL_PREMIUM"
+
+    # Count convergent premium signals
+    sell_signals = sum([pin_ok, strong_pin, high_iv, vrvp_sell, vwap_sell, vrp_sell, wall_sell, em_sell])
+
+    if ens_sig in ("BULL", "BEAR") and conf in ("HIGH", "MEDIUM"):
+        side     = "calls / bull spread" if ens_sig == "BULL" else "puts / bear spread"
+        strategy = f"BUY {side} — {conf} conf | Prob {ens_prob:.0f}%"
+    elif sell_signals >= 3:
+        # Build specific box from VRVP if available, fallback to VWAP/walls
+        if vrvp_sell and vrvp_m.get("box_lo"):
+            box_lo = vrvp_m["box_lo"]; box_hi = vrvp_m["box_hi"]
+            box_src = f"VRVP box ${box_lo:.0f}-${box_hi:.0f}"
+        elif vwap_sell and vwap_m.get("box_lo"):
+            box_lo = vwap_m["box_lo"]; box_hi = vwap_m["box_hi"]
+            box_src = f"VWAP ±1σ ${box_lo:.0f}-${box_hi:.0f}"
+        elif wall_sell:
+            box_lo = wall_m.get("put_wall", spot * 0.96)
+            box_hi = wall_m.get("call_wall", spot * 1.04)
+            box_src = f"Walls ${box_lo:.0f}-${box_hi:.0f}"
+        else:
+            box_lo = spot * 0.96; box_hi = spot * 1.04
+            box_src = f"±4% ${box_lo:.0f}-${box_hi:.0f}"
+        vrp_str = f" VRP+{vrp_m.get('vrp', 0):.0f}pp" if vrp_sell else ""
+        strategy = (f"SELL PREMIUM — {sell_signals}/8 signals align. "
+                    f"{box_src}{vrp_str}. IC/Straddle near spot.")
+        ens_sig = "SELL_PREMIUM"
+        ens_prob = min(84, 60 + sell_signals * 3)
+    elif sell_signals >= 1:
+        best_sell = max(
+            [(vrvp_m, "VRVP"), (vwap_m, "VWAP"), (vrp_m, "VRP"), (wall_m, "Walls"), (em_m, "EM")],
+            key=lambda x: x[0].get("prob", 0) if x[0].get("signal") == "SELL_PREMIUM" else 0)
+        src_m, src_n = best_sell
+        strategy = (f"SELL PREMIUM ({src_n}) — {src_m.get('reason','')[:55]}…"
+                    if src_m.get("signal") == "SELL_PREMIUM"
+                    else "WAIT — weak sell signal, need ≥3 to confirm")
+        ens_sig = "SELL_PREMIUM"
+    else:
+        strategy = "WAIT — no high-conf edge. Consider IC if IV ≥30."
+
+    below80 = ens_prob < 80
+    warn    = "⚠️ Prob <80% — reduce size or wait." if below80 else ""
+
+    try:
+        tod = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%m-%d-%Y")
+        for name, res in models.items():
+            conn.execute(
+                "INSERT OR REPLACE INTO signal_accuracy (ticker, trade_date, model_name, signal, prob)"
+                " VALUES (?,?,?,?,?)",
+                (ticker.upper(), tod, name, res.get("signal", "NEUTRAL"), res.get("prob", 50)))
+        conn.commit()
+    except Exception:
+        pass
+
+    return {
+        "ticker": ticker.upper(), "spot": round(spot, 2),
+        "signal": ens_sig, "prob": round(ens_prob, 1), "conf": conf,
+        "bull_v": bull_v, "bear_v": bear_v, "neut_v": neut_v,
+        "sell_v": sell_v, "total_m": total,
+        "strategy": strategy, "warn": warn, "below80": below80,
+        "models": models, "weights": weights,
+        # VRVP box for display
+        "vrvp_box": {
+            "lo": vrvp_m.get("box_lo"), "hi": vrvp_m.get("box_hi"),
+            "poc": vrvp_m.get("poc"), "val": vrvp_m.get("val"), "vah": vrvp_m.get("vah"),
+        } if vrvp_sell or vrvp_m.get("poc") else {},
+    }
+
+
+async def high_prob_detail(query, ticker):
+    """Telegram handler — 23-model High-Probability Signal Engine."""
+    tk  = str(ticker).upper()
+    _ld = await query.message.reply_text(f"⚙️ Running 23-model engine for {tk}…", parse_mode=H)
+    conn = get_conn()
+    try:
+        try:
+            spy_px = pd.read_sql(
+                "SELECT close FROM stock_daily WHERE ticker='SPY'"
+                " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 2",
+                conn)
+            spy_ret = (float(spy_px["close"].iloc[0]) / float(spy_px["close"].iloc[1]) - 1) * 100 \
+                      if len(spy_px) >= 2 else 0.0
+        except Exception:
+            spy_ret = 0.0
+
+        res = high_prob_signals_engine(tk, conn, spy_ret)
+        bt  = _hp_walk_forward_backtest(tk, conn)
+    except Exception as exc:
+        log.warning(f"high_prob_detail {tk}: {exc}")
+        try: await _ld.delete()
+        except Exception: pass
+        await query.message.reply_text(f"❌ Error: {exc}", reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
+        return
+    conn.close()
+
+    sig  = res["signal"]
+    prob = res["prob"]
+    conf = res["conf"]
+    total_m = res.get("total_m", 22)
+    s_em = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪", "SELL_PREMIUM": "💰"}.get(sig, "⚪")
+    c_em = {"HIGH": "🔥", "MEDIUM": "✅", "LOW": "⚠️"}.get(conf, "⚠️")
+
+    _ML = {
+        "gex":           "GEX",        "pcr_z":        "PCR-Z",
+        "oi_momentum":   "OI-Mom",     "gamma_pin":    "GammaPin",
+        "vol_flow":      "VolFlow",    "iv_skew":      "IV-Skew",
+        "rv_iv":         "RV/IV",      "oi_term_struct":"OI-TS",
+        "maxpain_vel":   "MPVel",      "iv_rank":      "IV-Rank",
+        "pcp_dev":       "PCP-Dev",    "vol_regime":   "VolReg",
+        "multi_expiry":  "MultiExp",   "smart_uoa":    "SmartUOA",
+        "hhi_pin":       "HHI-Pin",    "pcr_vel":      "PCR-Vel",
+        "vrvp":          "VRVP",       "vwap_dev":     "VWAP-Dev",
+        "expected_move": "ExpMove",    "left_skew":    "LeftSkew",
+        "vrp":           "VRP",        "put_call_wall": "P/C-Wall",
+        "short_squeeze": "ShortSqz",
+    }
+    _ME = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪", "SELL_PREMIUM": "💰"}
+
+    lines = [
+        hdr(f"🎯 HIGH-PROB ENGINE · {tk}"),
+        "",
+        f"{s_em} <b>{sig}</b>  {c_em} <b>{conf} CONF</b>  Prob: <b>{prob:.0f}%</b>",
+        (f"Votes 🟢{res['bull_v']} 🔴{res['bear_v']} "
+         f"💰{res.get('sell_v',0)} ⚪{res['neut_v']} /{total_m}"),
+        "",
+        f"<b>Strategy:</b> {res['strategy']}",
+    ]
+    if res["warn"]:
+        lines.append(f"<i>{res['warn']}</i>")
+
+    # VRVP Premium Box (if applicable)
+    vbox = res.get("vrvp_box", {})
+    if vbox.get("lo") and vbox.get("hi"):
+        lines += [
+            "",
+            "<b>📦 VRVP Premium Collection Box:</b>",
+            mono(
+                f"POC  ${vbox.get('poc', 0):>7.2f}  (max volume)\n"
+                f"VAH  ${vbox.get('vah', 0):>7.2f}  (sell call above)\n"
+                f"VAL  ${vbox.get('val', 0):>7.2f}  (sell put below)\n"
+                f"Box  ${vbox['lo']:>7.2f} - ${vbox['hi']:<7.2f}\n"
+                f"Spot ${tk:>4} @ ${res['spot']:<8.2f}"
+            ),
+            "<i>Sell IC/Strangle: put at VAL, call at VAH when price enters box.</i>",
+        ]
+
+    # Wall levels
+    wall = res["models"].get("put_call_wall", {})
+    if wall.get("put_wall") and wall.get("call_wall"):
+        lines += [
+            "",
+            "<b>🧱 OI Walls:</b>",
+            mono(
+                f"Put Wall  ${wall['put_wall']:>7.2f} ({wall.get('pw_str',1):.1f}x)\n"
+                f"Spot      ${res['spot']:>7.2f}\n"
+                f"Call Wall ${wall['call_wall']:>7.2f} ({wall.get('cw_str',1):.1f}x)"
+            ),
+        ]
+
+    lines.append("")
+
+    # Split model table into 3 rows of ~7-8 for mobile
+    all_models = list(_ML.items())
+    chunk_labels = ["Models 1-8:", "Models 9-16:", "Models 17-23:"]
+    chunks = [all_models[:8], all_models[8:16], all_models[16:]]
+    for lbl, chunk in zip(chunk_labels, chunks):
+        if not chunk: continue
+        lines.append(f"<b>{lbl}</b>")
+        tbl = []
+        for nm, short in chunk:
+            r  = res["models"].get(nm, {})
+            ms = r.get("signal", "NEUTRAL")
+            mp = r.get("prob", 50)
+            mw = res["weights"].get(nm, 1.0)
+            tbl.append(f"{short[:8]:<8} {_ME.get(ms,'⚪')}{ms[:4]:<4} {mp:>3}% {mw:.1f}")
+        lines.append(mono("\n".join(tbl)))
+        lines.append("")
+
+    # Top signals across all 23 models (sorted by prob, exclude NEUTRAL<55)
+    ranked = sorted(
+        [(nm, r) for nm, r in res["models"].items() if r.get("prob", 50) >= 60],
+        key=lambda x: x[1].get("prob", 50), reverse=True)
+    if ranked:
+        lines.append("<b>Top Signals (prob>=60%):</b>")
+        for nm, r in ranked[:5]:
+            ms  = r.get("signal", "?"); mp = r.get("prob", 50)
+            rsn = r.get("reason", "")[:80]
+            lines.append(f"{_ME.get(ms,'⚪')} <b>{_ML.get(nm, nm)}</b> {mp}%")
+            lines.append(f"  <i>{rsn}</i>")
+    lines.append("")
+
+    meta  = bt.get("meta", {})
+    n_ext = meta.get("n_extreme", 0)
+    n_cln = meta.get("n_clean", 0)
+    bt_rows = [(nm, v) for nm, v in bt.items() if nm != "meta" and isinstance(v, dict) and "acc" in v]
+    if bt_rows:
+        lines.append("<b>Walk-Forward Backtest:</b>")
+        btl = []
+        for nm, v in bt_rows:
+            bar = "█" * min(int(v["acc"] / 10), 10)
+            btl.append(f"{nm:<10} {v['acc']:>5.1f}%  n={v['n']}  {bar}")
+        lines.append(mono("\n".join(btl)))
+        lines.append(f"<i>Removed {n_ext} extreme days · {n_cln} clean</i>")
+    else:
+        lines.append("<i>Backtest: need ≥15 clean days</i>")
+
+    lines += [
+        "",
+        "<i>🧠 23-model ensemble · weights auto-calibrate daily.</i>",
+        f"<i>SPY {spy_ret:+.2f}% · VRVP·VWAP·VRP·Walls·LeftSkew·VRP added.</i>",
+        "<i>Sources: Bali·Cremers·Ni·Amin·Sinclair·Xing·Carr·SpotGamma·Dalton</i>",
+    ]
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data=f"high_prob_{tk}"),
+         InlineKeyboardButton("📉 Mean Rev",  callback_data=f"mean_rev_{tk}")],
+        [InlineKeyboardButton("🏦 Inst Sig",  callback_data=f"inst_sig_{tk}"),
+         InlineKeyboardButton("📊 OI Menu",   callback_data="menu_oi")],
+        [BACK_BTN],
+    ])
+    try: await _ld.delete()
+    except Exception: pass
+    await _safe_reply(query.message, "\n".join(lines), reply_markup=kb)
+
+
+def _hp_model_short_squeeze(ticker, conn, spot):
+    """Model 23 - short-squeeze / short-covering. BULL when shorts are trapped
+    (high short interest + days-to-cover) and covering/igniting. Free data
+    (yfinance short interest + price/volume + options OI). See short_squeeze_signal."""
+    try:
+        sq = short_squeeze_signal(ticker, conn)
+    except Exception:
+        return {"signal": "NEUTRAL", "prob": 50, "reason": "short-squeeze: data n/a"}
+    sc = int(sq.get("score", 0) or 0)
+    stage = sq.get("stage", ""); lbl = sq.get("label", "")
+    if sc >= 4:
+        return {"signal": "BULL", "prob": min(88, 58 + sc * 7),
+                "reason": f"Short-squeeze {sc}/5 [{stage}] - {lbl}"}
+    if sc == 3:
+        return {"signal": "BULL", "prob": 68,
+                "reason": f"Short-squeeze building {sc}/5 [{stage}]"}
+    if sc == 2:
+        return {"signal": "NEUTRAL", "prob": 55,
+                "reason": f"Squeeze fuel present {sc}/5 - no trigger yet"}
+    return {"signal": "NEUTRAL", "prob": 50, "reason": f"No squeeze ({sc}/5)"}
+
+
+
 # ═══════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════
@@ -12646,6 +15024,7 @@ def main():
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_start))
+    app.add_handler(CommandHandler("squeeze", squeeze_command))
 
     # Button callbacks
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -23674,6 +26053,222 @@ def _classify_stock_move(ticker: str, net_call_chg: float, net_put_chg: float) -
         return {}
 
 
+# ═══════════════════════════════════════════════════════════════════
+# ── SHORT-SQUEEZE / SHORT-COVERING DETECTOR  (free data: yfinance + OI)
+# ═══════════════════════════════════════════════════════════════════
+# Theory (US single-name equities — NOT the futures OI matrix):
+#   1. FUEL    — short interest % float + days-to-cover (Ortex/S3 method)
+#   2. TRIGGER — price breakout on a volume spike (>1.5x avg)
+#   3. CONFIRM — call writers buying back (call OI falling on an up-day)
+# Scored 0–5; >=3 = active signal. CTB/Utilization need a paid feed
+# (Ortex/Fintel) and are intentionally omitted from the free version.
+
+def short_squeeze_signal(ticker, conn=None):
+    """US short-squeeze / short-covering detector. Returns a scored dict.
+
+    Score components (each +1, max 5):
+      • short % of float >= 15%        (squeeze fuel)
+      • days-to-cover (shortRatio) >= 5 (shorts hard to exit)
+      • short interest falling MoM      (shorts already covering)
+      • price >= +2% on volume >= 1.5x  (squeeze firing)
+      • call OI falling on an up-day     (call writers buying back)
+    A short squeeze is BULLISH for the stock. Returns {} only on hard failure.
+    """
+    tk = str(ticker).upper().strip()
+    out = {"ticker": tk, "score": 0, "max": 5, "reasons": [],
+           "stage": "NONE", "label": "No squeeze", "emoji": "⚪",
+           "short_pct": None, "dtc": None, "si_chg_pct": None,
+           "price_chg": None, "vol_ratio": None,
+           "call_oi_chg": None, "put_oi_chg": None}
+    score = 0
+
+    # ---- 1+2+3. Short-interest fuel (yfinance .info) ----
+    short_pct = dtc = si_now = si_prev = None
+    try:
+        info = yf.Ticker(tk).info or {}
+        short_pct = info.get("shortPercentOfFloat")   # fraction, e.g. 0.18
+        dtc       = info.get("shortRatio")             # days to cover
+        si_now    = info.get("sharesShort")
+        si_prev   = info.get("sharesShortPriorMonth")
+    except Exception:
+        pass
+
+    spct = (short_pct or 0) * 100.0
+    if spct >= 25:
+        score += 1; out["reasons"].append(f"🔴 Short {spct:.0f}% of float — EXTREME squeeze fuel")
+    elif spct >= 15:
+        score += 1; out["reasons"].append(f"🟠 Short {spct:.0f}% of float — high squeeze fuel")
+    elif spct > 0:
+        out["reasons"].append(f"Short {spct:.0f}% of float — low fuel")
+
+    if dtc and dtc >= 5:
+        score += 1; out["reasons"].append(f"⏳ Days-to-cover {dtc:.1f} — shorts hard to exit")
+    elif dtc:
+        out["reasons"].append(f"Days-to-cover {dtc:.1f} — easy exit")
+
+    si_chg_pct = None
+    if si_now and si_prev and si_prev > 0:
+        si_chg_pct = (si_now - si_prev) / si_prev * 100.0
+        if si_now < si_prev:
+            score += 1; out["reasons"].append(f"📉 Short interest {si_chg_pct:+.0f}% MoM — shorts covering")
+        else:
+            out["reasons"].append(f"📈 Short interest {si_chg_pct:+.0f}% MoM — shorts still building")
+
+    # ---- 4. Trigger: price + volume ----
+    price_chg = vol_ratio = None
+    try:
+        h = yf.Ticker(tk).history(period="40d")
+        if len(h) >= 5:
+            price_now  = float(h["Close"].iloc[-1])
+            price_prev = float(h["Close"].iloc[-2])
+            price_chg  = (price_now - price_prev) / price_prev * 100.0 if price_prev else 0.0
+            tvol = float(h["Volume"].iloc[-1])
+            avol = float(h["Volume"].iloc[-21:-1].mean()) if len(h) >= 21 else float(h["Volume"].mean())
+            vol_ratio = tvol / avol if avol > 0 else 1.0
+    except Exception:
+        pass
+
+    trigger = (price_chg is not None and vol_ratio is not None
+               and price_chg >= 2.0 and vol_ratio >= 1.5)
+    if trigger:
+        score += 1
+        out["reasons"].append(f"🚀 +{price_chg:.1f}% on {vol_ratio:.1f}x volume — squeeze firing")
+    elif price_chg is not None and vol_ratio is not None:
+        out["reasons"].append(f"Px {price_chg:+.1f}% on {vol_ratio:.1f}x vol — no ignition yet")
+
+    # ---- 5. Confirmation: call writers covering (options OI) ----
+    call_oi_chg = put_oi_chg = None
+    own = conn is None
+    if own:
+        try: conn = get_conn()
+        except Exception: conn = None
+    if conn is not None:
+        try:
+            row = pd.read_sql(
+                "SELECT SUM(change_OI_Call) c, SUM(change_OI_Put) p FROM options_change "
+                "WHERE ticker=? AND trade_date_now=("
+                "  SELECT trade_date_now FROM options_change WHERE ticker=? "
+                "  ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1)",
+                conn, params=(tk, tk))
+            if not row.empty:
+                _c = row["c"].iloc[0]; _p = row["p"].iloc[0]
+                call_oi_chg = _safe_float(_c, None) if _c is not None else None
+                put_oi_chg  = _safe_float(_p, None) if _p is not None else None
+        except Exception:
+            pass
+    if own and conn is not None:
+        try: conn.close()
+        except Exception: pass
+
+    if call_oi_chg is not None and call_oi_chg < 0 and (price_chg or 0) > 0:
+        score += 1
+        out["reasons"].append(f"🔄 Call OI {call_oi_chg:+,.0f} on up-day — call writers buying back")
+    elif call_oi_chg is not None:
+        out["reasons"].append(f"Call OI {call_oi_chg:+,.0f} — no writer covering")
+
+    # ---- Finalise ----
+    score = min(score, 5)
+    out["score"]      = score
+    out["short_pct"]  = round(spct, 1) if short_pct is not None else None
+    out["dtc"]        = round(dtc, 1) if dtc else None
+    out["si_chg_pct"] = round(si_chg_pct, 1) if si_chg_pct is not None else None
+    out["price_chg"]  = round(price_chg, 2) if price_chg is not None else None
+    out["vol_ratio"]  = round(vol_ratio, 2) if vol_ratio is not None else None
+    out["call_oi_chg"] = call_oi_chg
+    out["put_oi_chg"]  = put_oi_chg
+
+    fuel = (spct >= 15) or bool(dtc and dtc >= 5)
+    if trigger and fuel:
+        out["stage"] = "FIRING"
+    elif fuel:
+        out["stage"] = "SETUP"
+    else:
+        out["stage"] = "NONE"
+
+    if score >= 4:
+        out["emoji"] = "🔴"; out["label"] = "HIGH squeeze / strong covering"
+    elif score == 3:
+        out["emoji"] = "🟠"; out["label"] = "MODERATE squeeze building"
+    elif score == 2:
+        out["emoji"] = "🟡"; out["label"] = "Low — watch"
+    else:
+        out["emoji"] = "⚪"; out["label"] = "No squeeze"
+    return out
+
+
+def _fmt_squeeze_report(sig) -> str:
+    """Mobile-friendly HTML report for one ticker's squeeze signal."""
+    if not sig:
+        return "❌ No squeeze data available."
+    tk = sig["ticker"]; sc = sig["score"]
+    bars = "█" * sc + "░" * (5 - sc)
+    lines = [f"{sig['emoji']} <b>{tk} SHORT-SQUEEZE</b>",
+             f"Score: <b>{sc}/5</b> [{bars}]",
+             f"Stage: <b>{sig['stage']}</b> — {sig['label']}", ""]
+    t = []
+    if sig.get("short_pct")  is not None: t.append(f"Short%Flt {sig['short_pct']:>5.1f}%")
+    if sig.get("dtc")        is not None: t.append(f"DaysCover {sig['dtc']:>5.1f}")
+    if sig.get("si_chg_pct") is not None: t.append(f"SI MoM    {sig['si_chg_pct']:>+5.0f}%")
+    if sig.get("price_chg")  is not None: t.append(f"Price     {sig['price_chg']:>+5.1f}%")
+    if sig.get("vol_ratio")  is not None: t.append(f"Volume    {sig['vol_ratio']:>5.1f}x")
+    if t:
+        lines.append("<pre>" + "\n".join(t) + "</pre>")
+    lines.append("<b>Why:</b>")
+    lines.extend("• " + r for r in sig["reasons"])
+    lines.append("")
+    if sc >= 3:
+        lines.append("<i>↗ Bullish for the stock. Short-side legs (long puts / short calls) "
+                     "fight a rally — consider trimming/hedging. Longs can run with a stop "
+                     "under the breakout.</i>")
+    else:
+        lines.append("<i>No actionable squeeze. Re-check on a volume-backed up-day.</i>")
+    return "\n".join(lines)
+
+
+async def squeeze_command(update, ctx):
+    """/squeeze [TICKER] — one-ticker report, or scan the watchlist (score >=3)."""
+    args = list(getattr(ctx, "args", []) or [])
+    if args:
+        tk = str(args[0]).upper().strip()
+        loading = await update.message.reply_text(f"⏳ Analyzing {tk} short-squeeze…", parse_mode=H)
+        try:
+            sig = await asyncio.to_thread(short_squeeze_signal, tk)
+        except Exception:
+            sig = short_squeeze_signal(tk)
+        try: await loading.delete()
+        except Exception: pass
+        await update.message.reply_text(_fmt_squeeze_report(sig), parse_mode=H)
+        return
+
+    loading = await update.message.reply_text(
+        "⏳ Scanning watchlist for short squeezes… (~30s)", parse_mode=H)
+    results = []
+    for tk in DEFAULT_TICKERS:
+        try:
+            sig = await asyncio.to_thread(short_squeeze_signal, tk)
+            if sig and sig.get("score", 0) >= 3:
+                results.append(sig)
+        except Exception:
+            continue
+    try: await loading.delete()
+    except Exception: pass
+
+    if not results:
+        await update.message.reply_text(
+            "⚪ No active short-squeeze signals (score ≥3) in the watchlist right now.\n"
+            "<i>Send /squeeze TICKER to check any symbol.</i>", parse_mode=H)
+        return
+    results.sort(key=lambda s: s["score"], reverse=True)
+    rows = ["🔥 <b>SHORT-SQUEEZE SCAN</b>", "Active signals (score ≥3/5):", ""]
+    for s in results:
+        line = f"{s['emoji']} <b>{s['ticker']}</b> {s['score']}/5 — {s['stage']}"
+        if s.get("short_pct") is not None: line += f" | SI {s['short_pct']:.0f}%"
+        if s.get("price_chg") is not None: line += f" | {s['price_chg']:+.1f}%"
+        rows.append(line)
+    rows += ["", "<i>Send /squeeze TICKER for full detail.</i>"]
+    await update.message.reply_text("\n".join(rows), parse_mode=H)
+
+
 _DOWNSTREAM_MAP = {
     "NVDA":  {"up": ["TSM","ASML","AMAT"],       "down": ["SMCI","ANET","AMD","MSFT","AMZN"],
               "theme": "AI capex multiplier — GPU demand drives cloud build-out"},
@@ -28904,6 +31499,7 @@ def main():
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_start))
+    app.add_handler(CommandHandler("squeeze", squeeze_command))
 
     # Button callbacks
     app.add_handler(CallbackQueryHandler(button_handler))
