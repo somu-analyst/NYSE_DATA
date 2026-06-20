@@ -10769,6 +10769,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await mom_view(query)
         elif data == "mom_recompute":
             await mom_recompute_view(query)
+        elif data == "mom_help":
+            await mom_help_view(query)
         elif data == "regime_view":
             await regime_view(query)
         elif data == "vanna_view":
@@ -20327,8 +20329,35 @@ def _fmt_momentum_leaderboard(conn, n=8, highlight=None):
 
 def _kb_momentum():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Recompute (today)", callback_data="mom_recompute")],
+        [InlineKeyboardButton("🔄 Recompute (today)", callback_data="mom_recompute"),
+         InlineKeyboardButton("ℹ️ How to read", callback_data="mom_help")],
         [InlineKeyboardButton("⬅️ Hub", callback_data="hub_menu")]])
+
+_MOM_HELP = (
+    "🚀 <b>MOMENTUM 12-1 — HOW TO READ IT</b>\n\n"
+    "<b>What it is:</b> ranks every name in your DB by trend strength, so you see "
+    "leaders to ride and laggards to avoid.\n\n"
+    "<b>Columns</b>\n"
+    "• <b>rk</b> — rank of all names (#1 = strongest trend)\n"
+    "• <b>tkr</b> — ticker (<b>*</b> = you hold it)\n"
+    "• <b>12-1</b> — 12-month return, <i>skipping the last month</i>. The trend that "
+    "tends to persist — the core score.\n"
+    "• <b>1m</b> — last month's return; health-check (still going or rolling over?)\n"
+    "• <b>↑/↓</b> — above/below the 200-day average (long-term uptrend intact?)\n\n"
+    "<b>Sections</b>\n"
+    "🟢 <b>TOP</b> — strongest trends (top decile) → ride-winners longs\n"
+    "🔴 <b>BOTTOM</b> — weakest names (bottom decile) → avoid longs / careful shorts\n"
+    "⭐ <b>Your positions</b> — where your trades rank, shown as <code>12-1% rank/decile</code>\n"
+    "<b>Decile</b> — 1 = top 10% (best), 10 = bottom 10% (worst)\n\n"
+    "<b>How to use</b>\n"
+    "• Longs work best in RISK-ON — check 🧭 Regime.\n"
+    "• Don't chase a name with a huge 1m pop — wait for a pullback.\n"
+    "• Bottom list = mostly \"don't go long\"; short only with defined risk.\n"
+    "• Leveraged/inverse/vol ETFs are excluded for a cleaner signal.\n\n"
+    "<i>Educational, not advice. Size for being wrong.</i>")
+
+async def mom_help_view(query):
+    await query.message.reply_text(_MOM_HELP, parse_mode=H, reply_markup=_kb_momentum())
 
 def _hp_model_momentum(ticker, conn, spot):
     m = _momentum_signal(ticker)
