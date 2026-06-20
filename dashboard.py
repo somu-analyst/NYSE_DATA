@@ -8589,13 +8589,59 @@ Real edge comes from discipline and filters — not a higher strike.
         if st.button("\U0001f504 Refresh", key="ga_pos_refresh"):
             st.rerun()
 
+        # ── Main portfolio open positions (the shared `trades` ledger) ──
+        try:
+            _main_pos = pd.read_sql(
+                "SELECT ticker, option_type, strike, quantity, entry_date, expiry, strategy, pnl "
+                "FROM trades WHERE status='OPEN' ORDER BY expiry", _ga_conn)
+        except Exception:
+            _main_pos = pd.DataFrame()
+        st.markdown(f"#### \U0001f4cc Main Portfolio — Open ({len(_main_pos)})")
+        if _main_pos.empty:
+            st.caption("No open trades in the main portfolio (`trades` table). Add them on the Portfolio page.")
+        else:
+            _spots, _rows = {}, []
+            for _, _r in _main_pos.iterrows():
+                _tk = str(_r["ticker"]).upper()
+                if _tk not in _spots:
+                    _sp = _ga_conn.execute(
+                        "SELECT close FROM stock_daily WHERE UPPER(ticker)=? ORDER BY "
+                        "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                        (_tk,)).fetchone()
+                    _spots[_tk] = float(_sp[0]) if _sp else None
+                _spot_v = _spots[_tk]
+                _dte = None
+                for _fmt in ("%Y-%m-%d", "%m-%d-%Y"):
+                    try:
+                        _dte = (datetime.strptime(str(_r["expiry"]), _fmt) - datetime.now()).days
+                        break
+                    except Exception:
+                        pass
+                _k = float(_r["strike"] or 0)
+                _dist = ((_k - _spot_v) / _spot_v * 100) if (_spot_v and _k) else None
+                _rows.append({
+                    "Ticker": _tk,
+                    "Type": str(_r["option_type"]).upper(),
+                    "Strike": _k,
+                    "Qty": int(_r["quantity"] or 0),
+                    "Expiry": str(_r["expiry"]),
+                    "DTE": _dte if _dte is not None else "—",
+                    "Spot": round(_spot_v, 2) if _spot_v else "—",
+                    "Strike vs Spot %": round(_dist, 1) if _dist is not None else "—",
+                    "Strategy": _r["strategy"],
+                })
+            st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
+            st.caption("Your live trades from the shared portfolio. The Advisor-spread ledger below "
+                       "is only for credit spreads logged via Advisor Scan.")
+        st.markdown("---")
+
         _open_p = pd.read_sql(
             "SELECT * FROM gamma_wall_trades WHERE status='OPEN' ORDER BY trade_date DESC", _ga_conn)
         _closed_p = pd.read_sql(
             "SELECT * FROM gamma_wall_trades WHERE status!='OPEN' ORDER BY exit_date DESC", _ga_conn)
 
         # ── Open positions ────────────────────────────────────────────
-        st.markdown(f"#### \U0001f7e2 Open Positions ({len(_open_p)})")
+        st.markdown(f"#### \U0001f7e2 Advisor Spreads — Open ({len(_open_p)})")
         if _open_p.empty:
             st.info("No open positions. Use Advisor Scan to find a setup and log it.")
         else:
@@ -8675,7 +8721,7 @@ Stop: buy back at <b>${_cred*2:.2f}</b>
                         _ga_conn.commit(); st.rerun()
 
         # ── Closed analytics ──────────────────────────────────────────
-        st.markdown(f"#### \U0001f4c1 Closed Positions ({len(_closed_p)})")
+        st.markdown(f"#### \U0001f4c1 Advisor Spreads — Closed ({len(_closed_p)})")
         if not _closed_p.empty:
             _closed_p["pnl_dollar"] = pd.to_numeric(_closed_p["pnl_dollar"],errors="coerce").fillna(0)
             _cw_ = (_closed_p["pnl_dollar"] > 0).sum()
