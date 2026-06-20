@@ -15844,24 +15844,46 @@ def _fmt_gex_report(g, tk, spot, pos=None):
         lines.append(f"Spot is <b>{'above' if spot >= flip else 'below'}</b> the flip "
                      + ("→ stabilising bias." if spot >= flip else "→ volatile / trend bias."))
     if pos is not None and not pos.empty:
-        lines.append("<b>Your legs vs gamma:</b>")
+        dte = g.get("dte")
+        lines.append("<b>Your legs vs gamma — suggested actions:</b>")
         for _, p in pos.iterrows():
             ot = str(p["option_type"]).upper()[:1]
             k = float(p["strike"] or 0)
             q = int(p.get("quantity", 1) or 1)
             side = "short" if q < 0 else "long"
-            if cw and ot == "C" and side == "short":
-                note = (f"short call ${k:.0f} "
-                        + (f"above call wall ${cw:.0f} → low pin risk" if k >= cw
-                           else f"below call wall ${cw:.0f} → capped / pin risk"))
-            elif pw and ot == "P" and side == "long":
-                note = (f"long put ${k:.0f} "
-                        + (f"below put wall ${pw:.0f} → past support" if k <= pw
-                           else f"above put wall ${pw:.0f} → support sits below"))
-            else:
-                ref = cw if ot == "C" else pw
-                note = f"{side} {ot} ${k:.0f}" + (f" vs wall ${ref:.0f}" if ref else "")
-            lines.append(f"• {note}")
+            ref = cw if ot == "C" else pw
+            loc = ((("above" if k >= ref else "below") + f" {'call' if ot=='C' else 'put'} wall ${ref:.0f}")
+                   if ref else "no wall nearby")
+            acts = []
+            if ot == "C" and side == "short":
+                acts.append("low assignment risk — let theta work, take ~50% profit" if (cw and k >= cw)
+                            else (f"capped near wall — watch for breakout, roll up if spot clears ${cw:.0f}" if cw
+                                  else "watch upside"))
+                if reg == "TRENDING":
+                    acts.append("neg-gamma can spike through; a cheap long-call hedge caps risk")
+            elif ot == "C" and side == "long":
+                acts.append("trend tailwind above flip — hold/trail" if (reg == "TRENDING" and flip and spot >= flip)
+                            else ("pinning caps upside — take profit or roll out" if reg == "PINNING"
+                                  else "hold vs call wall"))
+            elif ot == "P" and side == "long":
+                acts.append("spot at/below put wall — hedge paying, monetize part" if (pw and spot <= pw)
+                            else (f"protection intact; support at put wall ${pw:.0f}" if pw else "protection intact"))
+            elif ot == "P" and side == "short":
+                acts.append("below flip — downside risk, roll down or close" if (reg == "TRENDING" and flip and spot < flip)
+                            else ("lower assignment risk — hold" if (pw and k <= pw) else "monitor downside"))
+            if isinstance(dte, (int, float)) and dte <= 21:
+                acts.append(f"{int(dte)}DTE — gamma rising, manage per 21-DTE rule")
+            lines.append(f"• {side} {ot} ${k:.0f} ({loc})")
+            lines.append(f"   ↳ {'; '.join(acts) if acts else 'hold & monitor'}")
+        ov = []
+        if reg == "TRENDING":
+            ov.append("neg-gamma regime → bigger swings; favor defined-risk longs, avoid naked shorts")
+        elif reg == "PINNING":
+            ov.append("pos-gamma regime → range/pin; premium-selling near walls favored")
+        if flip and spot:
+            ov.append(("spot above flip" if spot >= flip else "spot below flip") + f" ${flip:.0f}")
+        if ov:
+            lines.append("📋 <b>Overall:</b> " + "; ".join(ov) + ".")
     return "\n".join(lines)
 
 def _kb_gex():
@@ -15898,7 +15920,16 @@ def _to_mdy(s):
 
 def _gex_reports(conn, tickers=None, position_aware=True):
     out = []
-    for tk in (tickers or ["SPY"])[:6]:
+    tks = list(tickers) if tickers else []
+    if not tks:
+        try:
+            _pf = pd.read_sql("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'", conn)
+            tks = [str(t).upper() for t in _pf["ticker"].tolist()] if not _pf.empty else []
+        except Exception:
+            tks = []
+        if not tks:
+            tks = ["SPY"]
+    for tk in tks[:6]:
         spot = _gex_spot(conn, tk)
         pos = None
         if position_aware:
