@@ -12638,6 +12638,33 @@ if page == "📡 Macro/Event Hub":
         with _tb_mom:
             st.caption("Full-universe 12-1 cross-sectional momentum (Jegadeesh-Titman / AQR). "
                        "Ranks every name in your DB; top decile = trend longs, bottom = shorts/avoid.")
+            with st.expander("ℹ️ How to read this — what each heading means"):
+                st.markdown("""
+**What it is** — ranks every name in your DB by trend strength (12-1 momentum), so you can see leaders to ride and laggards to avoid.
+
+**Columns**
+- **Rank** — position out of all names (#1 = strongest trend)
+- **Ticker** — the symbol
+- **12-1 %** — 12-month return *skipping the most recent month* — the trend that historically persists. **The core score.**
+- **6-1 %** — 6-month version (skip last month) — confirms whether the trend is still building or fading
+- **1m %** — last month alone — health-check (still going, or rolling over?)
+- **>200DMA** — ✅ above / ❌ below the 200-day average (long-term uptrend intact?)
+- **Decile** — universe split into 10 buckets: **1 = top 10% (best)**, 10 = bottom 10% (worst)
+
+**Sections**
+- 🟢 **Top momentum** — strongest trends → "ride winners" long candidates
+- 🔴 **Bottom momentum** — weakest names → avoid longs / careful shorts
+- ⭐ **Your open positions, ranked** — where your trades sit
+- **Bar chart** — all names; green = top decile, red = bottom decile
+
+**How to use**
+- Longs work best in **RISK-ON** (see the Risk Regime view).
+- Don't chase a name with a huge 1m pop — wait for a pullback.
+- The bottom list is mostly a *"don't go long"* list; short only with defined risk.
+- Leveraged / inverse / vol ETFs are excluded for a cleaner signal.
+
+*Educational, not advice. Size for being wrong.*
+""")
             _mc1, _mc2, _mc3 = st.columns([1.4, 1, 1])
             with _mc1:
                 if st.button("🔄 Recompute today's ranks", key="hub_mom_btn"):
