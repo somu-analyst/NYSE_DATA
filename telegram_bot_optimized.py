@@ -10767,6 +10767,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await macro_view(query)
         elif data == "mom_view":
             await mom_view(query)
+        elif data == "mom_recompute":
+            await mom_recompute_view(query)
         elif data == "regime_view":
             await regime_view(query)
         elif data == "vanna_view":
@@ -19266,7 +19268,16 @@ def morning_briefing(conn, event_keys=None):
         regime = _risk_regime()
     except Exception:
         regime = {}
-    return {"opex": rad, "events": evs, "news": news, "regime": regime}
+    mom = {}
+    try:
+        _mdf, _masof = load_momentum_ranks(conn)
+        if _mdf is not None and not _mdf.empty:
+            mom = {"asof": _masof,
+                   "top": _mdf.head(3)[["ticker", "ret_12_1"]].values.tolist(),
+                   "bottom": _mdf.tail(3).iloc[::-1][["ticker", "ret_12_1"]].values.tolist()}
+    except Exception:
+        mom = {}
+    return {"opex": rad, "events": evs, "news": news, "regime": regime, "momentum": mom}
 
 def _fmt_briefing(b):
     from datetime import datetime as _dt
@@ -19298,6 +19309,12 @@ def _fmt_briefing(b):
             lines.append("<i>Negative gamma -> dealers amplify moves; expect bigger swings.</i>")
         elif gex.get("gex_signal") == "PINNING":
             lines.append("<i>Positive gamma -> dealers dampen moves; range/mean-revert bias.</i>")
+    _mm = b.get("momentum") or {}
+    if _mm.get("top"):
+        _tp = " · ".join(f"{t} {r:+.0f}%" for t, r in _mm["top"])
+        _bt = " · ".join(f"{t} {r:+.0f}%" for t, r in _mm["bottom"])
+        lines.append("🚀 <b>Momentum leaders:</b> " + _tp)
+        lines.append("🐌 <b>Laggards:</b> " + _bt)
     lines.append("")
     lines.append("<b>\U0001F30D Events to watch</b>  (optimistic / pessimistic / balanced)")
 
@@ -19321,6 +19338,10 @@ def _fmt_briefing(b):
 
 async def briefing_command(update, ctx):
     """/briefing - daily macro event brief with optimistic/pessimistic/balanced views."""
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, compute_universe_momentum, False)
+    except Exception:
+        pass
     conn = get_conn()
     try:
         b = morning_briefing(conn)
@@ -19512,6 +19533,10 @@ async def logevent_command(update, ctx):
 async def briefing_alert(ctx):
     """Daily auto-send of the morning event brief (scheduled)."""
     try:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, compute_universe_momentum, False)
+        except Exception:
+            pass
         _, chat_id = load_creds()
         conn = get_conn()
         try:
@@ -20127,6 +20152,184 @@ def _momentum_signal(ticker):
     except Exception:
         return None
 
+# ═══════════════════════════════════════════════════════════════════
+# ── FULL-UNIVERSE CROSS-SECTIONAL MOMENTUM (12-1) — precompute & store
+#    Jegadeesh-Titman / AQR factor. Ranks the whole DB universe daily and
+#    caches to momentum_ranks so Telegram/Streamlit reads are instant.
+# ═══════════════════════════════════════════════════════════════════
+def _ensure_momentum_table(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS momentum_ranks ("
+        "asof TEXT, ticker TEXT, ret_12_1 REAL, ret_6_1 REAL, ret_1m REAL, "
+        "above200 INTEGER, mom_rank INTEGER, pct_rank REAL, decile INTEGER, zscore REAL, "
+        "PRIMARY KEY (asof, ticker))")
+    conn.commit()
+
+# Leveraged / inverse / vol ETFs distort a momentum ranking (a 3x ETF mechanically
+# tops any up-market list), so they are excluded by default. Index symbols (^VIX)
+# are not directly investable and are dropped too.
+_LEV_INV_VOL_ETFS = frozenset({
+    "SOXL", "SOXS", "SPXL", "SPXS", "SPXU", "UPRO", "SQQQ", "TQQQ", "QID", "QLD",
+    "UVXY", "VXX", "VIXY", "UVIX", "SVXY", "SVIX", "UDOW", "SDOW", "TNA", "TZA",
+    "LABU", "LABD", "FAS", "FAZ", "NUGT", "DUST", "JNUG", "JDST", "BOIL", "KOLD",
+    "YINN", "YANG", "TMF", "TMV", "GUSH", "DRIP", "ERX", "ERY", "TECL", "TECS",
+    "WEBL", "WEBS", "DPST", "NAIL", "CURE", "DFEN", "FNGU", "FNGD", "BULZ",
+    "TSLL", "TSLQ", "TSLS", "NVDL", "NVDU", "NVDD", "CONL", "MSTU", "MSTX", "MSTZ",
+})
+
+def _universe_tickers(conn, exclude_leveraged=True):
+    try:
+        df = pd.read_sql("SELECT DISTINCT ticker FROM stock_daily", conn)
+        tks = sorted({str(t).strip().upper() for t in df["ticker"].tolist() if str(t).strip()})
+        if exclude_leveraged:
+            tks = [t for t in tks if t not in _LEV_INV_VOL_ETFS and not t.startswith("^")]
+        return tks
+    except Exception:
+        return []
+
+def _batch_closes(tickers):
+    """{ticker: adjusted-close Series} via batched, threaded yf.download (fast)."""
+    out = {}
+    CH = 45
+    for i in range(0, len(tickers), CH):
+        chunk = tickers[i:i + CH]
+        try:
+            data = yf.download(chunk, period="13mo", interval="1d",
+                               auto_adjust=True, progress=False, threads=True,
+                               group_by="ticker")
+        except Exception:
+            data = None
+        if data is None or getattr(data, "empty", True):
+            continue
+        for tk in chunk:
+            try:
+                s = data["Close"] if len(chunk) == 1 else data[tk]["Close"]
+                s = s.dropna()
+                if len(s) >= 210:
+                    out[tk] = s
+            except Exception:
+                continue
+    return out
+
+def compute_universe_momentum(force=False):
+    """Compute 12-1 cross-sectional momentum for the whole DB universe and store in
+    momentum_ranks. Opens its own connection (executor-safe). Returns (status,count,asof)."""
+    conn = get_conn()
+    try:
+        _ensure_momentum_table(conn)
+        asof = datetime.now().strftime("%Y-%m-%d")
+        if not force:
+            try:
+                ex = conn.execute("SELECT COUNT(*) FROM momentum_ranks WHERE asof=?", (asof,)).fetchone()[0]
+            except Exception:
+                ex = 0
+            if ex:
+                return ("cached", ex, asof)
+        tks = _universe_tickers(conn)
+        if not tks:
+            return ("no-universe", 0, asof)
+        closes = _batch_closes(tks)
+        rows = []
+        for tk, c in closes.items():
+            try:
+                p_skip = float(c.iloc[-21])
+                p_year = float(c.iloc[-252]) if len(c) >= 252 else float(c.iloc[0])
+                p_6 = float(c.iloc[-126]) if len(c) >= 126 else float(c.iloc[0])
+                if p_year <= 0 or p_skip <= 0:
+                    continue
+                r121 = (p_skip - p_year) / p_year * 100
+                r61 = (p_skip - p_6) / p_6 * 100 if p_6 > 0 else 0.0
+                r1m = (float(c.iloc[-1]) - p_skip) / p_skip * 100
+                ma200 = float(c.rolling(200).mean().iloc[-1])
+                above = 1 if float(c.iloc[-1]) > ma200 else 0
+                rows.append([tk, r121, r61, r1m, above])
+            except Exception:
+                continue
+        if not rows:
+            return ("no-data", 0, asof)
+        rows.sort(key=lambda x: x[1], reverse=True)
+        n = len(rows)
+        vals = [r[1] for r in rows]
+        mean = sum(vals) / n
+        std = (sum((v - mean) ** 2 for v in vals) / n) ** 0.5 or 1.0
+        recs = []
+        for i, r in enumerate(rows):
+            rank = i + 1
+            pct = (n - rank) / (n - 1) * 100 if n > 1 else 100.0
+            dec = min(10, int(i * 10 / n) + 1)
+            z = (r[1] - mean) / std
+            recs.append((asof, r[0], r[1], r[2], r[3], r[4], rank, pct, dec, z))
+        conn.execute("DELETE FROM momentum_ranks WHERE asof=?", (asof,))
+        conn.executemany(
+            "INSERT INTO momentum_ranks (asof,ticker,ret_12_1,ret_6_1,ret_1m,above200,"
+            "mom_rank,pct_rank,decile,zscore) VALUES (?,?,?,?,?,?,?,?,?,?)", recs)
+        conn.commit()
+        return ("computed", len(recs), asof)
+    finally:
+        conn.close()
+
+def load_momentum_ranks(conn):
+    """Latest stored snapshot → (DataFrame ordered by rank, asof) or (None,None)."""
+    try:
+        _ensure_momentum_table(conn)
+        asof = conn.execute("SELECT MAX(asof) FROM momentum_ranks").fetchone()[0]
+        if not asof:
+            return None, None
+        df = pd.read_sql("SELECT * FROM momentum_ranks WHERE asof=? ORDER BY mom_rank",
+                         conn, params=(asof,))
+        return df, asof
+    except Exception:
+        return None, None
+
+def _mom_asof_disp(asof):
+    try:
+        return datetime.strptime(asof, "%Y-%m-%d").strftime("%d%b").lstrip("0")
+    except Exception:
+        return asof or "?"
+
+def _fmt_momentum_leaderboard(conn, n=8, highlight=None):
+    df, asof = load_momentum_ranks(conn)
+    if df is None or df.empty:
+        return ("🚀 <b>MOMENTUM 12-1 — UNIVERSE</b>\n\n"
+                "No snapshot yet. Tap <b>Recompute</b> to build it (~1 min).")
+    highlight = {str(h).upper() for h in (highlight or set())}
+    stale = (asof != datetime.now().strftime("%Y-%m-%d"))
+    total = len(df)
+
+    def _block(sub, title):
+        out = [title, "<pre>", "rk tkr    12-1  1m"]
+        for _, r in sub.iterrows():
+            tk = str(r["ticker"])[:5]
+            star = "*" if tk in highlight else " "
+            tr = "↑" if int(r["above200"]) else "↓"
+            out.append(f"{int(r['mom_rank']):<2}{star}{tk:<5}{r['ret_12_1']:>+5.0f}%{r['ret_1m']:>+4.0f}%{tr}")
+        out.append("</pre>")
+        return "\n".join(out)
+
+    parts = ["🚀 <b>MOMENTUM 12-1 — UNIVERSE</b>",
+             f"<i>as of {_mom_asof_disp(asof)} · {total} names · 12-mo ret, skip 1m</i>"]
+    if stale:
+        parts.append("⚠️ <i>snapshot not from today — tap Recompute</i>")
+    parts.append(_block(df.head(n), "🟢 <b>TOP — momentum longs</b>"))
+    parts.append(_block(df.tail(n).iloc[::-1], "🔴 <b>BOTTOM — momentum shorts</b>"))
+    if highlight:
+        mine = df[df["ticker"].isin(highlight)].sort_values("mom_rank")
+        if not mine.empty:
+            ml = ["⭐ <b>Your positions ranked</b>", "<pre>", "tkr    12-1  rk/dec"]
+            for _, r in mine.iterrows():
+                ml.append(f"{str(r['ticker'])[:5]:<5}{r['ret_12_1']:>+5.0f}% {int(r['mom_rank'])}/{int(r['decile'])}")
+            ml.append("</pre>")
+            parts.append("\n".join(ml))
+    parts.append("<i>Top decile = strongest trend (long bias); bottom decile = weakest "
+                 "(short/avoid). Leveraged/inverse/vol ETFs excluded. Best when aligned "
+                 "with Risk Regime — press longs in RISK-ON.</i>")
+    return "\n".join(parts)
+
+def _kb_momentum():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Recompute (today)", callback_data="mom_recompute")],
+        [InlineKeyboardButton("⬅️ Hub", callback_data="hub_menu")]])
+
 def _hp_model_momentum(ticker, conn, spot):
     m = _momentum_signal(ticker)
     if not m:
@@ -20139,20 +20342,36 @@ def _hp_model_momentum(ticker, conn, spot):
     return {"signal": "NEUTRAL", "prob": 52, "reason": f"12-1 momentum {r:+.0f}%"}
 
 async def momentum_command(update, ctx):
-    """/momentum [TICKERS] - 12-1 momentum ranking (winners/losers)."""
+    """/momentum [TICKERS] - 12-1 momentum. No arg = full-universe leaderboard."""
     args = list(getattr(ctx, "args", []) or [])
-    tks = [a.upper() for a in args] if args else DEFAULT_TICKERS
-    res = []
-    for tk in tks[:15]:
-        m = _momentum_signal(tk)
-        if m:
-            res.append((tk, m))
-    res.sort(key=lambda x: x[1]["ret_12_1"], reverse=True)
-    rows = ["🚀 <b>MOMENTUM (12-1)</b>", "<i>12-mo return, skip last month</i>", ""]
-    for tk, m in res:
-        ic = "🟢" if (m["ret_12_1"] > 20 and m["above200"]) else ("🔴" if m["ret_12_1"] < -15 else "⚪")
-        rows.append(f"{ic} <b>{tk}</b> {m['ret_12_1']:+.0f}%  1m {m['ret_1m']:+.0f}%  {'>200' if m['above200'] else '<200'}DMA")
-    await update.message.reply_text("\n".join(rows), parse_mode=H)
+    conn = get_conn()
+    try:
+        if args:
+            tks = [a.upper() for a in args]
+            res = []
+            for tk in tks[:15]:
+                m = _momentum_signal(tk)
+                if m:
+                    res.append((tk, m))
+            res.sort(key=lambda x: x[1]["ret_12_1"], reverse=True)
+            rows = ["🚀 <b>MOMENTUM (12-1)</b>", "<i>12-mo return, skip last month</i>", ""]
+            for tk, m in res:
+                ic = "🟢" if (m["ret_12_1"] > 20 and m["above200"]) else ("🔴" if m["ret_12_1"] < -15 else "⚪")
+                rows.append(f"{ic} <b>{tk}</b> {m['ret_12_1']:+.0f}%  1m {m['ret_1m']:+.0f}%  {'>200' if m['above200'] else '<200'}DMA")
+            await update.message.reply_text("\n".join(rows), parse_mode=H)
+            return
+        df, _asof = load_momentum_ranks(conn)
+        if df is None or df.empty:
+            await update.message.reply_text("⏳ Building universe momentum (~1 min, first run)…", parse_mode=H)
+            await asyncio.get_event_loop().run_in_executor(None, compute_universe_momentum, True)
+        try:
+            hl = set(pd.read_sql("SELECT DISTINCT UPPER(ticker) tk FROM trades WHERE status='OPEN'", conn)["tk"].tolist())
+        except Exception:
+            hl = set()
+        txt = _fmt_momentum_leaderboard(conn, n=8, highlight=hl)
+    finally:
+        conn.close()
+    await update.message.reply_text(txt, parse_mode=H, reply_markup=_kb_momentum())
 
 _FOMC_DATES = ["01-28-2026", "03-18-2026", "04-29-2026", "06-17-2026",
                "07-29-2026", "09-16-2026", "10-28-2026", "12-09-2026"]
@@ -20304,17 +20523,34 @@ async def earnings_command(update, ctx):
     await update.message.reply_text("\n".join(lines), parse_mode=H)
 
 async def mom_view(query):
-    res = []
-    for tk in DEFAULT_TICKERS[:15]:
-        m = _momentum_signal(tk)
-        if m:
-            res.append((tk, m))
-    res.sort(key=lambda x: x[1]["ret_12_1"], reverse=True)
-    rows = ["🚀 <b>MOMENTUM (12-1)</b>", "<i>12-mo return, skip last month</i>", ""]
-    for tk, m in res:
-        ic = "🟢" if (m["ret_12_1"] > 20 and m["above200"]) else ("🔴" if m["ret_12_1"] < -15 else "⚪")
-        rows.append(f"{ic} <b>{tk}</b> {m['ret_12_1']:+.0f}%  1m {m['ret_1m']:+.0f}%")
-    await query.message.reply_text("\n".join(rows), parse_mode=H, reply_markup=HUB_MENU_KB)
+    conn = get_conn()
+    try:
+        df, _asof = load_momentum_ranks(conn)
+        if df is None or df.empty:
+            await query.message.reply_text("⏳ Building universe momentum (~1 min, first run)…", parse_mode=H)
+            await asyncio.get_event_loop().run_in_executor(None, compute_universe_momentum, True)
+        try:
+            hl = set(pd.read_sql("SELECT DISTINCT UPPER(ticker) tk FROM trades WHERE status='OPEN'", conn)["tk"].tolist())
+        except Exception:
+            hl = set()
+        txt = _fmt_momentum_leaderboard(conn, n=8, highlight=hl)
+    finally:
+        conn.close()
+    await query.message.reply_text(txt, parse_mode=H, reply_markup=_kb_momentum())
+
+async def mom_recompute_view(query):
+    await query.message.reply_text("⏳ Recomputing universe momentum…", parse_mode=H)
+    await asyncio.get_event_loop().run_in_executor(None, compute_universe_momentum, True)
+    conn = get_conn()
+    try:
+        try:
+            hl = set(pd.read_sql("SELECT DISTINCT UPPER(ticker) tk FROM trades WHERE status='OPEN'", conn)["tk"].tolist())
+        except Exception:
+            hl = set()
+        txt = _fmt_momentum_leaderboard(conn, n=8, highlight=hl)
+    finally:
+        conn.close()
+    await query.message.reply_text(txt, parse_mode=H, reply_markup=_kb_momentum())
 
 async def regime_view(query):
     await query.message.reply_text(_fmt_regime(), parse_mode=H, reply_markup=HUB_MENU_KB)
