@@ -1299,11 +1299,15 @@ def _oi_idea_metrics(conn, ticker, strike, direction, spot, r=0.045):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ideas=5):
+def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ideas=5,
+                            tp_pct=100.0, sl_pct=50.0):
     """Walk-forward backtest of OI-conviction ideas using stored option premiums.
-    On each historical date, fire ideas (conviction >= min_conv) and measure the
-    long-option P&L `hold_days` later on the SAME strike+expiry (entry/exit at the
-    stored last price). Returns (summary dict, trades DataFrame)."""
+    For each historical date, fire ideas (conviction >= min_conv) and track the long
+    option over the next `hold_days` on the SAME strike+expiry:
+      • fixed-hold P&L (exit on day N),
+      • managed P&L with a take-profit / stop rule (first daily close to touch),
+      • MFE / MAE (best & worst close reached during the hold).
+    Returns (summary dict, trades DataFrame)."""
     conn = get_conn()
     try:
         hist = pd.read_sql(
@@ -1330,9 +1334,18 @@ def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ide
                 pass
         return None
 
+    # fast price index: (date, strike, expiry) -> (callLast, putLast)
+    pidx = {}
+    for t in hist.itertuples(index=False):
+        pidx[(t.trade_date_now, float(t.strike), t.expiry_date)] = (
+            float(t.lastPrice_Call_now or 0), float(t.lastPrice_Put_now or 0))
+
+    tp, sl = tp_pct / 100.0, sl_pct / 100.0
     trades = []
     for i in range(lookback - 1, len(dates) - hold_days):
-        sig_d, exit_d = dates[i], dates[i + hold_days]
+        sig_d = dates[i]
+        path_dates = dates[i + 1: i + hold_days + 1]
+        exit_d = path_dates[-1]
         window = dates[i - lookback + 1: i + 1]
         sub = hist[hist["trade_date_now"].isin(window)].copy()
         spot_sig = spot_by_date.get(sig_d)
@@ -1348,6 +1361,7 @@ def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ide
             if direction not in ("BULL", "BEAR"):
                 continue
             strike = float(rr2["strike"]); typ = "call" if direction == "BULL" else "put"
+            ix = 0 if typ == "call" else 1
             lc = "lastPrice_Call_now" if typ == "call" else "lastPrice_Put_now"
             oc = "openInt_Call_now" if typ == "call" else "openInt_Put_now"
             er = hist[(hist["trade_date_now"] == sig_d) & (hist["strike"] == strike)]
@@ -1364,21 +1378,49 @@ def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ide
             if best is None:
                 continue
             exp, entry_px, _ = best
-            xr = hist[(hist["trade_date_now"] == exit_d) & (hist["strike"] == strike)
-                      & (hist["expiry_date"] == exp)]
-            if xr.empty:
+            # daily option-price path over the hold
+            path = []
+            for d in path_dates:
+                pv = pidx.get((d, strike, exp))
+                if pv is not None and pv[ix] >= 0:
+                    path.append(pv[ix])
+            if not path:
                 continue
-            exit_px = float(xr.iloc[0][lc] or 0)
+            exit_px = path[-1]
+            fixed = (exit_px - entry_px) / entry_px * 100
+            mfe = (max(path) - entry_px) / entry_px * 100
+            mae = (min(path) - entry_px) / entry_px * 100
+            managed, reason = fixed, "TIME"          # first daily close to hit TP or SL
+            for pv in path:
+                ch = (pv - entry_px) / entry_px
+                if ch >= tp:
+                    managed, reason = tp * 100, "TP"; break
+                if ch <= -sl:
+                    managed, reason = -sl * 100, "SL"; break
             trades.append({
                 "signal_date": sig_d, "exit_date": exit_d, "strike": strike,
                 "dir": direction, "type": typ, "expiry": exp, "entry": round(entry_px, 2),
-                "exit": round(exit_px, 2), "pnl_pct": round((exit_px - entry_px) / entry_px * 100, 1),
+                "exit": round(exit_px, 2), "pnl_pct": round(fixed, 1),
+                "managed_pct": round(managed, 1), "exit_reason": reason,
+                "mfe_pct": round(mfe, 1), "mae_pct": round(mae, 1),
                 "conviction": float(rr2["conviction"]),
             })
     tdf = pd.DataFrame(trades)
     if tdf.empty:
         return {"n": 0}, tdf
+
+    def _pf(series):
+        g = float(series[series > 0].sum()); l = float(series[series < 0].sum())
+        return (g / abs(l)) if l < 0 else (float("inf") if g > 0 else 0.0)
+
     wins = tdf["pnl_pct"] > 0
+    mw = tdf["managed_pct"] > 0
+    buckets = {}
+    for lo, hi, lbl in [(6, 7, "6–7"), (7, 8, "7–8"), (8, 10.01, "8–10")]:
+        b = tdf[(tdf["conviction"] >= lo) & (tdf["conviction"] < hi)]
+        if not b.empty:
+            buckets[lbl] = {"n": int(len(b)), "win": float((b["pnl_pct"] > 0).mean() * 100),
+                            "avg": float(b["pnl_pct"].mean())}
     summary = {
         "n": int(len(tdf)),
         "win_rate": float(wins.mean() * 100),
@@ -1386,11 +1428,22 @@ def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ide
         "median_pnl": float(tdf["pnl_pct"].median()),
         "avg_win": float(tdf[wins]["pnl_pct"].mean()) if wins.any() else 0.0,
         "avg_loss": float(tdf[~wins]["pnl_pct"].mean()) if (~wins).any() else 0.0,
+        "profit_factor": _pf(tdf["pnl_pct"]),
+        "avg_mfe": float(tdf["mfe_pct"].mean()),
+        "avg_mae": float(tdf["mae_pct"].mean()),
+        "mgd_win_rate": float(mw.mean() * 100),
+        "mgd_avg_pnl": float(tdf["managed_pct"].mean()),
+        "mgd_profit_factor": _pf(tdf["managed_pct"]),
+        "tp_hit": int((tdf["exit_reason"] == "TP").sum()),
+        "sl_hit": int((tdf["exit_reason"] == "SL").sum()),
+        "time_exit": int((tdf["exit_reason"] == "TIME").sum()),
         "bull_n": int((tdf["dir"] == "BULL").sum()),
         "bear_n": int((tdf["dir"] == "BEAR").sum()),
         "bull_win": float((tdf[tdf["dir"] == "BULL"]["pnl_pct"] > 0).mean() * 100) if (tdf["dir"] == "BULL").any() else 0.0,
         "bear_win": float((tdf[tdf["dir"] == "BEAR"]["pnl_pct"] > 0).mean() * 100) if (tdf["dir"] == "BEAR").any() else 0.0,
+        "buckets": buckets,
         "hold_days": hold_days, "lookback": lookback, "min_conv": min_conv,
+        "tp_pct": tp_pct, "sl_pct": sl_pct,
     }
     return summary, tdf
 
@@ -12235,36 +12288,78 @@ reveals where smart money is building or liquidating positions.
 
                 # ── Backtest the conviction signals on stored option premiums ──
                 st.markdown("---")
-                with st.expander("📊 Backtest these signals — historical win rate & avg P&L"):
+                with st.expander("📊 Backtest these signals — win rate, P&L, exit rules & equity curve"):
                     st.caption("Walks every historical date, fires the same OI-conviction ideas, then "
-                               "measures the long-option P&L a few days later using the option prices "
-                               "stored in your DB (entry/exit at last price, same strike+expiry).")
+                               "tracks the long option over the next few days using the option prices in "
+                               "your DB. Compares a fixed hold vs a take-profit/stop rule, shows the best "
+                               "& worst the trade reached (MFE/MAE), and whether the score predicts wins.")
                     _b1, _b2, _b3 = st.columns(3)
                     _bt_look = _b1.slider("Signal build (days)", 3, 12, int(_oi_days_c), key="bt_look")
                     _bt_hold = _b2.slider("Hold (trade days)", 2, 15, 5, key="bt_hold")
                     _bt_mc = _b3.slider("Min conviction", 5, 9, 6, key="bt_mc")
+                    _b4, _b5 = st.columns(2)
+                    _bt_tp = _b4.slider("Take-profit %", 25, 300, 100, step=25, key="bt_tp")
+                    _bt_sl = _b5.slider("Stop-loss %", 25, 100, 50, step=5, key="bt_sl")
                     if st.button("▶ Run backtest", key="bt_run"):
                         with st.spinner("Backtesting OI-conviction signals over stored history…"):
-                            _summ, _btdf = _backtest_oi_conviction(sel_ticker, _bt_look, _bt_hold, _bt_mc)
+                            _summ, _btdf = _backtest_oi_conviction(
+                                sel_ticker, _bt_look, _bt_hold, _bt_mc, 5, float(_bt_tp), float(_bt_sl))
                         if not _summ or _summ.get("n", 0) == 0:
                             st.warning("Not enough stored option-premium history to backtest this "
                                        "ticker / these parameters. Try a shorter hold or lower conviction.")
                         else:
+                            st.markdown(f"**Fixed {_bt_hold}-day hold**")
                             _r1 = st.columns(4)
                             _r1[0].metric("Signals tested", _summ["n"])
                             _r1[1].metric("Win rate", f"{_summ['win_rate']:.0f}%")
                             _r1[2].metric("Avg P&L / trade", f"{_summ['avg_pnl']:+.0f}%")
-                            _r1[3].metric("Median P&L", f"{_summ['median_pnl']:+.0f}%")
-                            _r2b = st.columns(3)
-                            _r2b[0].metric("Avg win", f"{_summ['avg_win']:+.0f}%")
-                            _r2b[1].metric("Avg loss", f"{_summ['avg_loss']:+.0f}%")
-                            _r2b[2].metric("BULL / BEAR win",
-                                           f"{_summ['bull_win']:.0f}% / {_summ['bear_win']:.0f}%")
+                            _r1[3].metric("Profit factor", f"{_summ['profit_factor']:.2f}")
+
+                            st.markdown(f"**Managed: +{_bt_tp}% take-profit / −{_bt_sl}% stop**")
+                            _r2 = st.columns(4)
+                            _r2[0].metric("Win rate", f"{_summ['mgd_win_rate']:.0f}%",
+                                          f"{_summ['mgd_win_rate']-_summ['win_rate']:+.0f} pts vs hold")
+                            _r2[1].metric("Avg P&L", f"{_summ['mgd_avg_pnl']:+.0f}%",
+                                          f"{_summ['mgd_avg_pnl']-_summ['avg_pnl']:+.0f} pts")
+                            _r2[2].metric("Profit factor", f"{_summ['mgd_profit_factor']:.2f}")
+                            _r2[3].metric("TP / SL / Time",
+                                          f"{_summ['tp_hit']}/{_summ['sl_hit']}/{_summ['time_exit']}")
+
+                            _r3 = st.columns(4)
+                            _r3[0].metric("Avg win", f"{_summ['avg_win']:+.0f}%")
+                            _r3[1].metric("Avg loss", f"{_summ['avg_loss']:+.0f}%")
+                            _r3[2].metric("Avg MFE (best)", f"{_summ['avg_mfe']:+.0f}%")
+                            _r3[3].metric("Avg MAE (worst)", f"{_summ['avg_mae']:+.0f}%")
+
+                            if _summ.get("buckets"):
+                                st.markdown("**Does the score predict? Win rate by conviction**")
+                                _bk = pd.DataFrame([
+                                    {"Conviction": k, "Trades": v["n"],
+                                     "Win %": round(v["win"]), "Avg P&L %": round(v["avg"])}
+                                    for k, v in _summ["buckets"].items()])
+                                st.dataframe(_bk, hide_index=True, use_container_width=True)
+
+                            _eqd = _btdf.sort_values("signal_date").reset_index(drop=True)
+                            _eqd["cum_fixed"] = _eqd["pnl_pct"].cumsum()
+                            _eqd["cum_managed"] = _eqd["managed_pct"].cumsum()
+                            _efig = go.Figure()
+                            _efig.add_trace(go.Scatter(y=_eqd["cum_fixed"], mode="lines",
+                                                       name="Fixed hold", line=dict(color="#8ab4ff", width=2)))
+                            _efig.add_trace(go.Scatter(y=_eqd["cum_managed"], mode="lines",
+                                                       name="Managed (TP/SL)", line=dict(color="#00e676", width=2)))
+                            _efig.update_layout(template="plotly_dark", height=300,
+                                                title="Cumulative P&L (sum of per-trade %, equal weight)",
+                                                xaxis_title="Trade #", yaxis_title="Cumulative %",
+                                                margin=dict(t=44, b=20),
+                                                legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+                            st.plotly_chart(_efig, use_container_width=True)
+
                             st.caption(
-                                f"{_summ['bull_n']} bull · {_summ['bear_n']} bear signals, conviction ≥ "
-                                f"{_bt_mc}, {_bt_hold}-day holds. **Educational backtest on ~6 months of "
-                                f"snapshots — past results don't guarantee future returns.** Slippage, "
-                                f"commissions and fills are not modeled.")
+                                f"{_summ['bull_n']} bull · {_summ['bear_n']} bear · conviction ≥ {_bt_mc}. "
+                                f"BULL win {_summ['bull_win']:.0f}% · BEAR win {_summ['bear_win']:.0f}%. "
+                                "**Educational backtest on ~6 months of EOD snapshots — daily closes only "
+                                "(intraday TP/SL touches not captured); no commissions/slippage. Past "
+                                "results don't guarantee future returns.**")
                             st.dataframe(_btdf.sort_values("signal_date"),
                                          hide_index=True, use_container_width=True)
     else:
