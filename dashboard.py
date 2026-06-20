@@ -517,107 +517,158 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # DARK THEME CSS  (Bloomberg-style)
 # ---------------------------------------------------------------------------
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+# ---------------------------------------------------------------------------
+# THEME SYSTEM — dark "fintech" (default) + light minimal, switchable at runtime
+# (toggle lives at the top of the sidebar; selection persists via session_state)
+# ---------------------------------------------------------------------------
+_FONT_IMPORT = "@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');"
 
-/* ─── Global ─── */
-html, body, [data-testid="stAppViewContainer"] {
-    font-family: 'Inter', sans-serif;
-    color: #1a2332;
+_CSS_DARK = """
+<style>
+__FONT__
+:root{
+  --panel:rgba(20,28,46,0.72); --panel-solid:#141c2e; --border:rgba(120,140,180,0.18);
+  --text:#e6edf3; --muted:#8b9bb4; --accent:#3d8bff;
+  --green:#00e676; --red:#ff5c6c; --amber:#ffb74d; --purple:#b388ff;
 }
-[data-testid="stAppViewContainer"] {
-    background: linear-gradient(180deg, #f0f4f8, #e8edf3);
+html, body, [data-testid="stAppViewContainer"]{ font-family:'Inter',sans-serif; color:var(--text); }
+[data-testid="stAppViewContainer"]{
+  background:radial-gradient(900px 480px at 8% -10%, rgba(61,139,255,.22), transparent 60%),
+             radial-gradient(820px 520px at 102% 2%, rgba(124,77,255,.18), transparent 55%),
+             radial-gradient(700px 600px at 50% 120%, rgba(0,230,118,.07), transparent 60%),
+             linear-gradient(180deg,#0a0e17,#0b1120);
 }
-section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #e65100, #bf360c);
-    border-right: 2px solid #ff6d00;
+[data-testid="stHeader"]{ background:transparent; }
+.block-container{ padding-top:2.2rem; max-width:1400px; }
+section[data-testid="stSidebar"]{ background:linear-gradient(180deg,#0c1226,#0a0e17); border-right:1px solid var(--border); }
+section[data-testid="stSidebar"] *{ color:var(--text)!important; }
+section[data-testid="stSidebar"] .stRadio label{ font-size:.92rem; padding:8px 10px; border-radius:8px; transition:all .15s; }
+section[data-testid="stSidebar"] .stRadio label:hover{ background:rgba(61,139,255,.14); }
+section[data-testid="stSidebar"] .stRadio label:has(input:checked){
+  background:linear-gradient(90deg,rgba(61,139,255,.32),rgba(124,77,255,.10) 70%,transparent);
+  box-shadow:inset 3px 0 0 var(--accent); font-weight:700;
 }
-section[data-testid="stSidebar"] * {
-    color: #ffffff !important;
+h1,h2{ background:linear-gradient(90deg,#5aa6ff,#9c7bff 55%,#22d3ee);
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+  font-weight:800!important; letter-spacing:.2px; }
+h3,h4{ color:#dbe6ff!important; font-weight:700; letter-spacing:.2px; }
+h1 a,h2 a,h3 a,h4 a{ display:none!important; }
+[data-testid="stMetric"]{
+  background:linear-gradient(135deg,rgba(61,139,255,.10),var(--panel)); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+  border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:14px; padding:16px 18px;
+  box-shadow:0 8px 24px rgba(0,0,0,.35), 0 0 0 1px rgba(61,139,255,.05), inset 0 1px 0 rgba(255,255,255,.05);
+  transition:transform .15s, box-shadow .15s;
 }
-section[data-testid="stSidebar"] .stRadio label {
-    font-size: 0.92rem;
-    padding: 6px 4px;
-    border-radius: 6px;
-    transition: background 0.15s;
-    color: #ffffff;
+[data-testid="stMetric"]:hover{ transform:translateY(-2px); box-shadow:0 12px 30px rgba(61,139,255,.22); }
+[data-testid="stMetricValue"]{ font-size:1.55rem!important; font-weight:800; color:#fff!important; }
+[data-testid="stMetricLabel"]{ font-size:.72rem!important; color:#9fb3d4; text-transform:uppercase; letter-spacing:.8px; }
+[data-testid="stMetricDelta"]{ font-size:.85rem!important; font-weight:700; }
+button[data-baseweb="tab"]{ font-size:.85rem!important; font-weight:600; color:var(--muted)!important; padding:6px 16px; }
+button[data-baseweb="tab"][aria-selected="true"]{ color:#fff!important;
+  background:linear-gradient(135deg,rgba(61,139,255,.26),rgba(124,77,255,.16)); border-radius:10px 10px 0 0; }
+[data-baseweb="tab-highlight"]{ background:linear-gradient(90deg,var(--accent),#9c7bff)!important; height:3px!important; }
+.stDataFrame,[data-testid="stDataFrame"]{ border-radius:12px; overflow:hidden; border:1px solid var(--border); }
+.stButton>button,[data-testid="stBaseButton-secondary"]{
+  background:linear-gradient(135deg,#3d8bff,#7c4dff); color:#fff!important;
+  border:none; border-radius:10px; font-weight:700; transition:all .15s;
+  box-shadow:0 4px 14px rgba(61,139,255,.32);
 }
-section[data-testid="stSidebar"] .stRadio label:hover {
-    background: rgba(255,255,255,0.2);
+.stButton>button:hover{ filter:brightness(1.08); transform:translateY(-1px); box-shadow:0 7px 22px rgba(124,77,255,.45); }
+[data-testid="stSelectbox"] label,[data-testid="stMultiSelect"] label,
+[data-testid="stTextInput"] label,[data-testid="stNumberInput"] label{
+  color:var(--muted)!important; font-size:.82rem!important; text-transform:uppercase; letter-spacing:.5px;
 }
-/* ─── Metric cards ─── */
-[data-testid="stMetric"] {
-    background: linear-gradient(135deg, #ffffff, #f6f9fc);
-    border: 1px solid #d0dbe8;
-    border-radius: 10px;
-    padding: 14px 16px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-}
-[data-testid="stMetricValue"] { font-size: 1.3rem !important; font-weight: 700; color: #1a2332 !important; }
-[data-testid="stMetricLabel"] { font-size: 0.78rem !important; color: #5a7290; text-transform: uppercase; letter-spacing: 0.5px; }
-[data-testid="stMetricDelta"] { font-size: 0.82rem !important; }
-/* ─── DataFrames ─── */
-.stDataFrame { border-radius: 8px; overflow: hidden; }
-/* ─── Tabs ─── */
-button[data-baseweb="tab"] { font-size: 0.85rem !important; font-weight: 500; color: #5a7290 !important; }
-button[data-baseweb="tab"][aria-selected="true"] { color: #0066cc !important; border-bottom-color: #0066cc !important; }
-/* ─── Section headers ─── */
-.section-header {
-    font-size: 1.1rem; font-weight: 700; color: #0066cc;
-    border-bottom: 2px solid #0066cc; padding-bottom: 6px; margin: 20px 0 12px 0;
-    letter-spacing: 0.3px;
-}
-.card {
-    background: linear-gradient(135deg, #ffffff, #f8fafe); border: 1px solid #d0dbe8; border-radius: 10px;
-    padding: 16px; margin-bottom: 12px;
-}
-.news-card {
-    background: linear-gradient(135deg, #ffffff, #f6f9fc); border-left: 3px solid #2196f3;
-    padding: 10px 14px; margin: 4px 0; border-radius: 0 8px 8px 0;
-}
-.news-card.bull { border-left-color: #00c853; background: linear-gradient(135deg, #f0fff4, #f6f9fc); }
-.news-card.bear { border-left-color: #e53935; background: linear-gradient(135deg, #fff5f5, #f6f9fc); }
-.alert-bar {
-    background: linear-gradient(90deg, #fff3e0, #ffffff); border: 1px solid #ff9100;
-    border-radius: 8px; padding: 10px 16px; margin: 8px 0;
-    animation: pulse 2s infinite;
-}
-.trade-idea {
-    background: linear-gradient(135deg, #e8f5e9, #f1f8e9); border: 1px solid #81c784;
-    border-radius: 8px; padding: 10px 14px; margin: 4px 0;
-}
-.trade-idea.bearish { background: linear-gradient(135deg, #fce4ec, #fff3e0); border-color: #ef5350; }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.88} }
-/* ─── Signal badges ─── */
-.badge-bull { background: #00c853; color: #fff; padding: 3px 12px; border-radius: 12px; font-weight: 700; font-size: 0.78rem; }
-.badge-bear { background: #e53935; color: #fff; padding: 3px 12px; border-radius: 12px; font-weight: 700; font-size: 0.78rem; }
-.badge-neutral { background: #78909c; color: #fff; padding: 3px 12px; border-radius: 12px; font-weight: 600; font-size: 0.78rem; }
-.badge-warn { background: #ff9100; color: #fff; padding: 3px 12px; border-radius: 12px; font-weight: 700; font-size: 0.78rem; }
-.badge-volatile { background: #ab47bc; color: #fff; padding: 3px 12px; border-radius: 12px; font-weight: 700; font-size: 0.78rem; }
-/* ─── Prop screen ─── */
-.prop-card {
-    background: linear-gradient(135deg, #ffffff, #f0f5fa);
-    border: 1px solid #c8d8e8; border-radius: 12px;
-    padding: 18px; margin: 8px 0;
-}
-.prop-card h4 { color: #0066cc; margin: 0 0 8px 0; }
-/* ─── Analysis cards ─── */
-.analysis-finding {
-    background: linear-gradient(135deg, #ffffff, #f6f9fc); border-left: 3px solid #0066cc;
-    padding: 10px 14px; margin: 6px 0; border-radius: 0 8px 8px 0;
-}
-.analysis-finding.bearish { border-left-color: #e53935; }
-.analysis-finding.bullish { border-left-color: #00c853; }
-.analysis-finding.volatile { border-left-color: #ab47bc; }
-/* ─── Hide anchor links ─── */
-h1 a, h2 a, h3 a, h4 a { display: none !important; }
-/* ─── Selectbox/input ─── */
-[data-testid="stSelectbox"] label, [data-testid="stMultiSelect"] label {
-    color: #5a7290 !important; font-size: 0.85rem !important;
-}
+[data-testid="stExpander"]{ background:var(--panel); border:1px solid var(--border); border-radius:12px; }
+[data-testid="stAlert"]{ border-radius:12px; }
+.section-header{ font-size:1.05rem; font-weight:700; color:var(--accent); border-bottom:1px solid var(--border); padding-bottom:6px; margin:20px 0 12px; letter-spacing:.3px; }
+.card{ background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:16px; margin-bottom:12px; backdrop-filter:blur(10px); }
+.news-card{ background:var(--panel-solid); border-left:3px solid var(--accent); padding:10px 14px; margin:4px 0; border-radius:0 10px 10px 0; }
+.news-card.bull{ border-left-color:var(--green); } .news-card.bear{ border-left-color:var(--red); }
+.alert-bar{ background:linear-gradient(90deg,rgba(255,183,77,.12),transparent); border:1px solid var(--amber); border-radius:10px; padding:10px 16px; margin:8px 0; animation:pulse 2s infinite; }
+.trade-idea{ background:linear-gradient(135deg,rgba(0,230,118,.10),rgba(0,230,118,.02)); border:1px solid rgba(0,230,118,.40); border-radius:10px; padding:10px 14px; margin:4px 0; }
+.trade-idea.bearish{ background:linear-gradient(135deg,rgba(255,92,108,.10),rgba(255,92,108,.02)); border-color:rgba(255,92,108,.40); }
+@keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.85} }
+.badge-bull{ background:var(--green); color:#06210f; padding:3px 12px; border-radius:20px; font-weight:700; font-size:.78rem; }
+.badge-bear{ background:var(--red); color:#2a0a0e; padding:3px 12px; border-radius:20px; font-weight:700; font-size:.78rem; }
+.badge-neutral{ background:#54637a; color:#fff; padding:3px 12px; border-radius:20px; font-weight:600; font-size:.78rem; }
+.badge-warn{ background:var(--amber); color:#231600; padding:3px 12px; border-radius:20px; font-weight:700; font-size:.78rem; }
+.badge-volatile{ background:var(--purple); color:#1a0a2e; padding:3px 12px; border-radius:20px; font-weight:700; font-size:.78rem; }
+.prop-card{ background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:18px; margin:8px 0; backdrop-filter:blur(10px); }
+.prop-card h4{ color:var(--accent); margin:0 0 8px; }
+.analysis-finding{ background:var(--panel-solid); border-left:3px solid var(--accent); padding:10px 14px; margin:6px 0; border-radius:0 10px 10px 0; }
+.analysis-finding.bearish{ border-left-color:var(--red); } .analysis-finding.bullish{ border-left-color:var(--green); } .analysis-finding.volatile{ border-left-color:var(--purple); }
 </style>
-""", unsafe_allow_html=True)
+""".replace("__FONT__", _FONT_IMPORT)
+
+_CSS_LIGHT = """
+<style>
+__FONT__
+:root{
+  --panel:#ffffff; --panel-solid:#ffffff; --border:#e6e8ee;
+  --text:#1a2332; --muted:#64748b; --accent:#4f46e5;
+  --green:#16a34a; --red:#dc2626; --amber:#d97706; --purple:#7c3aed;
+}
+html, body, [data-testid="stAppViewContainer"]{ font-family:'Inter',sans-serif; color:var(--text); }
+[data-testid="stAppViewContainer"]{
+  background:radial-gradient(900px 480px at 8% -10%, rgba(79,70,229,.08), transparent 60%),
+             radial-gradient(820px 520px at 102% 2%, rgba(124,58,237,.07), transparent 55%),
+             #f4f5f8;
+}
+[data-testid="stHeader"]{ background:transparent; }
+.block-container{ padding-top:2.2rem; max-width:1400px; }
+section[data-testid="stSidebar"]{ background:linear-gradient(180deg,#ffffff,#f3f1fe); border-right:1px solid var(--border); }
+section[data-testid="stSidebar"] *{ color:var(--text)!important; }
+section[data-testid="stSidebar"] .stRadio label{ font-size:.92rem; padding:8px 10px; border-radius:8px; transition:all .15s; }
+section[data-testid="stSidebar"] .stRadio label:hover{ background:rgba(79,70,229,.10); }
+section[data-testid="stSidebar"] .stRadio label:has(input:checked){
+  background:linear-gradient(90deg,rgba(79,70,229,.16),transparent); box-shadow:inset 3px 0 0 var(--accent); font-weight:700;
+}
+h1,h2{ background:linear-gradient(90deg,#4f46e5,#7c3aed 60%,#0ea5e9);
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+  font-weight:800!important; letter-spacing:.2px; }
+h3,h4{ color:#0f172a!important; font-weight:700; letter-spacing:.2px; }
+h1 a,h2 a,h3 a,h4 a{ display:none!important; }
+[data-testid="stMetric"]{ background:linear-gradient(135deg,rgba(79,70,229,.05),#fff); border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:14px; padding:16px 18px; box-shadow:0 1px 3px rgba(16,24,40,.06); transition:transform .15s, box-shadow .15s; }
+[data-testid="stMetric"]:hover{ transform:translateY(-2px); box-shadow:0 10px 24px rgba(79,70,229,.15); }
+[data-testid="stMetricValue"]{ font-size:1.55rem!important; font-weight:800; color:#0f172a!important; }
+[data-testid="stMetricLabel"]{ font-size:.72rem!important; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; }
+[data-testid="stMetricDelta"]{ font-size:.85rem!important; font-weight:700; }
+button[data-baseweb="tab"]{ font-size:.85rem!important; font-weight:600; color:var(--muted)!important; padding:6px 16px; }
+button[data-baseweb="tab"][aria-selected="true"]{ color:var(--accent)!important; background:rgba(79,70,229,.08); border-radius:10px 10px 0 0; }
+[data-baseweb="tab-highlight"]{ background:linear-gradient(90deg,var(--accent),#7c3aed)!important; height:3px!important; }
+.stDataFrame,[data-testid="stDataFrame"]{ border-radius:12px; overflow:hidden; border:1px solid var(--border); }
+.stButton>button{ background:linear-gradient(135deg,#4f46e5,#7c3aed); color:#fff!important; border:none; border-radius:10px; font-weight:700; transition:all .15s; box-shadow:0 3px 10px rgba(79,70,229,.25); }
+.stButton>button:hover{ filter:brightness(1.06); transform:translateY(-1px); box-shadow:0 6px 18px rgba(124,58,237,.35); }
+[data-testid="stSelectbox"] label,[data-testid="stMultiSelect"] label,
+[data-testid="stTextInput"] label,[data-testid="stNumberInput"] label{
+  color:var(--muted)!important; font-size:.82rem!important; text-transform:uppercase; letter-spacing:.5px;
+}
+[data-testid="stExpander"]{ background:#fff; border:1px solid var(--border); border-radius:12px; }
+[data-testid="stAlert"]{ border-radius:12px; }
+.section-header{ font-size:1.05rem; font-weight:700; color:var(--accent); border-bottom:2px solid var(--accent); padding-bottom:6px; margin:20px 0 12px; }
+.card{ background:#fff; border:1px solid var(--border); border-radius:14px; padding:16px; margin-bottom:12px; box-shadow:0 1px 3px rgba(16,24,40,.05); }
+.news-card{ background:#fff; border-left:3px solid var(--accent); padding:10px 14px; margin:4px 0; border-radius:0 10px 10px 0; box-shadow:0 1px 2px rgba(16,24,40,.04); }
+.news-card.bull{ border-left-color:var(--green); } .news-card.bear{ border-left-color:var(--red); }
+.alert-bar{ background:#fffbeb; border:1px solid var(--amber); border-radius:10px; padding:10px 16px; margin:8px 0; animation:pulse 2s infinite; }
+.trade-idea{ background:#f0fdf4; border:1px solid #86efac; border-radius:10px; padding:10px 14px; margin:4px 0; }
+.trade-idea.bearish{ background:#fef2f2; border-color:#fca5a5; }
+@keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.85} }
+.badge-bull{ background:var(--green); color:#fff; padding:3px 12px; border-radius:20px; font-weight:700; font-size:.78rem; }
+.badge-bear{ background:var(--red); color:#fff; padding:3px 12px; border-radius:20px; font-weight:700; font-size:.78rem; }
+.badge-neutral{ background:#94a3b8; color:#fff; padding:3px 12px; border-radius:20px; font-weight:600; font-size:.78rem; }
+.badge-warn{ background:var(--amber); color:#fff; padding:3px 12px; border-radius:20px; font-weight:700; font-size:.78rem; }
+.badge-volatile{ background:var(--purple); color:#fff; padding:3px 12px; border-radius:20px; font-weight:700; font-size:.78rem; }
+.prop-card{ background:#fff; border:1px solid var(--border); border-radius:14px; padding:18px; margin:8px 0; box-shadow:0 1px 3px rgba(16,24,40,.05); }
+.prop-card h4{ color:var(--accent); margin:0 0 8px; }
+.analysis-finding{ background:#fff; border-left:3px solid var(--accent); padding:10px 14px; margin:6px 0; border-radius:0 10px 10px 0; }
+.analysis-finding.bearish{ border-left-color:var(--red); } .analysis-finding.bullish{ border-left-color:var(--green); } .analysis-finding.volatile{ border-left-color:var(--purple); }
+</style>
+""".replace("__FONT__", _FONT_IMPORT)
+
+# Default to dark fintech; the sidebar toggle (key="ui_theme") flips it on rerun.
+st.session_state.setdefault("ui_theme", "🌙 Dark")
+st.markdown(_CSS_DARK if "Dark" in st.session_state["ui_theme"] else _CSS_LIGHT,
+            unsafe_allow_html=True)
 
 # ===================================================================
 # ──  GREEKS  (Black-Scholes)
@@ -1686,27 +1737,42 @@ _PAGE_HELP = {
 with st.sidebar:
     st.markdown("## 📊 RUDRARJUN")
     st.markdown("##### *Options Intelligence Terminal*")
+    st.radio("Theme", ["🌙 Dark", "☀️ Light"], key="ui_theme", horizontal=True,
+             label_visibility="collapsed",
+             help="Switch between dark fintech and light minimal. Applies on the next interaction.")
     st.markdown("---")
 
-    page = st.radio("Navigate", [
-        "🌍 Market Overview",
-        "🔬 OI Comparison Charts",
-        "🔥 OI Analytics & Prediction",
-        "🎯 Prop Trading Screen",
-        "💼 Portfolio & Suggestions",
-        "📊 Backtest Lab",
-        "🔮 Live Position Predictor",
-        "📈 Insider / Congress / Whales",
-        "🏆 Legendary Investors (13F)",
-        "📰 News & Calendar",
-        "⚡ Trade Risk Calculator",
-        "🎯 Next-Day Exit Planner",
-        "🚀 Live Momentum Scanner",
-        "🧠 High-Prob Engine",
-        "🧠 Smart Money Hub",
-        "🎯 Gamma Wall Advisor",
-        "📡 Macro/Event Hub",
-    ], label_visibility="collapsed")
+    _NAV_GROUPS = {
+        "📈 Markets & OI": [
+            "🌍 Market Overview",
+            "🔬 OI Comparison Charts",
+            "🔥 OI Analytics & Prediction",
+        ],
+        "💡 Trade Ideas": [
+            "🎯 Prop Trading Screen",
+            "🧠 High-Prob Engine",
+            "🎯 Gamma Wall Advisor",
+            "🚀 Live Momentum Scanner",
+        ],
+        "💼 Portfolio & Risk": [
+            "💼 Portfolio & Suggestions",
+            "🔮 Live Position Predictor",
+            "⚡ Trade Risk Calculator",
+            "🎯 Next-Day Exit Planner",
+            "📊 Backtest Lab",
+        ],
+        "🏛 Smart Money & News": [
+            "📈 Insider / Congress / Whales",
+            "🏆 Legendary Investors (13F)",
+            "🧠 Smart Money Hub",
+            "📰 News & Calendar",
+        ],
+        "📡 Macro / Event Hub": [
+            "📡 Macro/Event Hub",
+        ],
+    }
+    _cat = st.selectbox("Section", list(_NAV_GROUPS), key="nav_cat")
+    page = st.radio("Navigate", _NAV_GROUPS[_cat], label_visibility="collapsed")
 
     st.markdown("---")
     # Mini help for current page
