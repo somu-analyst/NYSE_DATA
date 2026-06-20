@@ -548,9 +548,7 @@ section[data-testid="stSidebar"] .stRadio label:has(input:checked){
   background:linear-gradient(90deg,rgba(61,139,255,.32),rgba(124,77,255,.10) 70%,transparent);
   box-shadow:inset 3px 0 0 var(--accent); font-weight:700;
 }
-h1,h2{ background:linear-gradient(90deg,#5aa6ff,#9c7bff 55%,#22d3ee);
-  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
-  font-weight:800!important; letter-spacing:.2px; }
+h1,h2{ color:#8ab4ff!important; font-weight:800!important; letter-spacing:.2px; }
 h3,h4{ color:#dbe6ff!important; font-weight:700; letter-spacing:.2px; }
 h1 a,h2 a,h3 a,h4 a{ display:none!important; }
 [data-testid="stMetric"]{
@@ -656,9 +654,7 @@ section[data-testid="stSidebar"] .stRadio label:hover{ background:rgba(79,70,229
 section[data-testid="stSidebar"] .stRadio label:has(input:checked){
   background:linear-gradient(90deg,rgba(79,70,229,.16),transparent); box-shadow:inset 3px 0 0 var(--accent); font-weight:700;
 }
-h1,h2{ background:linear-gradient(90deg,#4f46e5,#7c3aed 60%,#0ea5e9);
-  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
-  font-weight:800!important; letter-spacing:.2px; }
+h1,h2{ color:#4f46e5!important; font-weight:800!important; letter-spacing:.2px; }
 h3,h4{ color:#0f172a!important; font-weight:700; letter-spacing:.2px; }
 h1 a,h2 a,h3 a,h4 a{ display:none!important; }
 [data-testid="stMetric"]{ background:linear-gradient(135deg,rgba(79,70,229,.05),#fff); border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:14px; padding:16px 18px; box-shadow:0 1px 3px rgba(16,24,40,.06); transition:transform .15s, box-shadow .15s; }
@@ -1928,9 +1924,9 @@ if page == "🌍 Market Overview":
                         f"<div style='background:var(--panel-solid);color:var(--text);"
                         f"border:1px solid var(--border);border-left:4px solid {_border_color};"
                         f"border-radius:12px;padding:12px 12px;margin-bottom:6px;'>"
-                        f"<div style='font-size:.9rem;color:var(--text);'>{_em_s} {_icon} <b>{_n}</b></div>"
-                        f"<div style='font-size:1.05rem;font-weight:700;margin-top:2px;color:var(--text);'>"
-                        f"{_px_s} <span style='color:{_border_color};'>{_pct:+.2f}%</span></div>"
+                        f"<div>{_em_s} {_icon} <b>{_n}</b></div>"
+                        f"<div>"
+                        f"{_px_s} {_pct:+.2f}%</div>"
                         f"</div>",
                         unsafe_allow_html=True,
                     )
