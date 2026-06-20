@@ -19,9 +19,47 @@ import yfinance as yf
 from scipy.stats import norm
 import math
 import warnings, sys, os
-from wall_engine import compute_walls
 
 warnings.filterwarnings("ignore")
+
+
+def compute_walls(df, spot=None):
+    """Identify the call wall (max call-OI strike = resistance) and put wall
+    (max put-OI strike = support), with each wall's OI and strength (OI / mean OI).
+    Input df needs columns: strike, openInt_Call_now, openInt_Put_now.
+    (Inlined here — kept in the single main file, no separate module.)"""
+    out = {
+        "call_wall": None, "put_wall": None,
+        "call_wall_oi": 0.0, "put_wall_oi": 0.0,
+        "call_wall_strength": 0.0, "put_wall_strength": 0.0,
+    }
+    if df is None or len(df) == 0:
+        return out
+    try:
+        d = df.copy()
+        for col in ("strike", "openInt_Call_now", "openInt_Put_now"):
+            if col in d.columns:
+                d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["strike"])
+        if d.empty:
+            return out
+        c = d["openInt_Call_now"].fillna(0.0) if "openInt_Call_now" in d.columns else pd.Series(0.0, index=d.index)
+        p = d["openInt_Put_now"].fillna(0.0) if "openInt_Put_now" in d.columns else pd.Series(0.0, index=d.index)
+        mean_c = float(c[c > 0].mean()) if (c > 0).any() else 0.0
+        mean_p = float(p[p > 0].mean()) if (p > 0).any() else 0.0
+        if (c > 0).any():
+            ci = c.idxmax()
+            out["call_wall"] = float(d.loc[ci, "strike"])
+            out["call_wall_oi"] = float(c.loc[ci])
+            out["call_wall_strength"] = (out["call_wall_oi"] / mean_c) if mean_c > 0 else 0.0
+        if (p > 0).any():
+            pi = p.idxmax()
+            out["put_wall"] = float(d.loc[pi, "strike"])
+            out["put_wall_oi"] = float(p.loc[pi])
+            out["put_wall_strength"] = (out["put_wall_oi"] / mean_p) if mean_p > 0 else 0.0
+    except Exception:
+        return out
+    return out
 
 import re
 
@@ -1404,6 +1442,7 @@ def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ide
                 "managed_pct": round(managed, 1), "exit_reason": reason,
                 "mfe_pct": round(mfe, 1), "mae_pct": round(mae, 1),
                 "conviction": float(rr2["conviction"]),
+                "path": [round((pv - entry_px) / entry_px * 100, 1) for pv in path],
             })
     tdf = pd.DataFrame(trades)
     if tdf.empty:
@@ -1446,6 +1485,61 @@ def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ide
         "tp_pct": tp_pct, "sl_pct": sl_pct,
     }
     return summary, tdf
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _optimize_oi_exit(ticker, lookback, hold_days, min_conv):
+    """Grid-search take-profit/stop-loss over the backtested trades' daily price paths,
+    then walk-forward validate (optimize on the 1st half, test out-of-sample on the 2nd).
+    Returns (best dict, grid DataFrame, walk_forward dict)."""
+    _, tdf = _backtest_oi_conviction(ticker, lookback, hold_days, min_conv)
+    if tdf is None or tdf.empty or "path" not in tdf.columns:
+        return {}, pd.DataFrame(), {}
+    tdf = tdf.sort_values("signal_date").reset_index(drop=True)
+    paths = list(tdf["path"]); fixed = list(tdf["pnl_pct"])
+    tp_grid = [25, 40, 50, 75, 100, 150, 200]
+    sl_grid = [25, 40, 50, 60, 75, 100]
+
+    def _apply(ps, fs, tp, sl):
+        out = []
+        for pth, fx in zip(ps, fs):
+            r = fx
+            for ch in (pth or []):
+                if ch >= tp:
+                    r = float(tp); break
+                if ch <= -sl:
+                    r = float(-sl); break
+            out.append(r)
+        return np.array(out, dtype=float) if out else np.array([0.0])
+
+    def _stats(arr):
+        g = float(arr[arr > 0].sum()); l = float(arr[arr < 0].sum())
+        return {"exp": float(arr.mean()), "win": float((arr > 0).mean() * 100),
+                "pf": (g / abs(l)) if l < 0 else (float("inf") if g > 0 else 0.0)}
+
+    rows = []
+    for tp in tp_grid:
+        for sl in sl_grid:
+            s = _stats(_apply(paths, fixed, tp, sl))
+            rows.append({"tp": tp, "sl": sl, **s})
+    grid = pd.DataFrame(rows)
+    best = grid.loc[grid["exp"].idxmax()].to_dict()
+
+    # walk-forward: optimize on first half, apply to held-out second half
+    n = len(tdf); mid = max(1, n // 2)
+    tr_p, tr_f = paths[:mid], fixed[:mid]
+    te_p, te_f = paths[mid:], fixed[mid:]
+    b_tp, b_sl, b_exp = tp_grid[0], sl_grid[0], -1e9
+    for tp in tp_grid:
+        for sl in sl_grid:
+            e = float(_apply(tr_p, tr_f, tp, sl).mean())
+            if e > b_exp:
+                b_tp, b_sl, b_exp = tp, sl, e
+    te = _apply(te_p, te_f, b_tp, b_sl)
+    te_s = _stats(te)
+    wf = {"tp": b_tp, "sl": b_sl, "train_exp": b_exp, "n_train": mid, "n_test": len(te_p),
+          "test_exp": te_s["exp"], "test_win": te_s["win"], "test_pf": te_s["pf"]}
+    return best, grid, wf
 
 
 # ===================================================================
@@ -12360,8 +12454,57 @@ reveals where smart money is building or liquidating positions.
                                 "**Educational backtest on ~6 months of EOD snapshots — daily closes only "
                                 "(intraday TP/SL touches not captured); no commissions/slippage. Past "
                                 "results don't guarantee future returns.**")
-                            st.dataframe(_btdf.sort_values("signal_date"),
-                                         hide_index=True, use_container_width=True)
+                            st.dataframe(
+                                _btdf.drop(columns=["path"], errors="ignore").sort_values("signal_date"),
+                                hide_index=True, use_container_width=True)
+
+                    # ── Auto-optimize exit + walk-forward (out-of-sample) ──
+                    st.markdown("---")
+                    if st.button("🔧 Auto-optimize exit + walk-forward test", key="bt_opt"):
+                        with st.spinner("Grid-searching TP/SL and walk-forward testing…"):
+                            _best, _grid, _wf = _optimize_oi_exit(sel_ticker, _bt_look, _bt_hold, _bt_mc)
+                        if not _best:
+                            st.warning("Not enough data to optimize for this ticker / parameters.")
+                        else:
+                            st.markdown("**🔧 Best exit rule (in-sample grid-search, ranked by expectancy)**")
+                            _o = st.columns(4)
+                            _o[0].metric("Best take-profit", f"+{_best['tp']:.0f}%")
+                            _o[1].metric("Best stop-loss", f"−{_best['sl']:.0f}%")
+                            _o[2].metric("Expectancy", f"{_best['exp']:+.0f}%/trade")
+                            _o[3].metric("Profit factor",
+                                         ("∞" if _best['pf'] == float('inf') else f"{_best['pf']:.2f}"))
+                            try:
+                                _piv = _grid.pivot(index="tp", columns="sl", values="exp")
+                                _hf = go.Figure(go.Heatmap(
+                                    z=_piv.values,
+                                    x=[f"−{c:.0f}%" for c in _piv.columns],
+                                    y=[f"+{r:.0f}%" for r in _piv.index],
+                                    colorscale="RdYlGn", zmid=0,
+                                    colorbar=dict(title="Exp %/trade")))
+                                _hf.update_layout(template="plotly_dark", height=340,
+                                                  title="Expectancy by Take-Profit (rows) × Stop-Loss (cols)",
+                                                  xaxis_title="Stop-loss", yaxis_title="Take-profit",
+                                                  margin=dict(t=44, b=10))
+                                st.plotly_chart(_hf, use_container_width=True)
+                            except Exception:
+                                pass
+                            st.markdown("**🧪 Walk-forward — optimize on 1st half → test on unseen 2nd half**")
+                            _w = st.columns(4)
+                            _w[0].metric("Chosen TP / SL", f"+{_wf['tp']:.0f}% / −{_wf['sl']:.0f}%")
+                            _w[1].metric("In-sample exp", f"{_wf['train_exp']:+.0f}%")
+                            _w[2].metric("Out-of-sample exp", f"{_wf['test_exp']:+.0f}%")
+                            _w[3].metric("OOS win / PF",
+                                         f"{_wf['test_win']:.0f}% / " +
+                                         ("∞" if _wf['test_pf'] == float('inf') else f"{_wf['test_pf']:.2f}"))
+                            _oos_ok = _wf["test_exp"] > 0
+                            st.caption(
+                                f"Trained on {_wf['n_train']} trades, tested on {_wf['n_test']} **unseen** trades. "
+                                + ("✅ Out-of-sample expectancy stayed **positive** — the edge held up, not just "
+                                   "curve-fit." if _oos_ok else
+                                   "⚠️ Out-of-sample expectancy went **negative** — the in-sample 'best' was likely "
+                                   "curve-fit; don't trust it.")
+                                + " The grid 'best' above is in-sample and always looks good; this OOS number is "
+                                  "the honest test. Educational, not advice.")
     else:
         st.info(f"Not enough multi-day OI data for {sel_ticker}.")
 
