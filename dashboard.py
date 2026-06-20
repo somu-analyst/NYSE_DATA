@@ -1241,6 +1241,160 @@ def _compute_oi_conviction(multi_df, dates_newest_first, live_px=0):
     return strike_agg.sort_values("conviction", ascending=False).reset_index(drop=True)
 
 
+def _oi_idea_metrics(conn, ticker, strike, direction, spot, r=0.045):
+    """Concrete economics for an OI-conviction idea: entry premium (from DB), expiry/DTE,
+    IV (back-solved), POP (~|delta|), a 1-sigma expected-move target + the option's value
+    there, max risk and reward:risk. Returns dict, or None if no usable premium in DB."""
+    if not spot or spot <= 0:
+        return None
+    typ = "call" if direction == "BULL" else "put"
+    last_col = "lastPrice_Call_now" if typ == "call" else "lastPrice_Put_now"
+    oi_col = "openInt_Call_now" if typ == "call" else "openInt_Put_now"
+    try:
+        rows = pd.read_sql(
+            f"SELECT expiry_date, {last_col} AS last, {oi_col} AS oi "
+            "FROM options_change WHERE ticker=? AND strike=?",
+            conn, params=(ticker, float(strike)))
+    except Exception:
+        return None
+    if rows.empty:
+        return None
+    today = datetime.now()
+    cand = []
+    for _, rr in rows.iterrows():
+        ed = None
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+            try:
+                ed = datetime.strptime(str(rr["expiry_date"]), fmt); break
+            except Exception:
+                pass
+        if ed is None:
+            continue
+        dte = (ed - today).days
+        last = float(rr["last"] or 0)
+        if dte >= 1 and last > 0:
+            cand.append((dte, str(rr["expiry_date"]), last, float(rr["oi"] or 0)))
+    if not cand:
+        return None
+    # prefer the ideal 21-50 DTE entry zone, else the nearest future expiry
+    ideal = [c for c in cand if 21 <= c[0] <= 50]
+    dte, exp, entry, oi = sorted(ideal or cand, key=lambda c: (0 if 21 <= c[0] <= 50 else 1, c[0]))[0]
+    T = max(dte, 1) / 365.0
+    iv = _implied_vol(entry, spot, float(strike), T, r, typ)
+    g = bs_greeks(spot, float(strike), T, r, iv, typ)
+    pop = abs(g.get("delta", 0.0)) * 100
+    H = min(dte, 10)                                   # ~2-week hold (capped by DTE)
+    sigma_move = spot * iv * (H / 252.0) ** 0.5        # 1-sigma expected move
+    target = spot + sigma_move if typ == "call" else spot - sigma_move
+    T_rem = max(dte - H, 1) / 365.0
+    tval = bs_greeks(target, float(strike), T_rem, r, iv, typ).get("price", 0.0)
+    profit_pct = (tval - entry) / entry * 100 if entry > 0 else 0.0
+    return {
+        "type": typ, "expiry": exp, "dte": dte, "entry": entry, "invest": entry * 100,
+        "iv": iv, "pop": pop, "target": target, "target_val": tval,
+        "profit_pct": profit_pct, "max_risk": entry * 100,
+        "rr": (max(tval - entry, 0) / entry) if entry > 0 else 0.0,
+        "hold": H, "move_pct": sigma_move / spot * 100 * (1 if typ == "call" else -1),
+    }
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ideas=5):
+    """Walk-forward backtest of OI-conviction ideas using stored option premiums.
+    On each historical date, fire ideas (conviction >= min_conv) and measure the
+    long-option P&L `hold_days` later on the SAME strike+expiry (entry/exit at the
+    stored last price). Returns (summary dict, trades DataFrame)."""
+    conn = get_conn()
+    try:
+        hist = pd.read_sql(
+            "SELECT strike, expiry_date, trade_date_now, change_OI_Call, change_OI_Put, "
+            "openInt_Call_now, openInt_Put_now, vol_Call_now, vol_Put_now, "
+            "lastPrice_Call_now, lastPrice_Put_now FROM options_change WHERE ticker=?",
+            conn, params=(ticker,))
+        sd = pd.read_sql("SELECT trade_date, close FROM stock_daily WHERE ticker=?",
+                         conn, params=(ticker,))
+    finally:
+        conn.close()
+    if hist.empty:
+        return {"n": 0}, pd.DataFrame()
+    spot_by_date = {str(d): float(c) for d, c in zip(sd["trade_date"], sd["close"])}
+    dates = _sort_dates_chrono(list(hist["trade_date_now"].dropna().unique()), descending=False)
+    if len(dates) < lookback + hold_days + 1:
+        return {"n": 0, "error": "not enough history"}, pd.DataFrame()
+
+    def _parse(d):
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(str(d), fmt)
+            except Exception:
+                pass
+        return None
+
+    trades = []
+    for i in range(lookback - 1, len(dates) - hold_days):
+        sig_d, exit_d = dates[i], dates[i + hold_days]
+        window = dates[i - lookback + 1: i + 1]
+        sub = hist[hist["trade_date_now"].isin(window)].copy()
+        spot_sig = spot_by_date.get(sig_d)
+        if sub.empty or not spot_sig:
+            continue
+        sub = sub.rename(columns={"trade_date_now": "trade_date"})
+        conv = _compute_oi_conviction(sub, _sort_dates_chrono(list(window), descending=True), spot_sig)
+        if conv.empty:
+            continue
+        exd = _parse(exit_d)
+        for _, rr2 in conv[conv["conviction"] >= min_conv].head(max_ideas).iterrows():
+            direction = rr2["direction"]
+            if direction not in ("BULL", "BEAR"):
+                continue
+            strike = float(rr2["strike"]); typ = "call" if direction == "BULL" else "put"
+            lc = "lastPrice_Call_now" if typ == "call" else "lastPrice_Put_now"
+            oc = "openInt_Call_now" if typ == "call" else "openInt_Put_now"
+            er = hist[(hist["trade_date_now"] == sig_d) & (hist["strike"] == strike)]
+            best = None
+            for _, e in er.iterrows():
+                ed = _parse(e["expiry_date"])
+                if ed is None or (exd is not None and ed <= exd):
+                    continue                          # skip expiries that die during the hold
+                entry_px = float(e[lc] or 0)
+                if entry_px <= 0:
+                    continue
+                if best is None or float(e[oc] or 0) > best[2]:
+                    best = (str(e["expiry_date"]), entry_px, float(e[oc] or 0))
+            if best is None:
+                continue
+            exp, entry_px, _ = best
+            xr = hist[(hist["trade_date_now"] == exit_d) & (hist["strike"] == strike)
+                      & (hist["expiry_date"] == exp)]
+            if xr.empty:
+                continue
+            exit_px = float(xr.iloc[0][lc] or 0)
+            trades.append({
+                "signal_date": sig_d, "exit_date": exit_d, "strike": strike,
+                "dir": direction, "type": typ, "expiry": exp, "entry": round(entry_px, 2),
+                "exit": round(exit_px, 2), "pnl_pct": round((exit_px - entry_px) / entry_px * 100, 1),
+                "conviction": float(rr2["conviction"]),
+            })
+    tdf = pd.DataFrame(trades)
+    if tdf.empty:
+        return {"n": 0}, tdf
+    wins = tdf["pnl_pct"] > 0
+    summary = {
+        "n": int(len(tdf)),
+        "win_rate": float(wins.mean() * 100),
+        "avg_pnl": float(tdf["pnl_pct"].mean()),
+        "median_pnl": float(tdf["pnl_pct"].median()),
+        "avg_win": float(tdf[wins]["pnl_pct"].mean()) if wins.any() else 0.0,
+        "avg_loss": float(tdf[~wins]["pnl_pct"].mean()) if (~wins).any() else 0.0,
+        "bull_n": int((tdf["dir"] == "BULL").sum()),
+        "bear_n": int((tdf["dir"] == "BEAR").sum()),
+        "bull_win": float((tdf[tdf["dir"] == "BULL"]["pnl_pct"] > 0).mean() * 100) if (tdf["dir"] == "BULL").any() else 0.0,
+        "bear_win": float((tdf[tdf["dir"] == "BEAR"]["pnl_pct"] > 0).mean() * 100) if (tdf["dir"] == "BEAR").any() else 0.0,
+        "hold_days": hold_days, "lookback": lookback, "min_conv": min_conv,
+    }
+    return summary, tdf
+
+
 # ===================================================================
 # ──  OI WEEKLY COMPARISON  (same-week strike analysis)
 # ===================================================================
@@ -12052,6 +12206,67 @@ reveals where smart money is building or liquidating positions.
                         _tc1.markdown(f"{_icon2} **{_setup2}**  \n`{_skt2}` · {_dist2:.1f}% from spot")
                         _tc2.markdown(_why2)
                         _tc3.metric("Score", f"{_cv2:.0f}/10")
+                        _cc = get_conn()
+                        try:
+                            _m = _oi_idea_metrics(_cc, sel_ticker, _sk2, _dir2, spot)
+                        finally:
+                            _cc.close()
+                        if _m:
+                            _q1, _q2, _q3, _q4 = st.columns(4)
+                            _q1.metric("Entry / Invest", f"${_m['entry']:.2f}",
+                                       f"${_m['invest']:,.0f}/contract")
+                            _q2.metric(f"Target (1σ ~{_m['hold']}d)", f"${_m['target']:.2f}",
+                                       f"{_m['move_pct']:+.1f}% spot")
+                            _q3.metric("Est. profit", f"{_m['profit_pct']:+.0f}%",
+                                       f"R:R {_m['rr']:.1f}")
+                            _q4.metric("POP (≈Δ)", f"{_m['pop']:.0f}%",
+                                       f"IV {_m['iv']*100:.0f}% · {_m['dte']}DTE")
+                            st.caption(
+                                f"🧠 **Logic:** {_why2}. Buy the **{_m['expiry']} ${_sk2:.0f} "
+                                f"{_m['type'].upper()}** at **${_m['entry']:.2f}** — max risk = premium "
+                                f"(**${_m['max_risk']:,.0f}**/contract). On a 1-sigma move to "
+                                f"**${_m['target']:.2f}** in ~{_m['hold']} trading days the option is "
+                                f"worth ≈**${_m['target_val']:.2f}** (**{_m['profit_pct']:+.0f}%**). "
+                                f"Prob. of finishing ITM ≈ |Δ| = **{_m['pop']:.0f}%**."
+                            )
+                        else:
+                            st.caption(f"🧠 **Logic:** {_why2}. _(No live premium stored for this "
+                                       f"strike — can't size investment/target.)_")
+
+                # ── Backtest the conviction signals on stored option premiums ──
+                st.markdown("---")
+                with st.expander("📊 Backtest these signals — historical win rate & avg P&L"):
+                    st.caption("Walks every historical date, fires the same OI-conviction ideas, then "
+                               "measures the long-option P&L a few days later using the option prices "
+                               "stored in your DB (entry/exit at last price, same strike+expiry).")
+                    _b1, _b2, _b3 = st.columns(3)
+                    _bt_look = _b1.slider("Signal build (days)", 3, 12, int(_oi_days_c), key="bt_look")
+                    _bt_hold = _b2.slider("Hold (trade days)", 2, 15, 5, key="bt_hold")
+                    _bt_mc = _b3.slider("Min conviction", 5, 9, 6, key="bt_mc")
+                    if st.button("▶ Run backtest", key="bt_run"):
+                        with st.spinner("Backtesting OI-conviction signals over stored history…"):
+                            _summ, _btdf = _backtest_oi_conviction(sel_ticker, _bt_look, _bt_hold, _bt_mc)
+                        if not _summ or _summ.get("n", 0) == 0:
+                            st.warning("Not enough stored option-premium history to backtest this "
+                                       "ticker / these parameters. Try a shorter hold or lower conviction.")
+                        else:
+                            _r1 = st.columns(4)
+                            _r1[0].metric("Signals tested", _summ["n"])
+                            _r1[1].metric("Win rate", f"{_summ['win_rate']:.0f}%")
+                            _r1[2].metric("Avg P&L / trade", f"{_summ['avg_pnl']:+.0f}%")
+                            _r1[3].metric("Median P&L", f"{_summ['median_pnl']:+.0f}%")
+                            _r2b = st.columns(3)
+                            _r2b[0].metric("Avg win", f"{_summ['avg_win']:+.0f}%")
+                            _r2b[1].metric("Avg loss", f"{_summ['avg_loss']:+.0f}%")
+                            _r2b[2].metric("BULL / BEAR win",
+                                           f"{_summ['bull_win']:.0f}% / {_summ['bear_win']:.0f}%")
+                            st.caption(
+                                f"{_summ['bull_n']} bull · {_summ['bear_n']} bear signals, conviction ≥ "
+                                f"{_bt_mc}, {_bt_hold}-day holds. **Educational backtest on ~6 months of "
+                                f"snapshots — past results don't guarantee future returns.** Slippage, "
+                                f"commissions and fills are not modeled.")
+                            st.dataframe(_btdf.sort_values("signal_date"),
+                                         hide_index=True, use_container_width=True)
     else:
         st.info(f"Not enough multi-day OI data for {sel_ticker}.")
 
