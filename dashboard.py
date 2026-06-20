@@ -1925,11 +1925,12 @@ if page == "🌍 Market Overview":
                     _border_color = "#00c853" if _pct >= 0.5 else ("#d32f2f" if _pct < -0.5 else "#ff9100")
                     _px_s = _px_fmt(_n, _px)
                     _cols[_ci].markdown(
-                        f"<div style='background:#f8f9fa;border-radius:10px;padding:12px 10px;"
-                        f"border-left:4px solid {_border_color};margin-bottom:6px;'>"
-                        f"{_em_s} {_icon} <b>{_n}</b><br>"
-                        f"{_px_s} "
-                        f"{_pct:+.2f}%"
+                        f"<div style='background:var(--panel-solid);color:var(--text);"
+                        f"border:1px solid var(--border);border-left:4px solid {_border_color};"
+                        f"border-radius:12px;padding:12px 12px;margin-bottom:6px;'>"
+                        f"<div style='font-size:.9rem;color:var(--text);'>{_em_s} {_icon} <b>{_n}</b></div>"
+                        f"<div style='font-size:1.05rem;font-weight:700;margin-top:2px;color:var(--text);'>"
+                        f"{_px_s} <span style='color:{_border_color};'>{_pct:+.2f}%</span></div>"
                         f"</div>",
                         unsafe_allow_html=True,
                     )
@@ -2002,7 +2003,7 @@ if page == "🌍 Market Overview":
                     _src = "#00c853" if _srr["5d%"] > 0 else "#d32f2f"
                     _srem = "🟢" if _srr["5d%"] > 1 else ("🔴" if _srr["5d%"] < -1 else "🟡")
                     _sr_cols[_sri].markdown(
-                        f"<div style='text-align:center;padding:6px;background:#f8f9fa;"
+                        f"<div style='text-align:center;padding:6px;background:var(--panel-solid);color:var(--text);"
                         f"border-radius:8px;border-top:3px solid {_src}'>"
                         f"{_srem}<br><b>{_srr['ETF']}</b><br><small>{_srr['Sector']}</small><br>"
                         f"<b>{_srr['5d%']:+.1f}%</b></div>",
@@ -2034,7 +2035,7 @@ if page == "🌍 Market Overview":
                 _fgc1, _fgc2 = st.columns([1, 3])
                 _fgc1.metric("Fear & Greed", str(_fg_score), _fg_label)
                 _fgc2.markdown(
-                    f"<div style='padding:12px;background:#f8f9fa;border-radius:8px;"
+                    f"<div style='padding:12px;background:var(--panel-solid);color:var(--text);border-radius:8px;"
                     f"border-left:4px solid {_fg_color};margin-top:8px'>"
                     f"<code>{_bar_s}</code><br>"
                     f"<small>VIX: {_vix_fg:.1f} | SPY 1d: {_spy_pct:+.2f}% | "
@@ -2344,7 +2345,7 @@ if page == "🌍 Market Overview":
                         _arrow = "▲" if _chg_pct >= 0 else "▼"
                         _px_display = f"{_cur_px:,.4f}" if _cur_px < 1 else f"${_cur_px:,.2f}"
                         st.markdown(
-                            f"<div style='background:linear-gradient(135deg,#ffffff,#f0f4f8);border-radius:12px;"
+                            f"<div style='background:var(--panel-solid);color:var(--text);border-radius:12px;"
                             f"padding:20px 28px;margin:12px 0;border-left:5px solid {_chg_color};"
                             f"box-shadow:0 2px 8px rgba(0,0,0,0.08);'>"
                             f"<h2>{_inst_icon} {_disp_name} ({_inst_sym})</h2>"
@@ -5440,7 +5441,7 @@ elif page == "🔮 Live Position Predictor":
 
     # ── Dashboard header ──
     st.markdown(
-        f"<div style='background:linear-gradient(135deg,#ffffff,#f0f4f8);border:2px solid {regime_color};"
+        f"<div style='background:var(--panel-solid);color:var(--text);border:2px solid {regime_color};"
         f"border-radius:12px;padding:18px 24px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,0.08);'>"
         f"<h3>Market Regime: {regime}</h3>"
         f"<p>{regime_detail}</p></div>",
@@ -5684,8 +5685,8 @@ elif page == "🔮 Live Position Predictor":
                 _wl_g_now = bs_greeks(spot if spot else _wl_sl_px, _wl_strike, _wl_T_now, 0.045, _wl_iv, _wl_otype)
 
                 _result_parts = (
-                    f"<div style='background:#fff;border-radius:10px;padding:14px 20px;"
-                    f"border-left:4px solid #0066cc;margin:8px 0;'>"
+                    f"<div style='background:var(--panel-solid);color:var(--text);border-radius:10px;padding:14px 20px;"
+                    f"border-left:4px solid #3d8bff;margin:8px 0;'>"
                     f"<b>Stock ${_wl_sl_px:.2f} on Day {_wl_sl_days}:</b> "
                     f"{_wl_otype.upper()} ${_wl_strike:.0f} = ${_wl_theo:.2f}"
                     f" &nbsp; (Current: ${_wl_g_now['price']:.2f})"
@@ -9150,7 +9151,7 @@ elif page == "⚡ Trade Risk Calculator":
     # ── Result card at slider position ──
     _sim_intr = max(0, sim_target_price - sim_strike) if sim_opt_type == "call" else max(0, sim_strike - sim_target_price)
     st.markdown(
-        f"<div style='background:linear-gradient(135deg,#ffffff,#f0f4f8);border-radius:12px;"
+        f"<div style='background:var(--panel-solid);color:var(--text);border-radius:12px;"
         f"padding:18px 24px;margin:12px 0;border-left:5px solid {_pnl_c};"
         f"box-shadow:0 2px 8px rgba(0,0,0,0.08);'>"
         f"<h3>{sim_ticker} {sim_opt_type.upper()} ${sim_strike:.0f} — "
@@ -10227,7 +10228,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
     _dir_color = "#c62828" if "SELL" in _mkt_direction else "#e65100" if "WEAK" in _mkt_direction or "DOWN" in _mkt_direction else "#2e7d32" if "RALLY" in _mkt_direction or "POSITIVE" in _mkt_direction else "#546e7a"
     _live_badge = f"🌙 <b>Live Price: ${_ep_live_price:.2f}</b> ({_ep_live_src})" if _ep_ah_price else f"Close: ${_ep_spot:.2f}"
     st.markdown(f"""
-    <div style='background:linear-gradient(135deg,#f8fafb,#eef2f7);border-left:5px solid {_dir_color};
+    <div style='background:var(--panel-solid);color:var(--text);border-left:5px solid {_dir_color};
                 padding:14px 20px;border-radius:10px;margin:10px 0;'>
         {_live_badge} &nbsp;|&nbsp;
         <b>Market: {_mkt_direction}</b> &nbsp;|&nbsp;
@@ -10272,7 +10273,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
 
     # Main MC prediction card
     st.markdown(f"""
-    <div style='background:linear-gradient(135deg,#e8f5e9,#c8e6c9);border-left:6px solid {_mc_exp_color};
+    <div style='background:var(--panel-solid);color:var(--text);border-left:6px solid {_mc_exp_color};
                 padding:20px 24px;border-radius:12px;margin:12px 0;box-shadow:0 2px 10px rgba(0,0,0,0.1);'>
         <h3>🎲 Monte Carlo Expected Value ({_mc_n_sims:,} sims · {_mc_method})</h3>
         <div>
@@ -10610,7 +10611,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
 
     _rec_border = "#2e7d32" if "🟢" in _rec_action else "#c62828" if "🔴" in _rec_action else "#e65100"
     st.markdown(f"""
-    <div style='background:linear-gradient(135deg,#ffffff,#f0f4f8);border-left:6px solid {_rec_border};
+    <div style='background:var(--panel-solid);color:var(--text);border-left:6px solid {_rec_border};
                 padding:22px 26px;border-radius:12px;margin:12px 0;box-shadow:0 3px 12px rgba(0,0,0,0.12);'>
         <h3>{_rec_action}</h3>
         <p>{_rec_reason}</p>
