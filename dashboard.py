@@ -2968,8 +2968,8 @@ if page == "🌍 Market Overview":
             def _color_rsi(val):
                 try:
                     v = float(val)
-                    if v > 70: return "background-color: #ffcccc"
-                    if v < 30: return "background-color: #ccffcc"
+                    if v > 70: return "background-color: #ffcccc; color:#111"
+                    if v < 30: return "background-color: #ccffcc; color:#111"
                 except: pass
                 return ""
             styled = _ts_df.style\
@@ -3005,8 +3005,8 @@ if page == "🌍 Market Overview":
             if _vol_rows:
                 _vdf = pd.DataFrame(_vol_rows)
                 def _color_note(val):
-                    if val == "SPIKE": return "background-color: #ffcccc; font-weight: bold"
-                    if val == "HIGH": return "background-color: #fff3cd"
+                    if val == "SPIKE": return "background-color: #ffcccc; color:#111; font-weight: bold"
+                    if val == "HIGH": return "background-color: #fff3cd; color:#111"
                     return ""
                 st.dataframe(_vdf.style.map(_color_note, subset=["Note"]),
                              hide_index=True, use_container_width=True)
@@ -4406,8 +4406,8 @@ elif page == "💼 Portfolio & Suggestions":
     def _color_pnl(val):
         try:
             v=float(val)
-            if v>0: return "background-color:#c8f7c5"
-            if v<0: return "background-color:#f7c5c5"
+            if v>0: return "background-color:#c8f7c5; color:#111"
+            if v<0: return "background-color:#f7c5c5; color:#111"
         except: pass
         return ""
 
