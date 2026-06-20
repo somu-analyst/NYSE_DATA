@@ -9666,9 +9666,248 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
     # ── Analysis Mode selector ──
     _ep_mode = st.radio(
         "Analysis Mode",
-        ["📋 Individual Position", "🏢 All positions — by Ticker", "🌐 All Open Positions"],
+        ["🌅 Next-Day Game Plan", "📋 Individual Position",
+         "🏢 All positions — by Ticker", "🌐 All Open Positions"],
         horizontal=True, key="ep_analysis_mode",
     )
+
+    # ══════════════════════════════════════════════════════════════════
+    #  NEXT-DAY GAME PLAN — whole-portfolio scenario analysis + action plan
+    # ══════════════════════════════════════════════════════════════════
+    if _ep_mode == "🌅 Next-Day Game Plan":
+        st.caption("Whole-portfolio view: what tomorrow's open could do to your positions, the key "
+                   "levels to watch, and a ranked action checklist. Built from your DB (latest close + "
+                   "stored option prices) with Black-Scholes — no waiting on live feeds.")
+        _gp_conn = get_conn()
+        try:
+            _gp_tr = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", _gp_conn)
+        except Exception:
+            _gp_tr = pd.DataFrame()
+        if _gp_tr.empty:
+            st.info("No open positions in the portfolio.")
+            try: _gp_conn.close()
+            except Exception: pass
+            st.stop()
+
+        _R = 0.045
+
+        def _gp_spot(tk):
+            try:
+                row = _gp_conn.execute(
+                    "SELECT close FROM stock_daily WHERE UPPER(ticker)=? ORDER BY "
+                    "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                    (tk.upper(),)).fetchone()
+                return float(row[0]) if row else None
+            except Exception:
+                return None
+
+        def _gp_to_mdy(s):
+            for fmt in ("%Y-%m-%d", "%m-%d-%Y"):
+                try: return datetime.strptime(str(s), fmt).strftime("%m-%d-%Y")
+                except Exception: pass
+            return None
+
+        def _gp_premium(tk, K, exp_mdy, typ):
+            col = "lastPrice_Call_now" if typ == "call" else "lastPrice_Put_now"
+            try:
+                pr = pd.read_sql(
+                    f"SELECT {col} AS last FROM options_change WHERE UPPER(ticker)=? AND strike=? "
+                    "AND expiry_date=? ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)"
+                    "||substr(trade_date_now,4,2) DESC LIMIT 1",
+                    _gp_conn, params=(tk.upper(), float(K), exp_mdy))
+                if not pr.empty and pr.iloc[0]["last"] and float(pr.iloc[0]["last"]) > 0:
+                    return float(pr.iloc[0]["last"])
+            except Exception:
+                pass
+            return None
+
+        # ── Build per-leg analytics ──
+        _legs = []
+        for _, _t in _gp_tr.iterrows():
+            _tk = str(_t["ticker"]).upper()
+            _typ = "call" if str(_t["option_type"]).lower().startswith("c") else "put"
+            _K = float(_t["strike"] or 0)
+            _qty = int(_t["quantity"] or 0)
+            _exp = str(_t["expiry"])
+            _exp_mdy = _gp_to_mdy(_exp)
+            _spot = _gp_spot(_tk)
+            _dte = None
+            for _fmt in ("%Y-%m-%d", "%m-%d-%Y"):
+                try:
+                    _dte = (datetime.strptime(_exp, _fmt) - datetime.now()).days; break
+                except Exception:
+                    pass
+            if _spot is None or _dte is None or _K <= 0 or _qty == 0:
+                continue
+            _T = max(_dte, 0) / 365.0
+            _entry = float(_t["entry_price"] or 0)
+            _prem = _gp_premium(_tk, _K, _exp_mdy, _typ)
+            _iv = _implied_vol(_prem, _spot, _K, _T, _R, _typ) if (_prem and _T > 0) else (float(_t["entry_iv"] or 0) or 0.30)
+            _g = bs_greeks(_spot, _K, _T, _R, _iv, _typ) if _T > 0 else {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "price": (_prem or _entry)}
+            _cur = _prem if _prem else _g.get("price", _entry)
+            _m = _qty * 100                                   # signed contract multiplier
+            _side = "short" if _qty < 0 else "long"
+            _be = (_K + _entry) if _typ == "call" else (_K - _entry)   # long breakeven ref
+            _legs.append({
+                "ticker": _tk, "typ": _typ, "K": _K, "qty": _qty, "side": _side,
+                "exp": _exp, "exp_mdy": _exp_mdy, "dte": _dte, "spot": _spot,
+                "iv": _iv, "entry": _entry, "cur": _cur, "g": _g, "m": _m, "be": _be,
+                "pnl": (_cur - _entry) * _m,
+                "pos_delta": _g["delta"] * _m, "pos_theta": _g["theta"] * _m,
+                "pos_vega": _g["vega"] * _m, "pos_gamma": _g["gamma"] * _m,
+                "ddelta_1pct": _g["delta"] * _m * _spot * 0.01,
+            })
+
+        if not _legs:
+            st.warning("Couldn't price any positions (missing spot/expiry data).")
+            try: _gp_conn.close()
+            except Exception: pass
+            st.stop()
+
+        # ── Portfolio Greeks strip ──
+        _net_ddelta = sum(l["ddelta_1pct"] for l in _legs)
+        _net_theta = sum(l["pos_theta"] for l in _legs)
+        _net_vega = sum(l["pos_vega"] for l in _legs)
+        _net_pnl = sum(l["pnl"] for l in _legs)
+        _gross_risk = sum(abs(l["cur"] * l["m"]) for l in _legs if l["side"] == "long") \
+            + sum(l["entry"] * abs(l["m"]) for l in _legs if l["side"] == "short")
+        st.markdown("#### 🧮 Portfolio Greeks (next-day exposure)")
+        _pg = st.columns(4)
+        _pg[0].metric("Net Δ per +1% move", f"${_net_ddelta:,.0f}",
+                      "bullish" if _net_ddelta >= 0 else "bearish",
+                      delta_color="normal" if _net_ddelta >= 0 else "inverse")
+        _pg[1].metric("Theta / day", f"${_net_theta:,.0f}",
+                      "you collect" if _net_theta >= 0 else "decay drag",
+                      delta_color="normal" if _net_theta >= 0 else "inverse")
+        _pg[2].metric("Vega per +1 vol pt", f"${_net_vega:,.0f}")
+        _pg[3].metric("Open P&L", f"${_net_pnl:,.0f}",
+                      delta_color="normal" if _net_pnl >= 0 else "inverse")
+        st.caption(f"Net Δ: a market +1% tomorrow ≈ **${_net_ddelta:,.0f}** P&L. "
+                   f"Time decay runs **${_net_theta:,.0f}/day**. "
+                   f"A +1 vol-point IV change ≈ **${_net_vega:,.0f}**.")
+
+        # ── Next-day market-shock P&L grid ──
+        st.markdown("#### 📉 Tomorrow's scenarios — portfolio P&L vs a market move")
+        _shocks = [-0.03, -0.02, -0.01, -0.005, 0.0, 0.005, 0.01, 0.02, 0.03]
+        _scn_rows = []
+        for s in _shocks:
+            tot = 0.0
+            for l in _legs:
+                ns = l["spot"] * (1 + s)
+                t1 = max(l["dte"] - 1, 0) / 365.0
+                iv_s = max(l["iv"] * (1 - 2.0 * s), 0.05)     # vol rises when market drops
+                np_ = bs_greeks(ns, l["K"], t1, _R, iv_s, l["typ"]).get("price", l["cur"]) if t1 > 0 else \
+                    (max(ns - l["K"], 0) if l["typ"] == "call" else max(l["K"] - ns, 0))
+                tot += (np_ - l["cur"]) * l["m"]
+            _scn_rows.append({"Market move": f"{s*100:+.1f}%", "Portfolio P&L $": round(tot),
+                              "_s": s, "_pnl": tot})
+        _scn = pd.DataFrame(_scn_rows)
+        _sc1, _sc2 = st.columns([2, 3])
+        with _sc1:
+            _disp = _scn[["Market move", "Portfolio P&L $"]].copy()
+            st.dataframe(_disp, hide_index=True, use_container_width=True,
+                         column_config={"Portfolio P&L $": st.column_config.NumberColumn(format="$%d")})
+        with _sc2:
+            _sfig = go.Figure(go.Bar(
+                x=_scn["Market move"], y=_scn["_pnl"],
+                marker_color=["#ff5c6c" if v < 0 else "#00e676" for v in _scn["_pnl"]]))
+            _sfig.update_layout(template="plotly_dark", height=300,
+                                title="Next-day P&L by market move (1 day of decay + vol shift)",
+                                xaxis_title="Market move", yaxis_title="P&L $",
+                                margin=dict(t=42, b=10))
+            st.plotly_chart(_sfig, use_container_width=True)
+        _down = next(r["_pnl"] for r in _scn_rows if abs(r["_s"] + 0.02) < 1e-9)
+        _up = next(r["_pnl"] for r in _scn_rows if abs(r["_s"] - 0.02) < 1e-9)
+        st.caption(f"A **−2%** gap tomorrow ≈ **${_down:,.0f}**; a **+2%** gap ≈ **${_up:,.0f}**. "
+                   "Includes one day of theta and a simple vol bump on down moves.")
+
+        # ── Per-ticker expected move + key levels ──
+        st.markdown("#### 🎯 Per-ticker expected move & key levels for tomorrow")
+        _seen = {}
+        for l in _legs:
+            _seen.setdefault(l["ticker"], l)
+        for _tk, l in _seen.items():
+            _em = l["spot"] * l["iv"] * (1 / 252.0) ** 0.5
+            try:
+                _chain = pd.read_sql(
+                    "SELECT strike, openInt_Call_now, openInt_Put_now, R1, S1 FROM options_change "
+                    "WHERE UPPER(ticker)=? AND expiry_date=?",
+                    _gp_conn, params=(_tk, l["exp_mdy"]))
+            except Exception:
+                _chain = pd.DataFrame()
+            _w = compute_walls(_chain, l["spot"]) if not _chain.empty else {}
+            _r1 = _s1 = None
+            if not _chain.empty:
+                try:
+                    _r1 = float(_chain["R1"].dropna().iloc[0]); _s1 = float(_chain["S1"].dropna().iloc[0])
+                except Exception:
+                    pass
+            _parts = [f"**{_tk}** spot **${l['spot']:.2f}** · 1-day expected move **±${_em:.2f}** "
+                      f"(${l['spot']-_em:.2f} – ${l['spot']+_em:.2f}, ≈{_em/l['spot']*100:.1f}%)"]
+            _lv = []
+            if _w.get("call_wall"): _lv.append(f"call wall ${_w['call_wall']:.0f}")
+            if _w.get("put_wall"): _lv.append(f"put wall ${_w['put_wall']:.0f}")
+            if _r1: _lv.append(f"R1 ${_r1:.0f}")
+            if _s1: _lv.append(f"S1 ${_s1:.0f}")
+            if _lv:
+                _parts.append("Levels: " + " · ".join(_lv))
+            st.markdown("- " + "  \n  ".join(_parts))
+
+        # ── Per-leg next-day action table ──
+        st.markdown("#### 🧭 Per-position action plan")
+        _rows = []
+        _checklist = []
+        for l in _legs:
+            _moneyness = (("ITM" if l["spot"] > l["K"] else "OTM") if l["typ"] == "call"
+                          else ("ITM" if l["spot"] < l["K"] else "OTM"))
+            _pnl_pct = ((l["cur"] - l["entry"]) / l["entry"] * 100 * (1 if l["qty"] > 0 else -1)) if l["entry"] else 0
+            acts = []
+            if l["dte"] <= 7:
+                acts.append(f"{l['dte']}DTE — gamma/theta spike, decide now")
+            elif l["dte"] <= 21:
+                acts.append(f"{l['dte']}DTE — 21-day rule, plan exit/roll")
+            if l["side"] == "short" and _moneyness == "ITM":
+                acts.append("short & ITM — assignment risk, roll or close")
+            if _pnl_pct >= 50:
+                acts.append("up ≥50% — take profit / trim")
+            elif _pnl_pct <= -50:
+                acts.append("down ≥50% — cut or roll")
+            if l["side"] == "long" and l["dte"] > 21 and -50 < _pnl_pct < 50:
+                acts.append("hold; trail vs key level")
+            action = "; ".join(acts) if acts else "hold & monitor"
+            _rows.append({
+                "Position": f"{l['side']} {abs(l['qty'])}× {l['ticker']} ${l['K']:.0f}{l['typ'][0].upper()}",
+                "Exp": l["exp"][:10], "DTE": l["dte"], "Spot": round(l["spot"], 2),
+                "Money": _moneyness, "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
+                "P&L %": round(_pnl_pct), "P&L $": round(l["pnl"]),
+                "Θ/day $": round(l["pos_theta"]), "Action": action,
+            })
+            if action != "hold & monitor":
+                _checklist.append(f"**{l['ticker']} ${l['K']:.0f}{l['typ'][0].upper()}** ({l['side']}, {l['dte']}DTE): {action}")
+        st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True,
+                     column_config={"P&L %": st.column_config.NumberColumn(format="%d%%")})
+
+        # ── Morning checklist ──
+        st.markdown("#### ✅ Tomorrow's open — action checklist")
+        if _checklist:
+            for c in _checklist:
+                st.markdown(f"- {c}")
+        else:
+            st.markdown("- No urgent actions — positions are in good shape; monitor the key levels above.")
+        if _net_ddelta > 0:
+            st.markdown(f"- **Net long bias** (${_net_ddelta:,.0f}/+1%). If you want neutral into the open, "
+                        "a small index/put hedge offsets a gap-down.")
+        elif _net_ddelta < 0:
+            st.markdown(f"- **Net short bias** (${_net_ddelta:,.0f}/+1%). A gap-up hurts — consider a call hedge "
+                        "or trimming shorts.")
+        if _net_theta < 0:
+            st.markdown(f"- You're paying **${abs(_net_theta):,.0f}/day** in decay — long premium needs the move soon.")
+        st.caption("Educational scenario analysis from your DB + Black-Scholes; not financial advice. "
+                   "Real fills, IV shifts and gaps will differ.")
+
+        try: _gp_conn.close()
+        except Exception: pass
+        st.stop()
 
     # ──────────────────────────────────────────────────────────────
     # BATCH HELPER: fetch current option mid-price from yfinance
