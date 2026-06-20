@@ -8714,7 +8714,7 @@ sell stock as price rises toward the strike to stay delta-neutral. This creates 
 
 *Wall held = spot stayed below call wall for 5 days after signal*
 
-**Sources:** SpotGamma, Cem Karsan (@jam\_croissant), tastytrade, r/thetagang, optionAlpha 0DTE studies
+**Sources:** SpotGamma, Cem Karsan (@jam\\_croissant), tastytrade, r/thetagang, optionAlpha 0DTE studies
 """)
 
     _ga_conn.close()
@@ -12583,8 +12583,9 @@ if page == "📡 Macro/Event Hub":
 
     if _tbmod is not None:
         _hub_conn = get_conn()
-        _tb_brief, _tb_opex, _tb_sq, _tb_gex, _tb_van, _tb_ev, _tb_jr, _tb_mac = st.tabs(
-            ["☀️ Briefing", "🗓️ OpEx", "🩳 Squeeze", "📐 GEX", "🌀 Vanna", "🌍 Events", "📓 Journal", "📊 Macro"])
+        _tb_brief, _tb_opex, _tb_sq, _tb_gex, _tb_van, _tb_mom, _tb_ev, _tb_jr, _tb_mac = st.tabs(
+            ["☀️ Briefing", "🗓️ OpEx", "🩳 Squeeze", "📐 GEX", "🌀 Vanna", "🚀 Momentum",
+             "🌍 Events", "📓 Journal", "📊 Macro"])
 
         with _tb_brief:
             st.caption("Daily macro brief — optimistic / pessimistic / balanced, with live news.")
@@ -12633,6 +12634,82 @@ if page == "📡 Macro/Event Hub":
                     _render_tg(_r); st.markdown("---")
             except Exception as e:
                 st.error(f"Vanna error: {e}")
+
+        with _tb_mom:
+            st.caption("Full-universe 12-1 cross-sectional momentum (Jegadeesh-Titman / AQR). "
+                       "Ranks every name in your DB; top decile = trend longs, bottom = shorts/avoid.")
+            _mc1, _mc2, _mc3 = st.columns([1.4, 1, 1])
+            with _mc1:
+                if st.button("🔄 Recompute today's ranks", key="hub_mom_btn"):
+                    with st.spinner("Ranking the whole universe (~1 min)…"):
+                        _ms, _mcnt, _masof2 = _tbmod.compute_universe_momentum(force=True)
+                    st.success(f"{_ms}: {_mcnt} names ranked (as of {_masof2}).")
+                    st.rerun()
+            _mdf, _masof = _tbmod.load_momentum_ranks(_hub_conn)
+            if _mdf is None or _mdf.empty:
+                st.info("No snapshot yet — click **Recompute** to build the first one.")
+            else:
+                import datetime as _dtm
+                _is_today = (_masof == _dtm.date.today().strftime("%Y-%m-%d"))
+                with _mc2:
+                    st.metric("Universe", f"{len(_mdf)} names")
+                with _mc3:
+                    st.metric("As of", _masof, delta=("today" if _is_today else "stale"),
+                              delta_color=("normal" if _is_today else "inverse"))
+                try:
+                    _phl = [t.upper() for t in pd.read_sql(
+                        "SELECT DISTINCT UPPER(ticker) tk FROM trades WHERE status='OPEN'",
+                        _hub_conn)["tk"].tolist()]
+                except Exception:
+                    _phl = []
+
+                _disp = _mdf[["mom_rank", "ticker", "ret_12_1", "ret_6_1", "ret_1m",
+                              "above200", "decile"]].copy()
+                _disp.columns = ["Rank", "Ticker", "12-1 %", "6-1 %", "1m %", ">200DMA", "Decile"]
+                _disp[">200DMA"] = _disp[">200DMA"].map({1: "✅", 0: "❌"})
+                _mom_cc = {
+                    "12-1 %": st.column_config.NumberColumn(format="%+.0f%%"),
+                    "6-1 %": st.column_config.NumberColumn(format="%+.0f%%"),
+                    "1m %": st.column_config.NumberColumn(format="%+.0f%%"),
+                }
+
+                if _phl:
+                    _mine = _disp[_disp["Ticker"].isin(_phl)]
+                    if not _mine.empty:
+                        st.markdown("##### ⭐ Your open positions, ranked")
+                        st.dataframe(_mine, hide_index=True, use_container_width=True,
+                                     column_config=_mom_cc)
+
+                _lc, _rc = st.columns(2)
+                with _lc:
+                    st.markdown("##### 🟢 Top momentum — long bias")
+                    st.dataframe(_disp.head(12), hide_index=True, use_container_width=True,
+                                 column_config=_mom_cc)
+                with _rc:
+                    st.markdown("##### 🔴 Bottom momentum — short / avoid")
+                    st.dataframe(_disp.tail(12).iloc[::-1], hide_index=True,
+                                 use_container_width=True, column_config=_mom_cc)
+
+                try:
+                    import plotly.graph_objects as _go
+                    _sm = _mdf.sort_values("ret_12_1")
+                    _cols = ["#1b5e20" if d <= 3 else ("#b71c1c" if d >= 8 else "#90a4ae")
+                             for d in _sm["decile"]]
+                    _fig = _go.Figure(_go.Bar(
+                        x=_sm["ret_12_1"], y=_sm["ticker"], orientation="h",
+                        marker_color=_cols,
+                        hovertemplate="%{y}: %{x:+.0f}%<extra></extra>"))
+                    _fig.update_layout(
+                        height=max(420, len(_sm) * 13),
+                        title="12-1 momentum by ticker (green = top decile, red = bottom)",
+                        xaxis_title="12-1 return %", margin=dict(l=10, r=10, t=40, b=10),
+                        showlegend=False)
+                    st.plotly_chart(_fig, use_container_width=True)
+                except Exception as _e:
+                    st.caption(f"(chart unavailable: {_e})")
+                st.caption("Factor logic: buy past 12-month winners (skipping the most recent month "
+                           "to avoid short-term reversal). Pairs with the Risk Regime tab — press "
+                           "longs when RISK-ON, lighten when RISK-OFF.")
 
         with _tb_ev:
             st.caption("Macro/geopolitical event → 1st/2nd/3rd-order liquid trades + hedge.")
