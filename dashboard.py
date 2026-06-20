@@ -579,7 +579,40 @@ button[data-baseweb="tab"][aria-selected="true"]{ color:#fff!important;
   color:var(--muted)!important; font-size:.82rem!important; text-transform:uppercase; letter-spacing:.5px;
 }
 [data-testid="stExpander"]{ background:var(--panel); border:1px solid var(--border); border-radius:12px; }
-[data-testid="stAlert"]{ border-radius:12px; }
+[data-testid="stExpander"] summary{ color:var(--text)!important; }
+[data-testid="stExpander"] *{ color:var(--text); }
+/* ── make every native surface dark so text is always readable ── */
+[data-testid="stMarkdownContainer"], .stMarkdown, p, li, label,
+.stRadio, .stCheckbox, [data-testid="stWidgetLabel"]{ color:var(--text); }
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] *{ color:var(--muted)!important; }
+/* text / number inputs */
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"]{ background:#0f1626!important; }
+[data-baseweb="input"] input, [data-baseweb="base-input"] input, textarea,
+.stTextInput input, .stNumberInput input, [data-testid="stDateInput"] input{
+  background:#0f1626!important; color:var(--text)!important;
+}
+input::placeholder, textarea::placeholder{ color:#62748f!important; }
+/* selectbox / multiselect control + its text */
+[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div{
+  background:#0f1626!important; border-color:var(--border)!important;
+}
+[data-baseweb="select"] *{ color:var(--text)!important; }
+/* dropdown / autocomplete popover menus (rendered at body root) */
+[data-baseweb="popover"] [role="listbox"], [data-baseweb="menu"],
+[data-baseweb="popover"] ul, [data-baseweb="popover"] > div{ background:#0f1626!important; }
+[role="option"]{ background:#0f1626!important; color:var(--text)!important; }
+[role="option"]:hover, [role="option"][aria-selected="true"]{ background:rgba(61,139,255,.20)!important; }
+/* alerts (st.info / success / warning / error) */
+[data-testid="stAlert"]{ border-radius:12px; background:var(--panel-solid)!important; border:1px solid var(--border); }
+[data-testid="stAlert"] *{ color:var(--text)!important; }
+/* sliders, code, static tables */
+code, kbd{ background:#0f1626!important; color:#9ad1ff!important; }
+pre{ background:#0f1626!important; }
+[data-testid="stTable"] td, [data-testid="stTable"] th,
+table td, table th{ color:var(--text)!important; border-color:var(--border)!important; }
+/* tabs panel + toggle */
+[data-baseweb="tab-panel"]{ background:transparent; }
 .section-header{ font-size:1.05rem; font-weight:700; color:var(--accent); border-bottom:1px solid var(--border); padding-bottom:6px; margin:20px 0 12px; letter-spacing:.3px; }
 .card{ background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:16px; margin-bottom:12px; backdrop-filter:blur(10px); }
 .news-card{ background:var(--panel-solid); border-left:3px solid var(--accent); padding:10px 14px; margin:4px 0; border-radius:0 10px 10px 0; }
@@ -644,7 +677,30 @@ button[data-baseweb="tab"][aria-selected="true"]{ color:var(--accent)!important;
   color:var(--muted)!important; font-size:.82rem!important; text-transform:uppercase; letter-spacing:.5px;
 }
 [data-testid="stExpander"]{ background:#fff; border:1px solid var(--border); border-radius:12px; }
-[data-testid="stAlert"]{ border-radius:12px; }
+[data-testid="stExpander"] summary{ color:var(--text)!important; }
+[data-testid="stExpander"] *{ color:var(--text); }
+/* ── force light surfaces (overrides the dark config base when toggled) ── */
+[data-testid="stMarkdownContainer"], .stMarkdown, p, li, label,
+.stRadio, .stCheckbox, [data-testid="stWidgetLabel"]{ color:var(--text); }
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] *{ color:var(--muted)!important; }
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"]{ background:#fff!important; }
+[data-baseweb="input"] input, [data-baseweb="base-input"] input, textarea,
+.stTextInput input, .stNumberInput input, [data-testid="stDateInput"] input{ background:#fff!important; color:var(--text)!important; }
+input::placeholder, textarea::placeholder{ color:#94a3b8!important; }
+[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div{ background:#fff!important; border-color:var(--border)!important; }
+[data-baseweb="select"] *{ color:var(--text)!important; }
+[data-baseweb="popover"] [role="listbox"], [data-baseweb="menu"],
+[data-baseweb="popover"] ul, [data-baseweb="popover"] > div{ background:#fff!important; }
+[role="option"]{ background:#fff!important; color:var(--text)!important; }
+[role="option"]:hover, [role="option"][aria-selected="true"]{ background:rgba(79,70,229,.10)!important; }
+[data-testid="stAlert"]{ border-radius:12px; background:#fff!important; border:1px solid var(--border); }
+[data-testid="stAlert"] *{ color:var(--text)!important; }
+code, kbd{ background:#eef0f6!important; color:#4f46e5!important; }
+pre{ background:#f1f3f8!important; }
+[data-testid="stTable"] td, [data-testid="stTable"] th,
+table td, table th{ color:var(--text)!important; border-color:var(--border)!important; }
+[data-baseweb="tab-panel"]{ background:transparent; }
 .section-header{ font-size:1.05rem; font-weight:700; color:var(--accent); border-bottom:2px solid var(--accent); padding-bottom:6px; margin:20px 0 12px; }
 .card{ background:#fff; border:1px solid var(--border); border-radius:14px; padding:16px; margin-bottom:12px; box-shadow:0 1px 3px rgba(16,24,40,.05); }
 .news-card{ background:#fff; border-left:3px solid var(--accent); padding:10px 14px; margin:4px 0; border-radius:0 10px 10px 0; box-shadow:0 1px 2px rgba(16,24,40,.04); }
