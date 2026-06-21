@@ -1552,8 +1552,24 @@ _NEWS_NEG = ("drop", "fall", "crash", "sell-off", "bear", "loss", "cut", "slash"
              "probe", "lawsuit", "halt", "slump", "fraud", "ban", "selloff", "glut")
 
 
+# Words/phrases that dominate — if present, the headline reads negative regardless of any
+# upbeat keyword (handles "deal paused", "Hormuz closed", "talks collapse", geopolitics, etc.)
+_NEG_OVERRIDE = (
+    "paused", "pause", "halt", "stall", "collapse", "delay", "fail", "fell through",
+    "off the table", "blocked", "breakdown", "no deal", "scrapped", "called off",
+    "closure", "closed", "shut", "blockade", "hormuz", "strait", "embargo", "sanction",
+    "escalat", "conflict", " war", "attack", "strike on", "missile", "disrupt", "shortage",
+    "glut", "probe", "lawsuit", "fraud", "recall", "downgrade", "plunge", "crash",
+    "selloff", "sell-off", "tariff", "ban ", "slump", "tumble",
+)
+_NEG_FLIP = tuple(f"{neg} {pw}" for neg in ("no", "not", "without", "never", "denies", "denied")
+                  for pw in ("deal", "beat", "gain", "growth", "upgrade", "demand", "approval"))
+
+
 def _headline_tone(title):
     t = str(title).lower()
+    if any(w in t for w in _NEG_OVERRIDE) or any(ph in t for ph in _NEG_FLIP):
+        return -1                                  # decisive negative / disruption / negation
     p = sum(1 for w in _NEWS_POS if w in t)
     n = sum(1 for w in _NEWS_NEG if w in t)
     return 1 if p > n else (-1 if n > p else 0)
