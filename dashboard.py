@@ -1887,6 +1887,133 @@ def _edgar_load(cik):
         conn.close()
 
 
+# ── Global Opportunities: curated regions / themes / country sectors (proxy ETFs) ──
+_GLOBAL_REGIONS = {
+    "🇧🇷 Brazil": ("EWZ", "Brazil large-caps — commodities, banks, cheap valuations", "Brazil investment stocks commodities Lula rates"),
+    "🇯🇵 Japan": ("EWJ", "Japan — corporate reform, end of deflation, buybacks", "Japan stocks investment BOJ reform buybacks"),
+    "🇮🇳 India": ("INDA", "India — fastest-growing major economy, manufacturing push", "India stocks investment manufacturing growth"),
+    "🇨🇳 China": ("FXI", "China — deep value, stimulus-dependent, policy risk", "China stimulus stocks investment property"),
+    "🌎 LatAm": ("ILF", "Latin America — commodities + nearshoring beneficiaries", "Latin America investment commodities nearshoring"),
+    "🇲🇽 Mexico": ("EWW", "Mexico — #1 nearshoring winner from US-China split", "Mexico nearshoring investment manufacturing"),
+    "🇻🇳 Vietnam": ("VNM", "Vietnam — supply-chain shift out of China", "Vietnam manufacturing investment supply chain"),
+    "🇰🇷 Korea": ("EWY", "Korea — memory chips, shipbuilding, value-up reform", "South Korea chips shipbuilding investment"),
+    "🇹🇼 Taiwan": ("EWT", "Taiwan — the AI semiconductor heart (TSMC)", "Taiwan semiconductor TSMC investment"),
+    "🇮🇩 Indonesia": ("EIDO", "Indonesia — nickel/EV supply chain, young demographics", "Indonesia nickel EV investment"),
+    "🇸🇦 Gulf/Saudi": ("KSA", "Saudi — giga-projects, diversification from oil", "Saudi Gulf giga project investment"),
+    "🇪🇺 Europe": ("VGK", "Europe — defense rearmament, cheap vs US", "Europe stocks defense investment"),
+}
+_GLOBAL_THEMES = {
+    "🌾 Agriculture/Soft": ("DBA", "Farm commodities — food security, weather, EM demand", "farmland agriculture investment food security Brazil"),
+    "🚜 Agribusiness": ("MOO", "Fertilizer, equipment, seeds — the farmland value chain", "agribusiness fertilizer farmland investment"),
+    "🏞 Farmland REITs": ("LAND", "Direct US farmland (Gladstone) — inflation hedge, rents", "farmland REIT investment Gladstone returns"),
+    "☢️ Uranium/Nuclear": ("URA", "Nuclear renaissance to power AI + decarbonization", "uranium nuclear power investment data center"),
+    "🔌 Power & Grid (AI)": ("GRID", "Electrification + AI data-center power demand", "AI data center power grid electricity investment"),
+    "🥉 Copper/Materials": ("COPX", "Copper — structural deficit, AI + electrification", "copper supply deficit AI investment"),
+    "🛡 Defense": ("ITA", "Global rearmament — sustained budget growth", "defense spending rearmament investment"),
+    "💧 Water": ("PHO", "Water scarcity + infrastructure renewal", "water infrastructure scarcity investment"),
+    "🏗 Reshoring/Infra": ("PAVE", "US reshoring + infrastructure buildout", "US infrastructure reshoring investment"),
+    "🔐 Cybersecurity": ("CIBR", "Rising cyber spend, AI-driven threats", "cybersecurity spending investment"),
+    "🤖 Robotics/Automation": ("BOTZ", "Automation + physical AI / humanoids", "robotics automation humanoid investment"),
+    "🥇 Gold & Miners": ("GDX", "Central-bank buying, debasement hedge", "gold central bank buying investment"),
+    "₿ Crypto/Bitcoin": ("IBIT", "Institutional adoption via spot ETFs", "bitcoin crypto institutional ETF investment"),
+}
+_COUNTRY_SECTORS = {
+    "🇺🇸 USA — future sectors": [("AI Semis", "SMH"), ("Power & Nuclear", "URA"), ("Reshoring/Infra", "PAVE"),
+                                  ("Defense", "ITA"), ("Biotech", "XBI"), ("Cybersecurity", "CIBR")],
+    "🇮🇳 India — future sectors": [("Broad India", "INDA"), ("India Small-Cap", "SMIN"), ("Earnings-weighted", "EPI"),
+                                   ("Infosys (IT)", "INFY"), ("ICICI Bank", "IBN"), ("HDFC Bank", "HDB")],
+    "🌏 Other EM — themes": [("Mexico nearshoring", "EWW"), ("Vietnam mfg", "VNM"),
+                             ("Indonesia nickel", "EIDO"), ("Saudi giga-projects", "KSA")],
+}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _global_prices():
+    """Batch-download ~9mo of closes for all global proxy tickers (+SPY). One network call."""
+    tks = {"SPY"}
+    for d in (_GLOBAL_REGIONS, _GLOBAL_THEMES):
+        for v in d.values():
+            tks.add(v[0])
+    for arr in _COUNTRY_SECTORS.values():
+        for _, t in arr:
+            tks.add(t)
+    tks = sorted(tks)
+    try:
+        data = yf.download(tks, period="9mo", interval="1d", auto_adjust=True,
+                           progress=False, threads=True, group_by="ticker")
+    except Exception:
+        return {}
+    out = {}
+    for t in tks:
+        try:
+            s = (data[t]["Close"] if len(tks) > 1 else data["Close"]).dropna()
+            if len(s) > 20:
+                out[t] = s
+        except Exception:
+            continue
+    return out
+
+
+def _flow_signal(tk, prices):
+    """Money-flow proxy: momentum (3m/6m) + relative strength vs SPY + 52w-high proximity."""
+    s = prices.get(tk); spy = prices.get("SPY")
+    if s is None or len(s) < 40:
+        return None
+    px = float(s.iloc[-1])
+
+    def _ret(n):
+        return (px / float(s.iloc[-n]) - 1) * 100 if len(s) > n else 0.0
+
+    r1, r3, r6 = _ret(21), _ret(63), _ret(126)
+    near = px / float(s.max()) * 100
+    rs = 0.0
+    if spy is not None and len(spy) > 63:
+        rs = r3 - (float(spy.iloc[-1]) / float(spy.iloc[-63]) - 1) * 100
+    score = (1 if r3 > 0 else -1) + (1 if r6 > 0 else -1) + (1 if rs > 0 else -1) \
+            + (1 if near > 90 else (-1 if near < 75 else 0))
+    label = "🟢 Inflow" if score >= 2 else "🔴 Outflow" if score <= -2 else "🟡 Neutral"
+    return {"px": px, "r1": r1, "r3": r3, "r6": r6, "rs": rs, "near": near, "label": label, "score": score}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _theme_news(query, n=3):
+    """Live thematic headlines (Google News RSS) with context-aware tone."""
+    try:
+        import feedparser, urllib.parse as _u, html as _h, time as _t
+        fp = feedparser.parse("https://news.google.com/rss/search?q=" + _u.quote(query) +
+                              "&hl=en-US&gl=US&ceid=US:en")
+        out = []
+        for e in fp.entries[:n]:
+            title = _h.unescape(e.get("title", "")).strip()
+            pp = e.get("published_parsed", None)
+            out.append({"title": title, "link": e.get("link", ""),
+                        "tone": _headline_tone(title),
+                        "when": _t.strftime("%d%b", pp) if pp else ""})
+        return out
+    except Exception:
+        return []
+
+
+def _render_global_card(label, proxy, thesis, query, prices, expanded=False):
+    sig = _flow_signal(proxy, prices)
+    _hdr = f"{label} · {proxy}"
+    if sig:
+        _hdr += f" · {sig['label']} · 3m {sig['r3']:+.0f}%"
+    with st.expander(_hdr, expanded=expanded):
+        if sig:
+            _c = st.columns(4)
+            _c[0].metric("Price", f"${sig['px']:.2f}", f"1m {sig['r1']:+.0f}%")
+            _c[1].metric("3m / 6m", f"{sig['r3']:+.0f}% / {sig['r6']:+.0f}%")
+            _c[2].metric("vs SPY (3m)", f"{sig['rs']:+.0f}%",
+                         "leading" if sig['rs'] > 0 else "lagging",
+                         delta_color="normal" if sig['rs'] > 0 else "inverse")
+            _c[3].metric("% of 52w high", f"{sig['near']:.0f}%")
+        st.caption("💡 " + thesis)
+        for it in _theme_news(query):
+            e = "🟢" if it["tone"] > 0 else ("🔴" if it["tone"] < 0 else "⚪")
+            st.markdown(f"- {e} [{it['title']}]({it['link']}) · _{it['when']}_")
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def _shares_outstanding(ticker):
     """Shares outstanding via yfinance (for % of company). Cached 24h. None on failure."""
@@ -2654,7 +2781,8 @@ with st.sidebar:
             "🧠 Smart Money Hub",
             "📰 News & Calendar",
         ],
-        "📡 Macro / Event Hub": [
+        "🌍 Global / Macro": [
+            "🌍 Global Opportunities",
             "📡 Macro/Event Hub",
         ],
     }
@@ -14351,3 +14479,92 @@ if page == "📡 Macro/Event Hub":
             _hub_conn.close()
         except Exception:
             pass
+
+
+# ===================================================================
+# ──  PAGE: GLOBAL OPPORTUNITIES (regions / themes / country sectors)
+# ===================================================================
+if page == "🌍 Global Opportunities":
+    _page_header("🌍 Global Opportunities")
+    st.caption("Where capital is flowing — by region, theme, and country sector. **Flow signal** = price "
+               "momentum (3m/6m) + relative strength vs SPY + proximity to 52-week high (a free proxy for "
+               "fund flows). News is pulled live with sentiment. Curated proxy ETFs — educational, not advice.")
+    with st.spinner("Loading global proxies (one batch download)…"):
+        _gp = _global_prices()
+    if not _gp:
+        st.warning("Could not load global price data (network/yfinance). Try Refresh.")
+    else:
+        _gt1, _gt2, _gt3, _gt4 = st.tabs(
+            ["🌎 Regions", "🚀 Themes & Sectors", "🏳️ Country Future Sectors", "📡 Research Feed"])
+
+        def _flow_leaderboard(mapping, title):
+            rows = []
+            for lbl, (proxy, _desc, _q) in mapping.items():
+                sig = _flow_signal(proxy, _gp)
+                if sig:
+                    rows.append({"Name": lbl, "Proxy": proxy, "Flow": sig["label"],
+                                 "3m %": round(sig["r3"]), "6m %": round(sig["r6"]),
+                                 "vs SPY": round(sig["rs"]), "% 52w hi": round(sig["near"]),
+                                 "_score": sig["score"]})
+            if rows:
+                _df = pd.DataFrame(rows).sort_values(["_score", "3m %"], ascending=False).drop(columns="_score")
+                st.markdown(f"**🏁 {title} — strongest inflows first**")
+                st.dataframe(_df, hide_index=True, use_container_width=True,
+                             column_config={c: st.column_config.NumberColumn(format="%d%%")
+                                            for c in ["3m %", "6m %", "vs SPY", "% 52w hi"]})
+
+        with _gt1:
+            _flow_leaderboard(_GLOBAL_REGIONS, "Regions")
+            st.markdown("---")
+            _ordered = sorted(_GLOBAL_REGIONS.items(),
+                              key=lambda kv: (_flow_signal(kv[1][0], _gp) or {}).get("score", -9), reverse=True)
+            for _lbl, (_px, _desc, _q) in _ordered:
+                _render_global_card(_lbl, _px, _desc, _q, _gp)
+
+        with _gt2:
+            _flow_leaderboard(_GLOBAL_THEMES, "Themes")
+            st.markdown("---")
+            _ordered = sorted(_GLOBAL_THEMES.items(),
+                              key=lambda kv: (_flow_signal(kv[1][0], _gp) or {}).get("score", -9), reverse=True)
+            for _lbl, (_px, _desc, _q) in _ordered:
+                _render_global_card(_lbl, _px, _desc, _q, _gp)
+
+        with _gt3:
+            for _country, _arr in _COUNTRY_SECTORS.items():
+                st.markdown(f"### {_country}")
+                for _name, _tk in _arr:
+                    _render_global_card(_name, _tk, f"{_country.split('—')[0].strip()} — {_name}",
+                                        f"{_country.split('—')[0].strip()} {_name} investment opportunity", _gp)
+
+        with _gt4:
+            st.markdown("#### 📡 Research & idea feed")
+            st.caption("Free macro/thematic feeds with sentiment. Add your own RSS/blog URLs below "
+                       "(Substack, Morningstar, a hidden blog) — they persist for this session.")
+            _DEFAULT_FEEDS = {
+                "🌐 Global capital flows": "global capital flows where to invest 2026",
+                "🌾 Farmland / real assets": "farmland real assets investment institutional",
+                "🇮🇳 India opportunity": "India investment opportunity sectors 2026",
+                "🏭 Reshoring / supply chain": "reshoring nearshoring supply chain investment",
+                "⚡ AI power & energy": "AI data center power energy investment",
+            }
+            for _name, _q in _DEFAULT_FEEDS.items():
+                with st.expander(_name, expanded=False):
+                    for it in _theme_news(_q, n=5):
+                        e = "🟢" if it["tone"] > 0 else ("🔴" if it["tone"] < 0 else "⚪")
+                        st.markdown(f"- {e} [{it['title']}]({it['link']}) · _{it['when']}_")
+            st.markdown("---")
+            _custom = st.text_input("Add an RSS feed URL (e.g. a Substack/Morningstar/blog RSS)", key="glob_rss")
+            if _custom:
+                try:
+                    import feedparser, html as _h
+                    _fp = feedparser.parse(_custom)
+                    st.markdown(f"**{_h.unescape(getattr(_fp.feed, 'title', _custom))}**")
+                    for _e in _fp.entries[:8]:
+                        _ti = _h.unescape(_e.get("title", "")).strip()
+                        _tn = _headline_tone(_ti)
+                        _em = "🟢" if _tn > 0 else ("🔴" if _tn < 0 else "⚪")
+                        st.markdown(f"- {_em} [{_ti}]({_e.get('link', '')})")
+                except Exception as _e:
+                    st.error(f"Couldn't read that feed: {_e}")
+            st.caption("Tip: most newsletters/blogs have an RSS link (often /feed or /rss). "
+                       "Paste it above to fold it into your sentiment feed.")
