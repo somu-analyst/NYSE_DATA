@@ -1542,6 +1542,164 @@ def _optimize_oi_exit(ticker, lookback, hold_days, min_conv):
     return best, grid, wf
 
 
+# ── News + sentiment helpers (free sources, no API key) ──
+_NEWS_POS = ("rally", "surge", "bull", "gain", "beat", "strong", "rise", "record", "buy",
+             "upgrade", "boost", "growth", "profit", "optimis", "soar", "jump", "outperform",
+             "raise", "tops", "win", "deal", "approval", "rebound", "expand", "demand")
+_NEWS_NEG = ("drop", "fall", "crash", "sell-off", "bear", "loss", "cut", "slash", "tariff",
+             "warn", "fear", "decline", "recession", "weak", "miss", "layoff", "plunge",
+             "tumble", "sink", "dump", "concern", "risk", "threat", "crisis", "downgrade",
+             "probe", "lawsuit", "halt", "slump", "fraud", "ban", "selloff", "glut")
+
+
+def _headline_tone(title):
+    t = str(title).lower()
+    p = sum(1 for w in _NEWS_POS if w in t)
+    n = sum(1 for w in _NEWS_NEG if w in t)
+    return 1 if p > n else (-1 if n > p else 0)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _ticker_news(ticker, n=6):
+    """Free real-time headlines (Google News + Yahoo + Reddit RSS) with a simple
+    bullish/bearish tone score. No API key. Returns dict(items, bull, bear, label)."""
+    out = {"items": [], "bull": 0, "bear": 0, "label": "NEUTRAL"}
+    try:
+        import feedparser, time as _t, html as _h, socket
+        socket.setdefaulttimeout(6)
+    except Exception:
+        return out
+    srcs = [
+        ("Google", f"https://news.google.com/rss/search?q={ticker}%20stock&hl=en-US&gl=US&ceid=US:en"),
+        ("Yahoo", f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"),
+        ("Reddit", f"https://www.reddit.com/search.rss?q={ticker}&sort=new"),
+    ]
+    seen, items = set(), []
+    for sname, url in srcs:
+        try:
+            fp = feedparser.parse(url)
+            for e in fp.entries[:8]:
+                title = _h.unescape(e.get("title", "")).strip()
+                key = title.lower()[:80]
+                if not title or key in seen:
+                    continue
+                seen.add(key)
+                pp = e.get("published_parsed")
+                when = _t.strftime("%d %b %H:%M", pp).lstrip("0") if pp else ""
+                items.append({"title": title, "link": e.get("link", ""), "source": sname,
+                              "when": when, "tone": _headline_tone(title)})
+        except Exception:
+            continue
+    bull = sum(1 for i in items if i["tone"] > 0)
+    bear = sum(1 for i in items if i["tone"] < 0)
+    label = ("BULLISH" if bull > bear + 1 else "BEARISH" if bear > bull + 1
+             else "MIXED" if (bull or bear) else "NEUTRAL")
+    out.update({"items": items[:n], "bull": bull, "bear": bear, "label": label})
+    return out
+
+
+def _gp_writeup(tk, spot, em, walls, r1, s1, dd, th, nw, tlegs):
+    """Plain-language next-day read for one stock: levels + expected move + news + position risk."""
+    cw, pw = walls.get("call_wall"), walls.get("put_wall")
+    P = []
+    if cw and pw:
+        if pw < spot < cw:
+            P.append(f"{tk} sits between put-wall ${pw:.0f} (support) and call-wall ${cw:.0f} "
+                     "(resistance) — dealers tend to pin price inside this range.")
+        elif spot >= cw:
+            P.append(f"{tk} is above its call wall ${cw:.0f} — extended; that level often caps or reverses moves.")
+        else:
+            P.append(f"{tk} is below its put wall ${pw:.0f} — support has broken, momentum is weak.")
+    elif cw:
+        P.append(f"{tk} faces overhead resistance at the call wall ${cw:.0f}.")
+    elif pw:
+        P.append(f"{tk} has support at the put wall ${pw:.0f}.")
+    else:
+        P.append(f"{tk} has no dominant OI wall nearby, so price can roam.")
+    P.append(f"Tomorrow's 1-day expected move is about ±${em:.2f} (≈{em/spot*100:.1f}%) — a normal "
+             f"session likely stays in ${spot-em:.0f}–${spot+em:.0f}.")
+    if nw.get("items"):
+        if nw["label"] == "BULLISH":
+            P.append(f"News flow leans positive ({nw['bull']} up vs {nw['bear']} down headlines) — supportive "
+                     "for the open, though good news can deflate option IV.")
+        elif nw["label"] == "BEARISH":
+            P.append(f"News flow leans negative ({nw['bear']} down vs {nw['bull']} up headlines) — raises gap-down "
+                     "and IV-spike risk overnight.")
+        elif nw["label"] == "MIXED":
+            P.append(f"News is mixed ({nw['bull']} up / {nw['bear']} down) — no clean catalyst, so the levels above "
+                     "should drive the tape.")
+        else:
+            P.append("Newsflow is quiet — technicals and the walls should dominate.")
+    if dd > 0:
+        P.append(f"Your {tk} legs are net long (${dd:,.0f} per +1%) — a green open helps; a gap-down is the risk.")
+    elif dd < 0:
+        P.append(f"Your {tk} legs are net short (${dd:,.0f} per +1%) — a gap-up is the main risk.")
+    risks = []
+    for l in tlegs:
+        money = "ITM" if ((l["spot"] > l["K"]) if l["typ"] == "call" else (l["spot"] < l["K"])) else "OTM"
+        if l["side"] == "short" and money == "ITM":
+            risks.append(f"short ${l['K']:.0f}{l['typ'][0].upper()} is ITM (assignment risk)")
+        if l["dte"] <= 7:
+            risks.append(f"${l['K']:.0f}{l['typ'][0].upper()} has {l['dte']}DTE (theta/gamma spike)")
+    if risks:
+        P.append("Watch: " + "; ".join(dict.fromkeys(risks)) + ".")
+    if cw and pw and pw < spot < cw and th >= 0:
+        P.append("Plan: hold — let the range and time decay work; act only on a clean break of a wall.")
+    else:
+        P.append("Plan: manage the flagged legs at the open (roll / trim / hedge) per the table below.")
+    return " ".join(P)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _macro_backdrop():
+    """Live-ish cross-asset/international backdrop via yfinance (futures, vol, FX, rates,
+    commodities, China/EM, crypto) with a risk-on/off read. Returns (dict, label, score)."""
+    syms = {
+        "S&P fut": "ES=F", "Nasdaq fut": "NQ=F", "VIX": "^VIX", "WTI oil": "CL=F",
+        "Gold": "GC=F", "Dollar (DXY)": "DX=F", "US 10y": "^TNX",
+        "China (FXI)": "FXI", "EM (EEM)": "EEM", "Bitcoin": "BTC-USD",
+    }
+    out = {}
+    for name, sym in syms.items():
+        try:
+            c = yf.Ticker(sym).history(period="5d")["Close"].dropna()
+            if len(c) >= 2:
+                out[name] = {"price": float(c.iloc[-1]),
+                             "pct": (float(c.iloc[-1]) / float(c.iloc[-2]) - 1) * 100}
+        except Exception:
+            continue
+    score = 0
+    if "S&P fut" in out:
+        score += 1 if out["S&P fut"]["pct"] > 0 else -1
+    if "VIX" in out:
+        score += -1 if out["VIX"]["pct"] > 3 else (1 if out["VIX"]["pct"] < -3 else 0)
+    if "Dollar (DXY)" in out:
+        score += -1 if out["Dollar (DXY)"]["pct"] > 0.3 else (1 if out["Dollar (DXY)"]["pct"] < -0.3 else 0)
+    if "US 10y" in out:
+        score += -1 if out["US 10y"]["pct"] > 2 else 0
+    label = "RISK-ON" if score >= 2 else ("RISK-OFF" if score <= -2 else "MIXED")
+    return out, label, score
+
+
+def _macro_writeup(mac, label):
+    def mv(k):
+        if k in mac:
+            p = mac[k]["pct"]
+            return ("up" if p > 0.1 else "down" if p < -0.1 else "flat") + f" {p:+.1f}%"
+        return None
+    bits = []
+    for k in ("S&P fut", "VIX", "Dollar (DXY)", "US 10y", "WTI oil", "Gold", "China (FXI)"):
+        m = mv(k)
+        if m:
+            bits.append(f"{k} {m}")
+    tail = {
+        "RISK-ON": "Supportive backdrop for longs / semis / tech — tailwind into the open.",
+        "RISK-OFF": "Headwind — favor hedges, trim high-beta, and expect wider swings.",
+        "MIXED": "No clear global push — let your stock-level levels lead.",
+    }[label]
+    return f"Overnight, {', '.join(bits)}. {tail}"
+
+
 # ===================================================================
 # ──  OI WEEKLY COMPARISON  (same-week strike analysis)
 # ===================================================================
@@ -9689,6 +9847,28 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             except Exception: pass
             st.stop()
 
+        # ── Global / cross-asset backdrop (oil, gold, FX, rates, China/EM, crypto) ──
+        st.markdown("#### 🌐 Global macro backdrop (overnight)")
+        try:
+            _mac, _mlab, _mscore = _macro_backdrop()
+        except Exception:
+            _mac, _mlab, _mscore = {}, "MIXED", 0
+        if _mac:
+            _mcol = {"RISK-ON": "🟢", "RISK-OFF": "🔴", "MIXED": "🟡"}[_mlab]
+            st.markdown(f"**{_mcol} Risk read: {_mlab}** (score {_mscore:+d})")
+            _order = ["S&P fut", "Nasdaq fut", "VIX", "WTI oil", "Gold", "Dollar (DXY)",
+                      "US 10y", "China (FXI)", "EM (EEM)", "Bitcoin"]
+            _shown = [k for k in _order if k in _mac]
+            for _i in range(0, len(_shown), 5):
+                _cols = st.columns(5)
+                for _j, _k in enumerate(_shown[_i:_i + 5]):
+                    _v = _mac[_k]
+                    _cols[_j].metric(_k, f"{_v['price']:,.2f}", f"{_v['pct']:+.2f}%",
+                                     delta_color="normal" if _v["pct"] >= 0 else "inverse")
+            st.info(_macro_writeup(_mac, _mlab))
+        else:
+            st.caption("Macro feed unavailable right now (yfinance rate-limited).")
+
         _R = 0.045
 
         def _gp_spot(tk):
@@ -9821,71 +10001,99 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         st.caption(f"A **−2%** gap tomorrow ≈ **${_down:,.0f}**; a **+2%** gap ≈ **${_up:,.0f}**. "
                    "Includes one day of theta and a simple vol bump on down moves.")
 
-        # ── Per-ticker expected move + key levels ──
-        st.markdown("#### 🎯 Per-ticker expected move & key levels for tomorrow")
-        _seen = {}
+        # ── Stock-by-stock game plan (levels + news + sentiment + writeup + legs) ──
+        st.markdown("#### 🏢 Stock-by-stock game plan")
+        _by_tk = {}
         for l in _legs:
-            _seen.setdefault(l["ticker"], l)
-        for _tk, l in _seen.items():
-            _em = l["spot"] * l["iv"] * (1 / 252.0) ** 0.5
+            _by_tk.setdefault(l["ticker"], []).append(l)
+        _checklist = []
+        for _tk, _tl in _by_tk.items():
+            _spot = _tl[0]["spot"]
+            _ivs = sorted(x["iv"] for x in _tl); _ivm = _ivs[len(_ivs) // 2]
+            _em = _spot * _ivm * (1 / 252.0) ** 0.5
+            _tk_dd = sum(x["ddelta_1pct"] for x in _tl)
+            _tk_th = sum(x["pos_theta"] for x in _tl)
+            _tk_pnl = sum(x["pnl"] for x in _tl)
+            _near = min(_tl, key=lambda x: x["dte"])
             try:
                 _chain = pd.read_sql(
                     "SELECT strike, openInt_Call_now, openInt_Put_now, R1, S1 FROM options_change "
                     "WHERE UPPER(ticker)=? AND expiry_date=?",
-                    _gp_conn, params=(_tk, l["exp_mdy"]))
+                    _gp_conn, params=(_tk, _near["exp_mdy"]))
             except Exception:
                 _chain = pd.DataFrame()
-            _w = compute_walls(_chain, l["spot"]) if not _chain.empty else {}
+            _w = compute_walls(_chain, _spot) if not _chain.empty else {}
             _r1 = _s1 = None
             if not _chain.empty:
                 try:
                     _r1 = float(_chain["R1"].dropna().iloc[0]); _s1 = float(_chain["S1"].dropna().iloc[0])
                 except Exception:
                     pass
-            _parts = [f"**{_tk}** spot **${l['spot']:.2f}** · 1-day expected move **±${_em:.2f}** "
-                      f"(${l['spot']-_em:.2f} – ${l['spot']+_em:.2f}, ≈{_em/l['spot']*100:.1f}%)"]
-            _lv = []
-            if _w.get("call_wall"): _lv.append(f"call wall ${_w['call_wall']:.0f}")
-            if _w.get("put_wall"): _lv.append(f"put wall ${_w['put_wall']:.0f}")
-            if _r1: _lv.append(f"R1 ${_r1:.0f}")
-            if _s1: _lv.append(f"S1 ${_s1:.0f}")
-            if _lv:
-                _parts.append("Levels: " + " · ".join(_lv))
-            st.markdown("- " + "  \n  ".join(_parts))
+            _nw = _ticker_news(_tk)
+            _te = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡", "NEUTRAL": "⚪"}[_nw["label"]]
+            with st.expander(f"{_te} {_tk} · ${_spot:.2f} · {len(_tl)} legs · open P&L ${_tk_pnl:,.0f} · news {_nw['label']}",
+                             expanded=True):
+                _mc = st.columns(4)
+                _mc[0].metric("Spot", f"${_spot:.2f}")
+                _mc[1].metric("1-day exp. move", f"±${_em:.2f}", f"±{_em/_spot*100:.1f}%")
+                _mc[2].metric("Δ per +1%", f"${_tk_dd:,.0f}")
+                _mc[3].metric("Theta / day", f"${_tk_th:,.0f}")
+                _lv = []
+                if _w.get("put_wall"): _lv.append(f"🟩 put wall ${_w['put_wall']:.0f}")
+                if _w.get("call_wall"): _lv.append(f"🟥 call wall ${_w['call_wall']:.0f}")
+                if _s1: _lv.append(f"S1 ${_s1:.0f}")
+                if _r1: _lv.append(f"R1 ${_r1:.0f}")
+                if _lv:
+                    st.markdown("**Key levels:** " + " · ".join(_lv))
+                st.info(_gp_writeup(_tk, _spot, _em, _w, _r1, _s1, _tk_dd, _tk_th, _nw, _tl))
 
-        # ── Per-leg next-day action table ──
-        st.markdown("#### 🧭 Per-position action plan")
-        _rows = []
-        _checklist = []
-        for l in _legs:
-            _moneyness = (("ITM" if l["spot"] > l["K"] else "OTM") if l["typ"] == "call"
-                          else ("ITM" if l["spot"] < l["K"] else "OTM"))
-            _pnl_pct = ((l["cur"] - l["entry"]) / l["entry"] * 100 * (1 if l["qty"] > 0 else -1)) if l["entry"] else 0
-            acts = []
-            if l["dte"] <= 7:
-                acts.append(f"{l['dte']}DTE — gamma/theta spike, decide now")
-            elif l["dte"] <= 21:
-                acts.append(f"{l['dte']}DTE — 21-day rule, plan exit/roll")
-            if l["side"] == "short" and _moneyness == "ITM":
-                acts.append("short & ITM — assignment risk, roll or close")
-            if _pnl_pct >= 50:
-                acts.append("up ≥50% — take profit / trim")
-            elif _pnl_pct <= -50:
-                acts.append("down ≥50% — cut or roll")
-            if l["side"] == "long" and l["dte"] > 21 and -50 < _pnl_pct < 50:
-                acts.append("hold; trail vs key level")
-            action = "; ".join(acts) if acts else "hold & monitor"
-            _rows.append({
-                "Position": f"{l['side']} {abs(l['qty'])}× {l['ticker']} ${l['K']:.0f}{l['typ'][0].upper()}",
-                "Exp": l["exp"][:10], "DTE": l["dte"], "Spot": round(l["spot"], 2),
-                "Money": _moneyness, "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
-                "P&L %": round(_pnl_pct), "P&L $": round(l["pnl"]),
-                "Θ/day $": round(l["pos_theta"]), "Action": action,
-            })
-            if action != "hold & monitor":
-                _checklist.append(f"**{l['ticker']} ${l['K']:.0f}{l['typ'][0].upper()}** ({l['side']}, {l['dte']}DTE): {action}")
-        st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True,
-                     column_config={"P&L %": st.column_config.NumberColumn(format="%d%%")})
+                _sm = []
+                for s in (-0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03):
+                    tot = 0.0
+                    for l in _tl:
+                        ns = l["spot"] * (1 + s); t1 = max(l["dte"] - 1, 0) / 365.0
+                        ivs = max(l["iv"] * (1 - 2.0 * s), 0.05)
+                        npx = bs_greeks(ns, l["K"], t1, _R, ivs, l["typ"]).get("price", l["cur"]) if t1 > 0 \
+                            else (max(ns - l["K"], 0) if l["typ"] == "call" else max(l["K"] - ns, 0))
+                        tot += (npx - l["cur"]) * l["m"]
+                    _sm.append({f"If {_tk} moves": f"{s*100:+.0f}%", "P&L $": round(tot)})
+                st.dataframe(pd.DataFrame(_sm), hide_index=True, use_container_width=True,
+                             column_config={"P&L $": st.column_config.NumberColumn(format="$%d")})
+
+                if _nw["items"]:
+                    st.markdown("**📰 Latest headlines & tone:**")
+                    for it in _nw["items"]:
+                        e = "🟢" if it["tone"] > 0 else ("🔴" if it["tone"] < 0 else "⚪")
+                        st.markdown(f"- {e} [{it['title']}]({it['link']}) · _{it['source']} {it['when']}_")
+                else:
+                    st.caption("No fresh headlines found (feeds may be rate-limited).")
+
+                _rows = []
+                for l in _tl:
+                    money = "ITM" if ((l["spot"] > l["K"]) if l["typ"] == "call" else (l["spot"] < l["K"])) else "OTM"
+                    pnl_pct = ((l["cur"] - l["entry"]) / l["entry"] * 100 * (1 if l["qty"] > 0 else -1)) if l["entry"] else 0
+                    acts = []
+                    if l["dte"] <= 7:
+                        acts.append(f"{l['dte']}DTE — decide now")
+                    elif l["dte"] <= 21:
+                        acts.append(f"{l['dte']}DTE — plan exit/roll")
+                    if l["side"] == "short" and money == "ITM":
+                        acts.append("ITM short — assignment risk")
+                    if pnl_pct >= 50:
+                        acts.append("up ≥50% — take profit")
+                    elif pnl_pct <= -50:
+                        acts.append("down ≥50% — cut/roll")
+                    action = "; ".join(acts) if acts else "hold & monitor"
+                    _rows.append({
+                        "Leg": f"{l['side']} {abs(l['qty'])}× ${l['K']:.0f}{l['typ'][0].upper()}",
+                        "Exp": l["exp"][:10], "DTE": l["dte"], "Money": money,
+                        "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
+                        "P&L %": round(pnl_pct), "P&L $": round(l["pnl"]), "Action": action,
+                    })
+                    if action != "hold & monitor":
+                        _checklist.append(f"**{_tk} ${l['K']:.0f}{l['typ'][0].upper()}** ({l['side']}, {l['dte']}DTE): {action}")
+                st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True,
+                             column_config={"P&L %": st.column_config.NumberColumn(format="%d%%")})
 
         # ── Morning checklist ──
         st.markdown("#### ✅ Tomorrow's open — action checklist")
