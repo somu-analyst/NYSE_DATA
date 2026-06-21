@@ -19401,6 +19401,33 @@ def _stocktwits_sentiment(tk):
     _ST_CACHE[tk] = (now, res)
     return res
 
+_FH_CACHE = {}
+
+def _finnhub_sentiment(tk):
+    """Finnhub news-sentiment (needs free FINNHUB_API_KEY env var). Cached 15 min; None if no key."""
+    import os, time as _t
+    key = os.environ.get("FINNHUB_API_KEY") or os.environ.get("FINNHUB_KEY")
+    if not key:
+        return None
+    now = _t.time()
+    c = _FH_CACHE.get(tk)
+    if c and now - c[0] < 900:
+        return c[1]
+    res = None
+    try:
+        import urllib.request, json as _j
+        with urllib.request.urlopen(
+                f"https://finnhub.io/api/v1/news-sentiment?symbol={tk}&token={key}", timeout=6) as r:
+            d = _j.loads(r.read().decode())
+        bp = (d.get("sentiment") or {}).get("bullishPercent")
+        if bp is not None:
+            res = {"bull_pct": bp * 100,
+                   "label": "BULLISH" if bp >= 0.6 else "BEARISH" if bp <= 0.4 else "MIXED"}
+    except Exception:
+        res = None
+    _FH_CACHE[tk] = (now, res)
+    return res
+
 def _plan_prem(conn, tk, K, exp, typ):
     col = "lastPrice_Call_now" if typ == "call" else "lastPrice_Put_now"
     mdy = _to_mdy(exp)
@@ -19501,6 +19528,9 @@ def _next_day_plan(conn):
         stt = _stocktwits_sentiment(tk)
         if stt:
             head += f"\n  💬 StockTwits {stt['label']} ({stt['bull']}🟢/{stt['bear']}🔴)"
+        fh = _finnhub_sentiment(tk)
+        if fh:
+            head += f"\n  🛰 Finnhub {fh['label']} ({fh['bull_pct']:.0f}% bull)"
         blocks.append(head + "\n" + "\n".join(leglines))
     L.append(f"Net Δ/+1% <b>${net_dd:,.0f}</b> · Θ/day <b>${net_th:,.0f}</b>")
     L.append("")

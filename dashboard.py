@@ -1637,6 +1637,30 @@ def _stocktwits_sentiment(ticker):
     return None
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _finnhub_sentiment(ticker):
+    """Finnhub news-sentiment (bullish %, buzz, score). Needs free FINNHUB_API_KEY env var;
+    returns None if no key or the endpoint is gated/unavailable."""
+    key = os.environ.get("FINNHUB_API_KEY") or os.environ.get("FINNHUB_KEY")
+    if not key:
+        return None
+    try:
+        import urllib.request, json as _j
+        url = f"https://finnhub.io/api/v1/news-sentiment?symbol={ticker}&token={key}"
+        with urllib.request.urlopen(url, timeout=6) as r:
+            d = _j.loads(r.read().decode())
+        s = d.get("sentiment") or {}
+        bp = s.get("bullishPercent")
+        if bp is None:
+            return None
+        buzz = (d.get("buzz") or {}).get("buzz")
+        label = "BULLISH" if bp >= 0.6 else ("BEARISH" if bp <= 0.4 else "MIXED")
+        return {"bull_pct": bp * 100, "bear_pct": (s.get("bearishPercent") or 0) * 100,
+                "score": d.get("companyNewsScore"), "buzz": buzz, "label": label}
+    except Exception:
+        return None
+
+
 def _gp_writeup(tk, spot, em, walls, r1, s1, dd, th, nw, tlegs, stt=None):
     """Plain-language next-day read for one stock: levels + expected move + news + position risk."""
     cw, pw = walls.get("call_wall"), walls.get("put_wall")
@@ -10095,6 +10119,12 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _ste = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}.get(_stt["label"], "⚪")
                     st.markdown(f"**💬 StockTwits crowd:** {_ste} {_stt['label']} "
                                 f"({_stt['bull']} bullish / {_stt['bear']} bearish)")
+                _fh = _finnhub_sentiment(_tk)
+                if _fh:
+                    _fhe = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}.get(_fh["label"], "⚪")
+                    _buzz = f" · buzz {_fh['buzz']:.1f}×" if _fh.get("buzz") else ""
+                    st.markdown(f"**🛰 Finnhub news-sentiment:** {_fhe} {_fh['label']} "
+                                f"({_fh['bull_pct']:.0f}% bullish){_buzz}")
                 st.info(_gp_writeup(_tk, _spot, _em, _w, _r1, _s1, _tk_dd, _tk_th, _nw, _tl, _stt))
 
                 _sm = []
