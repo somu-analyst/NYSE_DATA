@@ -15559,6 +15559,96 @@ def _finnhub_sentiment(tk):
     _FH_CACHE[tk] = (now, res)
     return res
 
+_IVR_CACHE = {}
+
+def _iv_rank(conn, tk):
+    """ATM IV rank over stored ~6mo premium history. Cached 30 min."""
+    import time as _t
+    now = _t.time()
+    c = _IVR_CACHE.get(tk)
+    if c and now - c[0] < 1800:
+        return c[1]
+    res = None
+    try:
+        df = pd.read_sql("SELECT trade_date_now, strike, expiry_date, lastPrice_Call_now "
+                         "FROM options_change WHERE UPPER(ticker)=?", conn, params=(tk.upper(),))
+        sd = pd.read_sql("SELECT trade_date, close FROM stock_daily WHERE UPPER(ticker)=?",
+                         conn, params=(tk.upper(),))
+        if not df.empty and not sd.empty:
+            spot_by = {str(d): float(x) for d, x in zip(sd["trade_date"], sd["close"])}
+
+            def _pdt(x):
+                for f in ("%m-%d-%Y", "%Y-%m-%d"):
+                    try:
+                        return datetime.strptime(str(x), f)
+                    except Exception:
+                        pass
+                return None
+
+            ivs = []
+            for d, g in df.groupby("trade_date_now"):
+                spot = spot_by.get(str(d)); dd = _pdt(d)
+                if not spot or dd is None:
+                    continue
+                best = None
+                for _, row in g.iterrows():
+                    ed = _pdt(row["expiry_date"])
+                    if ed is None:
+                        continue
+                    dte = (ed - dd).days
+                    if dte < 10 or dte > 70:
+                        continue
+                    prem = float(row["lastPrice_Call_now"] or 0)
+                    if prem <= 0:
+                        continue
+                    dist = abs(float(row["strike"]) - spot)
+                    if best is None or dist < best[0]:
+                        best = (dist, float(row["strike"]), prem, dte)
+                if best:
+                    _, K, prem, dte = best
+                    iv = _implied_vol_hp(prem, spot, K, dte / 365.0)
+                    if 0.01 < iv < 5:
+                        ivs.append(iv)
+            if len(ivs) >= 10:
+                cur, lo, hi = ivs[-1], min(ivs), max(ivs)
+                res = {"iv": cur, "rank": (cur - lo) / (hi - lo) * 100 if hi > lo else 50.0}
+    except Exception:
+        res = None
+    _IVR_CACHE[tk] = (now, res)
+    return res
+
+_EARN_CACHE = {}
+
+def _next_earnings(tk):
+    """Next earnings date + days away via yfinance. Cached 2h. None if unavailable."""
+    import time as _t
+    now = _t.time()
+    c = _EARN_CACHE.get(tk)
+    if c and now - c[0] < 7200:
+        return c[1]
+    res = None
+    try:
+        import pandas as _pd
+        t = yf.Ticker(tk)
+        nowd = _pd.Timestamp.now().normalize()
+        dts = []
+        try:
+            ed = t.get_earnings_dates(limit=12)
+            if ed is not None and len(ed):
+                for ix in ed.index:
+                    ts = _pd.Timestamp(ix)
+                    ts = ts.tz_localize(None) if ts.tzinfo else ts
+                    dts.append(ts.normalize())
+        except Exception:
+            pass
+        fut = sorted(d for d in dts if d >= nowd)
+        if fut:
+            res = {"date": fut[0].strftime("%b %d"), "days": int((fut[0] - nowd).days)}
+    except Exception:
+        res = None
+    _EARN_CACHE[tk] = (now, res)
+    return res
+
 def _plan_prem(conn, tk, K, exp, typ):
     col = "lastPrice_Call_now" if typ == "call" else "lastPrice_Put_now"
     mdy = _to_mdy(exp)
@@ -15662,6 +15752,13 @@ def _next_day_plan(conn):
         fh = _finnhub_sentiment(tk)
         if fh:
             head += f"\n  🛰 Finnhub {fh['label']} ({fh['bull_pct']:.0f}% bull)"
+        ivr = _iv_rank(conn, tk)
+        if ivr:
+            hint = "cheap→buy" if ivr["rank"] < 30 else "rich→sell" if ivr["rank"] > 70 else "mid"
+            head += f"\n  🌡️ IV Rank {ivr['rank']:.0f} ({ivr['iv']*100:.0f}%) {hint}"
+        ea = _next_earnings(tk)
+        if ea and ea["days"] <= 14:
+            head += f"\n  📅 ⚠️ Earnings {ea['date']} ({ea['days']}d) — gap risk"
         blocks.append(head + "\n" + "\n".join(leglines))
     L.append(f"Net Δ/+1% <b>${net_dd:,.0f}</b> · Θ/day <b>${net_th:,.0f}</b>")
     L.append("")
