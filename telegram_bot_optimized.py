@@ -19402,9 +19402,29 @@ def _stocktwits_sentiment(tk):
     return res
 
 _FH_CACHE = {}
+_TONE_NEG_OVR = ("paused", "pause", "halt", "stall", "collapse", "delay", "fail", "fell through",
+                 "off the table", "blocked", "breakdown", "no deal", "scrapped", "called off", "closure",
+                 "closed", "shut", "blockade", "hormuz", "strait", "embargo", "sanction", "escalat",
+                 "conflict", " war", "attack", "strike on", "missile", "disrupt", "shortage", "glut",
+                 "probe", "lawsuit", "fraud", "recall", "downgrade", "plunge", "crash", "selloff",
+                 "sell-off", "tariff", "ban ", "slump", "tumble")
+_TONE_POS = ("rally", "surge", "bull", "gain", "beat", "strong", "rise", "record", "upgrade", "boost",
+             "growth", "profit", "optimis", "soar", "jump", "outperform", "tops", "win", "rebound",
+             "expand", "demand")
+_TONE_NEG = ("drop", "fall", "sell", "bear", "loss", "cut", "slash", "warn", "fear", "decline",
+             "recession", "weak", "miss", "layoff", "sink", "dump", "concern", "risk", "threat", "crisis")
+
+def _headline_tone(title):
+    t = str(title).lower()
+    if any(w in t for w in _TONE_NEG_OVR):
+        return -1
+    p = sum(1 for w in _TONE_POS if w in t)
+    n = sum(1 for w in _TONE_NEG if w in t)
+    return 1 if p > n else (-1 if n > p else 0)
 
 def _finnhub_sentiment(tk):
-    """Finnhub news-sentiment (needs free FINNHUB_API_KEY env var). Cached 15 min; None if no key."""
+    """Finnhub sentiment: news-sentiment endpoint, else the free company-news endpoint scored
+    locally. Needs FINNHUB_API_KEY env var. Cached 15 min; None if no key / nothing usable."""
     import os, time as _t
     key = os.environ.get("FINNHUB_API_KEY") or os.environ.get("FINNHUB_KEY")
     if not key:
@@ -19414,8 +19434,8 @@ def _finnhub_sentiment(tk):
     if c and now - c[0] < 900:
         return c[1]
     res = None
+    import urllib.request, json as _j
     try:
-        import urllib.request, json as _j
         with urllib.request.urlopen(
                 f"https://finnhub.io/api/v1/news-sentiment?symbol={tk}&token={key}", timeout=6) as r:
             d = _j.loads(r.read().decode())
@@ -19425,6 +19445,24 @@ def _finnhub_sentiment(tk):
                    "label": "BULLISH" if bp >= 0.6 else "BEARISH" if bp <= 0.4 else "MIXED"}
     except Exception:
         res = None
+    if res is None:
+        try:
+            from datetime import date, timedelta
+            _to = date.today(); _from = _to - timedelta(days=7)
+            with urllib.request.urlopen(
+                    f"https://finnhub.io/api/v1/company-news?symbol={tk}&from={_from}&to={_to}&token={key}",
+                    timeout=6) as r:
+                arts = _j.loads(r.read().decode())
+            bull = bear = 0
+            for a in (arts or [])[:40]:
+                tt = _headline_tone((a.get("headline", "") + " " + a.get("summary", "")))
+                if tt > 0: bull += 1
+                elif tt < 0: bear += 1
+            if bull + bear > 0:
+                res = {"bull_pct": bull / (bull + bear) * 100,
+                       "label": "BULLISH" if bull > bear * 1.3 else "BEARISH" if bear > bull * 1.3 else "MIXED"}
+        except Exception:
+            res = None
     _FH_CACHE[tk] = (now, res)
     return res
 
