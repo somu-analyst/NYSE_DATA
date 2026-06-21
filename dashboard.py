@@ -1788,6 +1788,17 @@ def _macro_writeup(mac, label):
     return f"Overnight, {', '.join(bits)}. {tail}"
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _shares_outstanding(ticker):
+    """Shares outstanding via yfinance (for % of company). Cached 24h. None on failure."""
+    try:
+        info = yf.Ticker(ticker).get_info()
+        so = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+        return float(so) if so else None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def _iv_rank(ticker, r=0.045):
     """ATM implied-vol rank/percentile over the stored ~6-month premium history.
@@ -6640,14 +6651,30 @@ elif page == "📈 Insider / Congress / Whales":
             else:
                 st.info("Institutional signal: **HOLD / MAINTAIN** — Institutions holding current positions")
 
-            # Table — use actual columns present in DB
-            _want = ["filer_name", "ticker", "shares_held", "value_usd",
-                     "shares_change", "value_change_usd",
+            # ── Enrich: % of fund portfolio, % of company, QoQ change ──
+            _filer_tot = whales.groupby("filer_name")["val_num"].transform("sum")
+            whales["pct_port"] = (whales["val_num"] / _filer_tot * 100).round(1)
+            if "shares_held" in whales.columns:
+                _sh = pd.to_numeric(whales["shares_held"], errors="coerce")
+                _so = whales["ticker"].apply(lambda t: _shares_outstanding(str(t)))
+                whales["pct_company"] = (_sh / _so * 100).round(2)
+                if "shares_change" in whales.columns:
+                    _chg = pd.to_numeric(whales["shares_change"], errors="coerce")
+                    _prev = _sh - _chg
+                    whales["qoq_shares_pct"] = (_chg / _prev.replace(0, pd.NA) * 100).round(0)
+            st.caption("**% Port** = position weight in that fund · **% Co** = shares held ÷ shares "
+                       "outstanding · **QoQ%** = share change vs prior quarter.")
+
+            # Table — use actual columns present in DB + enriched metrics
+            _want = ["filer_name", "ticker", "shares_held", "value_usd", "pct_port", "pct_company",
+                     "shares_change", "qoq_shares_pct", "value_change_usd",
                      "filing_date", "quarter_end_date",
                      "action_type", "action_confidence"]
             display_cols = [c for c in _want if c in whales.columns]
             # Format value columns for readability
             _disp = whales[display_cols].copy().head(50)
+            _disp = _disp.rename(columns={"pct_port": "% Port", "pct_company": "% Co",
+                                          "qoq_shares_pct": "QoQ%"})
             for _vc in ["value_usd", "value_change_usd"]:
                 if _vc in _disp.columns:
                     _disp[_vc] = pd.to_numeric(_disp[_vc], errors="coerce").apply(
