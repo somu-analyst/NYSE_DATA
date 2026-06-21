@@ -1788,6 +1788,105 @@ def _macro_writeup(mac, label):
     return f"Overnight, {', '.join(bits)}. {tail}"
 
 
+_EDGAR_H = {"User-Agent": "RUDRARJUN Analytics research srinivas.analystsas@gmail.com"}
+_EDGAR_DDL = ("CREATE TABLE IF NOT EXISTS edgar_13f (cik TEXT, fund TEXT, quarter TEXT, "
+              "filing_date TEXT, cusip TEXT, issuer TEXT, shares REAL, value REAL, put_call TEXT, "
+              "PRIMARY KEY (cik, quarter, cusip, put_call))")
+
+
+def _edgar_13f_filings(cik, n=12):
+    """List the last n 13F-HR filings for a CIK from SEC EDGAR submissions JSON."""
+    import urllib.request, json as _j
+    url = f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json"
+    req = urllib.request.Request(url, headers=_EDGAR_H)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        d = _j.loads(r.read().decode())
+    rec = d["filings"]["recent"]
+    seen = {}
+    for form, acc, fd, rd in zip(rec["form"], rec["accessionNumber"], rec["filingDate"], rec["reportDate"]):
+        if form == "13F-HR" and rd not in seen:
+            seen[rd] = {"accession": acc, "filing_date": fd, "report_date": rd}
+    return sorted(seen.values(), key=lambda x: x["report_date"], reverse=True)[:n]
+
+
+def _edgar_parse_infotable(cik, accession):
+    """Parse a 13F information-table XML into a list of holdings dicts."""
+    import urllib.request, json as _j, xml.etree.ElementTree as ET
+    ciki = str(int(cik)); acc = accession.replace("-", "")
+    idx = f"https://www.sec.gov/Archives/edgar/data/{ciki}/{acc}/index.json"
+    req = urllib.request.Request(idx, headers=_EDGAR_H)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        items = _j.loads(r.read().decode())["directory"]["item"]
+    xmls = [it["name"] for it in items if it["name"].lower().endswith(".xml")]
+    cand = [n for n in xmls if n.lower() != "primary_doc.xml"]
+    rows = []
+    for nm in (cand or xmls):                          # combine ALL info-table files (big filers split them)
+        try:
+            url = f"https://www.sec.gov/Archives/edgar/data/{ciki}/{acc}/{nm}"
+            req = urllib.request.Request(url, headers=_EDGAR_H)
+            with urllib.request.urlopen(req, timeout=25) as r:
+                root = ET.fromstring(r.read().decode(errors="ignore"))
+            for el in root.iter():
+                if el.tag.split("}")[-1] == "infoTable":
+                    d = {}
+                    for ch in el.iter():
+                        t = ch.tag.split("}")[-1]
+                        if t in ("nameOfIssuer", "cusip", "value", "putCall", "sshPrnamt"):
+                            d[t] = (ch.text or "").strip()
+                    if d.get("cusip"):
+                        rows.append(d)
+        except Exception:
+            continue
+    return rows
+
+
+def _edgar_build_history(cik, fund, n=12, force=False):
+    """Fetch + parse + store the last n 13F-HR holdings for a CIK. Returns quarters stored."""
+    import time as _t
+    conn = get_conn()
+    try:
+        conn.execute(_EDGAR_DDL); conn.commit()
+        have = set() if force else {x[0] for x in conn.execute(
+            "SELECT DISTINCT quarter FROM edgar_13f WHERE cik=?", (str(cik),)).fetchall()}
+        stored = 0
+        for f in _edgar_13f_filings(cik, n):
+            q = f["report_date"]
+            if q in have:
+                stored += 1; continue
+            rows = _edgar_parse_infotable(cik, f["accession"]); _t.sleep(0.2)
+            dollars = f["filing_date"] >= "2023-01-01"   # SEC switched $thousands→dollars in 2023
+            recs = []
+            for d in rows:
+                try:
+                    val = float(d.get("value") or 0) * (1 if dollars else 1000)
+                except Exception:
+                    val = 0.0
+                try:
+                    sh = float(d.get("sshPrnamt") or 0)
+                except Exception:
+                    sh = 0.0
+                recs.append((str(cik), fund, q, f["filing_date"], d.get("cusip", ""),
+                             d.get("nameOfIssuer", ""), sh, val, d.get("putCall", "") or ""))
+            if recs:
+                conn.execute("DELETE FROM edgar_13f WHERE cik=? AND quarter=?", (str(cik), q))
+                conn.executemany("INSERT OR REPLACE INTO edgar_13f VALUES (?,?,?,?,?,?,?,?,?)", recs)
+                conn.commit(); stored += 1
+        return stored
+    finally:
+        conn.close()
+
+
+def _edgar_load(cik):
+    conn = get_conn()
+    try:
+        conn.execute(_EDGAR_DDL); conn.commit()
+        return pd.read_sql("SELECT * FROM edgar_13f WHERE cik=?", conn, params=(str(cik),))
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def _shares_outstanding(ticker):
     """Shares outstanding via yfinance (for % of company). Cached 24h. None on failure."""
@@ -6553,7 +6652,82 @@ elif page == "📈 Insider / Congress / Whales":
         with st.popover("ℹ️"):
             st.markdown(_PAGE_HELP.get(page, ""))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["👤 Insider Trades", "🏛️ Congress Trades", "🐋 Whale Holdings", "🏆 Legendary Investors (13F)", "🩳 Short Sellers"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["👤 Insider Trades", "🏛️ Congress Trades", "🐋 Whale Holdings", "🏆 Legendary Investors (13F)", "🩳 Short Sellers", "📜 13F History (EDGAR)"])
+
+    with tab6:
+        st.markdown("### 📜 13F History — live from SEC EDGAR")
+        st.caption("Real quarterly 13F filings pulled from SEC EDGAR (free). Builds portfolio %, "
+                   "quarter-over-quarter change, and a 12-quarter holding trend. First fetch per fund "
+                   "takes ~10–20s; then it's stored in your DB.")
+        _EDGAR_FUNDS = {
+            "Berkshire Hathaway": "0001067983", "Vanguard Group": "0001029160",
+            "BlackRock": "0001364742", "Citadel Advisors": "0001423053",
+            "ARK Investment Management": "0001649339", "Soros Fund Management": "0001549626",
+            "Bridgewater Associates": "0001350694", "Renaissance Technologies": "0001037389",
+            "Pershing Square (Ackman)": "0001336528", "Scion (Burry)": "0001649339",
+            "Third Point (Loeb)": "0001040273", "Tiger Global (Coleman)": "0001167483",
+            "Greenlight (Einhorn)": "0001079114", "Baupost (Klarman)": "0001061768",
+        }
+        _ef1, _ef2 = st.columns([2, 1])
+        _fpick = _ef1.selectbox("Fund", list(_EDGAR_FUNDS) + ["(enter CIK manually)"], key="edgar_fund")
+        if _fpick == "(enter CIK manually)":
+            _cik = _ef1.text_input("CIK (10 digits, e.g. 0001067983)", key="edgar_cik_manual").strip()
+            _fund = _cik
+        else:
+            _cik = _EDGAR_FUNDS[_fpick]; _fund = _fpick
+        _nq = _ef2.slider("Quarters", 4, 12, 8, key="edgar_nq")
+        if _ef2.button("⬇️ Fetch / refresh from EDGAR", key="edgar_fetch") and _cik:
+            with st.spinner("Pulling 13F filings from SEC EDGAR…"):
+                try:
+                    _stq = _edgar_build_history(_cik, _fund, _nq)
+                    st.success(f"Stored {_stq} quarters for {_fund}.")
+                except Exception as _ee:
+                    st.error(f"EDGAR fetch failed: {_ee}")
+        _hist = _edgar_load(_cik) if _cik else pd.DataFrame()
+        if _hist is None or _hist.empty:
+            st.info("No stored 13F history yet for this fund — click **Fetch / refresh** above.")
+        else:
+            _qs = sorted(_hist["quarter"].unique())
+            # 1) AUM trend across quarters
+            _aum = _hist.groupby("quarter")["value"].sum().reset_index().sort_values("quarter")
+            _npos = _hist.groupby("quarter")["cusip"].nunique().reindex(
+                _aum["quarter"]).values if not _aum.empty else []
+            _af = go.Figure()
+            _af.add_trace(go.Scatter(x=_aum["quarter"], y=_aum["value"] / 1e9, mode="lines+markers",
+                                     name="AUM ($B)", line=dict(color="#3d8bff", width=3)))
+            _af.update_layout(template="plotly_dark", height=300,
+                              title=f"{_fund} — 13F portfolio value ({len(_qs)} quarters)",
+                              xaxis_title="Quarter end", yaxis_title="AUM ($B)", margin=dict(t=44, b=10))
+            st.plotly_chart(_af, use_container_width=True)
+            # 2) latest-quarter holdings with % portfolio + QoQ
+            _latest = _qs[-1]; _prev = _qs[-2] if len(_qs) > 1 else None
+            _cur = _hist[_hist["quarter"] == _latest].copy()
+            _curtot = _cur["value"].sum() or 1
+            _cur["% Port"] = (_cur["value"] / _curtot * 100).round(1)
+            if _prev:
+                _pmap = _hist[_hist["quarter"] == _prev].groupby("cusip")["shares"].sum()
+                _cur["QoQ%"] = _cur.apply(
+                    lambda r: round((r["shares"] - _pmap.get(r["cusip"], 0)) /
+                                    _pmap.get(r["cusip"], 1) * 100) if _pmap.get(r["cusip"], 0) else None, axis=1)
+            _cur = _cur.sort_values("value", ascending=False)
+            st.markdown(f"**Holdings as of {_latest}** ({len(_cur)} positions, "
+                        f"${_curtot/1e9:.1f}B)" + (f" · vs {_prev}" if _prev else ""))
+            _show = _cur[["issuer", "value", "% Port"] + (["QoQ%"] if _prev else []) + ["shares", "put_call"]].head(40).copy()
+            _show["value"] = _show["value"].apply(lambda v: f"${v/1e9:.2f}B" if v >= 1e9 else f"${v/1e6:.0f}M")
+            _show["shares"] = _show["shares"].apply(lambda v: f"{v/1e6:.1f}M" if v >= 1e6 else f"{v:,.0f}")
+            st.dataframe(_show, hide_index=True, use_container_width=True)
+            # 3) per-holding 12Q trend
+            _sel_h = st.selectbox("📈 12-quarter trend for holding",
+                                  list(_cur["issuer"].head(40)), key="edgar_hold")
+            _ht = _hist[_hist["issuer"] == _sel_h].groupby("quarter")["value"].sum().reset_index().sort_values("quarter")
+            if not _ht.empty:
+                _hf = go.Figure(go.Bar(x=_ht["quarter"], y=_ht["value"] / 1e9, marker_color="#00e676"))
+                _hf.update_layout(template="plotly_dark", height=280,
+                                  title=f"{_sel_h} — position value by quarter ($B)",
+                                  xaxis_title="Quarter", yaxis_title="$B", margin=dict(t=44, b=10))
+                st.plotly_chart(_hf, use_container_width=True)
+            st.caption("Note: 13F lists CUSIPs/issuer names (not tickers); % of company isn't shown here "
+                       "without a CUSIP→ticker map. Values are as-reported (whole $ for 2023+ filings).")
 
     with tab1:
         insiders = q("SELECT * FROM insider_trades ORDER BY transaction_date DESC")
