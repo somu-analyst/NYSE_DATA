@@ -14552,6 +14552,29 @@ if page == "🌍 Global Opportunities":
                     for it in _theme_news(_q, n=5):
                         e = "🟢" if it["tone"] > 0 else ("🔴" if it["tone"] < 0 else "⚪")
                         st.markdown(f"- {e} [{it['title']}]({it['link']}) · _{it['when']}_")
+
+            st.markdown("#### 🏛 Institutional research & white papers")
+            st.caption("Big-4 / bank / institution reports surfaced via news (most don't offer clean RSS). "
+                       "Each pulls the latest coverage of that publisher's reports & outlooks.")
+            _WHITEPAPER_FEEDS = {
+                "🟢 Deloitte Insights": "Deloitte Insights economic outlook industry report",
+                "🔵 McKinsey Global Institute": "McKinsey Global Institute report outlook",
+                "🟠 PwC / EY / KPMG": "PwC OR EY OR KPMG outlook report sector",
+                "🏦 Goldman Sachs Research": "Goldman Sachs research outlook markets economy",
+                "🏦 JPMorgan (Guide to Markets)": "JPMorgan Guide to the Markets outlook research",
+                "⚫ BlackRock Investment Institute": "BlackRock Investment Institute outlook",
+                "🌐 IMF / World Bank": "IMF World Economic Outlook OR World Bank Global Economic Prospects",
+                "🏛 BIS / OECD": "BIS OR OECD economic outlook report",
+            }
+            for _name, _q in _WHITEPAPER_FEEDS.items():
+                with st.expander(_name, expanded=False):
+                    _items = _theme_news(_q, n=5)
+                    if _items:
+                        for it in _items:
+                            e = "🟢" if it["tone"] > 0 else ("🔴" if it["tone"] < 0 else "⚪")
+                            st.markdown(f"- {e} [{it['title']}]({it['link']}) · _{it['when']}_")
+                    else:
+                        st.caption("No recent coverage found right now.")
             st.markdown("---")
             _custom = st.text_input("Add an RSS feed URL (e.g. a Substack/Morningstar/blog RSS)", key="glob_rss")
             if _custom:
