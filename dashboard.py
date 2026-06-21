@@ -1788,6 +1788,184 @@ def _macro_writeup(mac, label):
     return f"Overnight, {', '.join(bits)}. {tail}"
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _iv_rank(ticker, r=0.045):
+    """ATM implied-vol rank/percentile over the stored ~6-month premium history.
+    Returns dict(iv, rank, pct, lo, hi, n) or None. Built entirely from the DB."""
+    conn = get_conn()
+    try:
+        df = pd.read_sql(
+            "SELECT trade_date_now, strike, expiry_date, lastPrice_Call_now FROM options_change "
+            "WHERE UPPER(ticker)=?", conn, params=(ticker.upper(),))
+        sd = pd.read_sql("SELECT trade_date, close FROM stock_daily WHERE UPPER(ticker)=?",
+                         conn, params=(ticker.upper(),))
+    finally:
+        conn.close()
+    if df.empty or sd.empty:
+        return None
+    spot_by = {str(d): float(c) for d, c in zip(sd["trade_date"], sd["close"])}
+
+    def _pd_(x):
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(str(x), fmt)
+            except Exception:
+                pass
+        return None
+
+    ivs = []
+    for d, g in df.groupby("trade_date_now"):
+        spot = spot_by.get(str(d))
+        dd = _pd_(d)
+        if not spot or dd is None:
+            continue
+        best = None
+        for _, row in g.iterrows():
+            ed = _pd_(row["expiry_date"])
+            if ed is None:
+                continue
+            dte = (ed - dd).days
+            if dte < 10 or dte > 70:
+                continue
+            prem = float(row["lastPrice_Call_now"] or 0)
+            if prem <= 0:
+                continue
+            dist = abs(float(row["strike"]) - spot)
+            if best is None or dist < best[0]:
+                best = (dist, float(row["strike"]), prem, dte)
+        if best:
+            _, K, prem, dte = best
+            iv = _implied_vol(prem, spot, K, dte / 365.0, r, "call")
+            if 0.01 < iv < 5:
+                ivs.append(iv)
+    if len(ivs) < 10:
+        return None
+    cur, lo, hi = ivs[-1], min(ivs), max(ivs)
+    rank = (cur - lo) / (hi - lo) * 100 if hi > lo else 50.0
+    pct = sum(1 for v in ivs if v <= cur) / len(ivs) * 100
+    return {"iv": cur, "rank": rank, "pct": pct, "lo": lo, "hi": hi, "n": len(ivs)}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _next_earnings(ticker):
+    """Next earnings date + days away via yfinance. Returns dict(date, days) or None."""
+    try:
+        import pandas as _pd
+        t = yf.Ticker(ticker)
+        now = _pd.Timestamp.now().normalize()
+        dts = []
+        try:
+            ed = t.get_earnings_dates(limit=12)
+            if ed is not None and len(ed):
+                for ix in ed.index:
+                    ts = _pd.Timestamp(ix)
+                    ts = ts.tz_localize(None) if ts.tzinfo else ts
+                    dts.append(ts.normalize())
+        except Exception:
+            pass
+        if not dts:
+            try:
+                cal = t.calendar
+                e = cal.get("Earnings Date") if isinstance(cal, dict) else None
+                for x in (e if isinstance(e, (list, tuple)) else [e]) if e else []:
+                    dts.append(_pd.Timestamp(x).normalize())
+            except Exception:
+                pass
+        fut = sorted(d for d in dts if d >= now)
+        if fut:
+            return {"date": fut[0].strftime("%b %d"), "days": int((fut[0] - now).days)}
+    except Exception:
+        pass
+    return None
+
+
+def _roll_suggestion(conn, leg):
+    """Suggest a concrete roll for a flagged leg: target expiry/strike + est. credit/debit
+    from the stored chain. Returns a short string or None."""
+    try:
+        tk, typ, K, side, spot, cur = (leg["ticker"], leg["typ"], leg["K"],
+                                       leg["side"], leg["spot"], leg["cur"])
+        last_col = "lastPrice_Call_now" if typ == "call" else "lastPrice_Put_now"
+        ch = pd.read_sql(
+            f"SELECT expiry_date, strike, {last_col} AS last FROM options_change WHERE UPPER(ticker)=?",
+            conn, params=(tk.upper(),))
+        if ch.empty:
+            return None
+        today = datetime.now()
+        # target expiry: nearest with 25-45 DTE (further out than the current leg)
+        exps = {}
+        for _, rr in ch.iterrows():
+            for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+                try:
+                    ed = datetime.strptime(str(rr["expiry_date"]), fmt); break
+                except Exception:
+                    ed = None
+            if ed is None:
+                continue
+            dte = (ed - today).days
+            if 25 <= dte <= 50:
+                exps.setdefault(str(rr["expiry_date"]), dte)
+        if not exps:
+            return None
+        tgt_exp = min(exps, key=lambda e: abs(exps[e] - 35))
+        # target strike: short call ITM → roll up to ~3% OTM; else keep same strike (calendar)
+        tgt_K = K
+        if side == "short" and typ == "call" and spot > K:
+            tgt_K = round(spot * 1.03)
+        sub = ch[(ch["expiry_date"] == tgt_exp)].copy()
+        sub["d"] = (sub["strike"] - tgt_K).abs()
+        sub = sub[sub["last"].astype(float) > 0].sort_values("d")
+        if sub.empty:
+            return None
+        row = sub.iloc[0]
+        tgt_prem = float(row["last"]); tgt_K = float(row["strike"])
+        net = tgt_prem - cur                      # >0 credit for shorts / extra debit for longs
+        if side == "short":
+            cost = f"~${net:.2f} credit" if net > 0 else f"~${-net:.2f} debit"
+        else:
+            cost = f"~${net:.2f} debit" if net > 0 else f"~${-net:.2f} credit"
+        return f"roll → {tgt_exp[:10]} ${tgt_K:.0f}{typ[0].upper()} ({cost})"
+    except Exception:
+        return None
+
+
+def _portfolio_var(legs, r=0.045, lookback=60, conf=0.05):
+    """Historical 1-day VaR: replay each underlying's recent daily returns through the book
+    (BS reprice, 1 day decay). Returns dict(var, cvar, worst, best, n) in $ or None."""
+    conn = get_conn()
+    try:
+        rets = {}
+        for tk in {l["ticker"] for l in legs}:
+            sd = pd.read_sql(
+                "SELECT close FROM stock_daily WHERE UPPER(ticker)=? ORDER BY "
+                "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT ?",
+                conn, params=(tk.upper(), lookback + 1))
+            c = list(sd["close"].astype(float))[::-1]
+            rets[tk] = [c[i] / c[i - 1] - 1 for i in range(1, len(c))] if len(c) > 2 else []
+    finally:
+        conn.close()
+    n = min((len(v) for v in rets.values() if v), default=0)
+    if n < 20:
+        return None
+    pnls = []
+    for i in range(n):
+        tot = 0.0
+        for l in legs:
+            s = rets[l["ticker"]][i]
+            ns = l["spot"] * (1 + s); t1 = max(l["dte"] - 1, 0) / 365.0
+            ivs = max(l["iv"] * (1 - 2.0 * s), 0.05)
+            npx = bs_greeks(ns, l["K"], t1, r, ivs, l["typ"]).get("price", l["cur"]) if t1 > 0 \
+                else (max(ns - l["K"], 0) if l["typ"] == "call" else max(l["K"] - ns, 0))
+            tot += (npx - l["cur"]) * l["m"]
+        pnls.append(tot)
+    pnls.sort()
+    k = max(0, int(conf * len(pnls)) - 1)
+    var = pnls[k]
+    tail = [p for p in pnls if p <= var]
+    cvar = sum(tail) / len(tail) if tail else var
+    return {"var": var, "cvar": cvar, "worst": pnls[0], "best": pnls[-1], "n": len(pnls)}
+
+
 # ===================================================================
 # ──  OI WEEKLY COMPARISON  (same-week strike analysis)
 # ===================================================================
@@ -10054,6 +10232,33 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                    f"Time decay runs **${_net_theta:,.0f}/day**. "
                    f"A +1 vol-point IV change ≈ **${_net_vega:,.0f}**.")
 
+        # ── Portfolio risk: 1-day historical VaR + concentration ──
+        st.markdown("#### 🛡️ Portfolio risk")
+        _var = _portfolio_var(_legs)
+        _vc = st.columns(3)
+        if _var:
+            _vc[0].metric("1-day 95% VaR", f"${_var['var']:,.0f}", "worst realistic day", delta_color="inverse")
+            _vc[1].metric("Expected shortfall", f"${_var['cvar']:,.0f}", "avg of the bad tail", delta_color="inverse")
+            _vc[2].metric("Worst sim day", f"${_var['worst']:,.0f}", f"of {_var['n']} days", delta_color="inverse")
+            st.caption(f"Replays the last ~{_var['n']} daily moves of your underlyings through the book "
+                       "(BS reprice + 1 day decay). 95% VaR = on a bad-but-normal day you lose about this much; "
+                       "expected shortfall = average loss on the worst 5% of days.")
+        else:
+            st.caption("VaR needs more price history for these names.")
+        _gross = {}
+        for l in _legs:
+            gr = abs(l["cur"] * l["m"]) if l["side"] == "long" else l["entry"] * abs(l["m"])
+            _gross[l["ticker"]] = _gross.get(l["ticker"], 0.0) + gr
+        _tot = sum(_gross.values()) or 1.0
+        _top = max(_gross, key=_gross.get)
+        _toppct = _gross[_top] / _tot * 100
+        if _toppct >= 50:
+            st.warning(f"⚠️ **Concentration:** {_top} is **{_toppct:.0f}%** of your capital-at-risk. "
+                       "A single-name shock hits hard — consider diversifying or hedging it.")
+        else:
+            st.caption("Capital-at-risk split: "
+                       + " · ".join(f"{k} {v/_tot*100:.0f}%" for k, v in sorted(_gross.items(), key=lambda x: -x[1])))
+
         # ── Next-day market-shock P&L grid ──
         st.markdown("#### 📉 Tomorrow's scenarios — portfolio P&L vs a market move")
         _shocks = [-0.03, -0.02, -0.01, -0.005, 0.0, 0.005, 0.01, 0.02, 0.03]
@@ -10144,6 +10349,19 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _buzz = f" · buzz {_fh['buzz']:.1f}×" if _fh.get("buzz") else ""
                     st.markdown(f"**🛰 Finnhub news-sentiment:** {_fhe} {_fh['label']} "
                                 f"({_fh['bull_pct']:.0f}% bullish){_buzz}")
+                _ivr = _iv_rank(_tk)
+                if _ivr:
+                    _hint = ("🟢 cheap — favor buying premium / long options" if _ivr["rank"] < 30
+                             else "🔴 rich — favor selling premium / spreads" if _ivr["rank"] > 70
+                             else "🟡 mid-range")
+                    st.markdown(f"**🌡️ IV Rank {_ivr['rank']:.0f}** (IV {_ivr['iv']*100:.0f}% vs "
+                                f"{_ivr['lo']*100:.0f}–{_ivr['hi']*100:.0f}% over 6mo) — {_hint}")
+                _earn = _next_earnings(_tk)
+                if _earn and _earn["days"] <= 14:
+                    st.warning(f"📅 **{_tk} earnings in {_earn['days']}d ({_earn['date']})** — binary gap "
+                               "risk; consider sizing down or closing options before the print.")
+                elif _earn:
+                    st.caption(f"📅 Next {_tk} earnings: {_earn['date']} ({_earn['days']}d out).")
                 st.info(_gp_writeup(_tk, _spot, _em, _w, _r1, _s1, _tk_dd, _tk_th, _nw, _tl, _stt))
 
                 _sm = []
@@ -10183,6 +10401,10 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     elif pnl_pct <= -50:
                         acts.append("down ≥50% — cut/roll")
                     action = "; ".join(acts) if acts else "hold & monitor"
+                    if acts and (l["dte"] <= 21 or (l["side"] == "short" and money == "ITM")):
+                        _rs = _roll_suggestion(_gp_conn, l)
+                        if _rs:
+                            action += f" · {_rs}"
                     _rows.append({
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${l['K']:.0f}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": money,
