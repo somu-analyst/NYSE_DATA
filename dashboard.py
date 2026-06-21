@@ -1614,7 +1614,30 @@ def _ticker_news(ticker, n=6):
     return out
 
 
-def _gp_writeup(tk, spot, em, walls, r1, s1, dd, th, nw, tlegs):
+@st.cache_data(ttl=600, show_spinner=False)
+def _stocktwits_sentiment(ticker):
+    """Free StockTwits crowd sentiment (Bullish/Bearish message tags). No API key."""
+    try:
+        import urllib.request, json as _j
+        req = urllib.request.Request(
+            f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json",
+            headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            d = _j.loads(r.read().decode())
+        bull = bear = 0
+        for m in d.get("messages", []):
+            b = ((m.get("entities") or {}).get("sentiment") or {}).get("basic")
+            if b == "Bullish": bull += 1
+            elif b == "Bearish": bear += 1
+        if bull + bear > 0:
+            return {"bull": bull, "bear": bear,
+                    "label": "BULLISH" if bull > bear * 1.3 else "BEARISH" if bear > bull * 1.3 else "MIXED"}
+    except Exception:
+        pass
+    return None
+
+
+def _gp_writeup(tk, spot, em, walls, r1, s1, dd, th, nw, tlegs, stt=None):
     """Plain-language next-day read for one stock: levels + expected move + news + position risk."""
     cw, pw = walls.get("call_wall"), walls.get("put_wall")
     P = []
@@ -1646,6 +1669,12 @@ def _gp_writeup(tk, spot, em, walls, r1, s1, dd, th, nw, tlegs):
                      "should drive the tape.")
         else:
             P.append("Newsflow is quiet — technicals and the walls should dominate.")
+    if stt:
+        P.append(f"Retail crowd on StockTwits is {stt['label'].lower()} "
+                 f"({stt['bull']} bullish / {stt['bear']} bearish).")
+        if (nw.get("items") and nw["label"] in ("BULLISH", "BEARISH")
+                and stt["label"] in ("BULLISH", "BEARISH") and stt["label"] != nw["label"]):
+            P.append("Heads-up: news and the crowd disagree — expect choppier, headline-driven moves.")
     if dd > 0:
         P.append(f"Your {tk} legs are net long (${dd:,.0f} per +1%) — a green open helps; a gap-down is the risk.")
     elif dd < 0:
@@ -10046,6 +10075,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 except Exception:
                     pass
             _nw = _ticker_news(_tk)
+            _stt = _stocktwits_sentiment(_tk)
             _te = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡", "NEUTRAL": "⚪"}[_nw["label"]]
             with st.expander(f"{_te} {_tk} · ${_spot:.2f} · {len(_tl)} legs · open P&L ${_tk_pnl:,.0f} · news {_nw['label']}",
                              expanded=True):
@@ -10061,7 +10091,11 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 if _r1: _lv.append(f"R1 ${_r1:.0f}")
                 if _lv:
                     st.markdown("**Key levels:** " + " · ".join(_lv))
-                st.info(_gp_writeup(_tk, _spot, _em, _w, _r1, _s1, _tk_dd, _tk_th, _nw, _tl))
+                if _stt:
+                    _ste = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}.get(_stt["label"], "⚪")
+                    st.markdown(f"**💬 StockTwits crowd:** {_ste} {_stt['label']} "
+                                f"({_stt['bull']} bullish / {_stt['bear']} bearish)")
+                st.info(_gp_writeup(_tk, _spot, _em, _w, _r1, _s1, _tk_dd, _tk_th, _nw, _tl, _stt))
 
                 _sm = []
                 for s in (-0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03):
