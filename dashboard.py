@@ -1639,26 +1639,45 @@ def _stocktwits_sentiment(ticker):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def _finnhub_sentiment(ticker):
-    """Finnhub news-sentiment (bullish %, buzz, score). Needs free FINNHUB_API_KEY env var;
-    returns None if no key or the endpoint is gated/unavailable."""
+    """Finnhub sentiment. Tries the news-sentiment endpoint (premium on some plans); if that's
+    gated, falls back to the free company-news endpoint and scores the headlines locally.
+    Needs free FINNHUB_API_KEY env var; returns None if no key / nothing usable."""
     key = os.environ.get("FINNHUB_API_KEY") or os.environ.get("FINNHUB_KEY")
     if not key:
         return None
+    import urllib.request, json as _j
+    # 1) news-sentiment (richest, but premium on some tiers)
     try:
-        import urllib.request, json as _j
-        url = f"https://finnhub.io/api/v1/news-sentiment?symbol={ticker}&token={key}"
-        with urllib.request.urlopen(url, timeout=6) as r:
+        with urllib.request.urlopen(
+                f"https://finnhub.io/api/v1/news-sentiment?symbol={ticker}&token={key}", timeout=6) as r:
             d = _j.loads(r.read().decode())
-        s = d.get("sentiment") or {}
-        bp = s.get("bullishPercent")
-        if bp is None:
-            return None
-        buzz = (d.get("buzz") or {}).get("buzz")
-        label = "BULLISH" if bp >= 0.6 else ("BEARISH" if bp <= 0.4 else "MIXED")
-        return {"bull_pct": bp * 100, "bear_pct": (s.get("bearishPercent") or 0) * 100,
-                "score": d.get("companyNewsScore"), "buzz": buzz, "label": label}
+        bp = (d.get("sentiment") or {}).get("bullishPercent")
+        if bp is not None:
+            return {"bull_pct": bp * 100, "buzz": (d.get("buzz") or {}).get("buzz"),
+                    "label": "BULLISH" if bp >= 0.6 else "BEARISH" if bp <= 0.4 else "MIXED",
+                    "src": "news-sentiment"}
     except Exception:
-        return None
+        pass
+    # 2) free fallback: company-news → score headlines with the context-aware tone fn
+    try:
+        from datetime import date, timedelta
+        _to = date.today(); _from = _to - timedelta(days=7)
+        with urllib.request.urlopen(
+                f"https://finnhub.io/api/v1/company-news?symbol={ticker}"
+                f"&from={_from}&to={_to}&token={key}", timeout=6) as r:
+            arts = _j.loads(r.read().decode())
+        bull = bear = 0
+        for a in (arts or [])[:40]:
+            t = _headline_tone((a.get("headline", "") + " " + a.get("summary", "")))
+            if t > 0: bull += 1
+            elif t < 0: bear += 1
+        if bull + bear > 0:
+            return {"bull_pct": bull / (bull + bear) * 100, "buzz": None, "bull": bull, "bear": bear,
+                    "label": "BULLISH" if bull > bear * 1.3 else "BEARISH" if bear > bull * 1.3 else "MIXED",
+                    "src": "company-news"}
+    except Exception:
+        pass
+    return None
 
 
 def _gp_writeup(tk, spot, em, walls, r1, s1, dd, th, nw, tlegs, stt=None):
