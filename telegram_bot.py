@@ -10604,6 +10604,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await macro_view(query)
         elif data == "mom_view":
             await mom_view(query)
+        elif data == "plan_view":
+            await plan_view(query)
         elif data == "mom_recompute":
             await mom_recompute_view(query)
         elif data == "mom_help":
@@ -15459,6 +15461,182 @@ def _fmt_briefing(b):
         "<i>Educational - not advice. Size for being wrong; let options price the odds.</i>"]
     return "\n".join(lines)
 
+# ═══════════════════════════════════════════════════════════════════
+# ── NEXT-DAY GAME PLAN (/plan) — condensed portfolio plan for Telegram
+# ═══════════════════════════════════════════════════════════════════
+_ST_CACHE = {}
+
+def _stocktwits_sentiment(tk):
+    """Free StockTwits crowd sentiment for a ticker (Bullish/Bearish tags). Cached 10 min."""
+    import time as _t
+    now = _t.time()
+    c = _ST_CACHE.get(tk)
+    if c and now - c[0] < 600:
+        return c[1]
+    res = None
+    try:
+        import urllib.request, json as _j
+        req = urllib.request.Request(
+            f"https://api.stocktwits.com/api/2/streams/symbol/{tk}.json",
+            headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            d = _j.loads(r.read().decode())
+        bull = bear = 0
+        for m in d.get("messages", []):
+            b = ((m.get("entities") or {}).get("sentiment") or {}).get("basic")
+            if b == "Bullish": bull += 1
+            elif b == "Bearish": bear += 1
+        if bull + bear > 0:
+            res = {"bull": bull, "bear": bear,
+                   "label": "BULLISH" if bull > bear * 1.3 else "BEARISH" if bear > bull * 1.3 else "MIXED"}
+    except Exception:
+        res = None
+    _ST_CACHE[tk] = (now, res)
+    return res
+
+def _plan_prem(conn, tk, K, exp, typ):
+    col = "lastPrice_Call_now" if typ == "call" else "lastPrice_Put_now"
+    mdy = _to_mdy(exp)
+    try:
+        pr = pd.read_sql(
+            f"SELECT {col} AS last FROM options_change WHERE UPPER(ticker)=? AND strike=? AND expiry_date=? "
+            "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            conn, params=(tk.upper(), float(K), mdy))
+        if not pr.empty and pr.iloc[0]["last"] and float(pr.iloc[0]["last"]) > 0:
+            return float(pr.iloc[0]["last"])
+    except Exception:
+        pass
+    return None
+
+def _kb_plan():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="plan_view"),
+                                  InlineKeyboardButton("⬅️ Hub", callback_data="hub_menu")]])
+
+def _next_day_plan(conn):
+    """Condensed whole-portfolio next-day plan: regime + Greeks + per-stock levels,
+    expected move, StockTwits sentiment, per-leg actions, and a morning checklist."""
+    L = ["🌅 <b>NEXT-DAY GAME PLAN</b>"]
+    try:
+        rg = _risk_regime()
+        L.append(f"{rg['emoji']} Regime <b>{rg['label']}</b> ({rg['score']:+d})")
+    except Exception:
+        pass
+    try:
+        tr = pd.read_sql("SELECT ticker,option_type,strike,quantity,expiry,entry_price,entry_iv "
+                         "FROM trades WHERE status='OPEN'", conn)
+    except Exception:
+        tr = pd.DataFrame()
+    if tr is None or tr.empty:
+        L.append("No open positions.")
+        return "\n".join(L)
+    R = 0.045
+    by = {}
+    for _, t in tr.iterrows():
+        by.setdefault(str(t["ticker"]).upper(), []).append(t)
+    net_dd = net_th = 0.0
+    checklist, blocks = [], []
+    for tk, legs in by.items():
+        spot = _gex_spot(conn, tk) or _last_price(tk)
+        if not spot:
+            continue
+        g = {}
+        try:
+            g = _compute_gex(tk, conn, spot)
+        except Exception:
+            pass
+        cw, pw = g.get("call_wall"), g.get("put_wall")
+        tk_dd = tk_th = 0.0
+        ivs, leglines = [], []
+        for t in legs:
+            typ = "call" if str(t["option_type"]).lower().startswith("c") else "put"
+            K = float(t["strike"] or 0); qty = int(t["quantity"] or 0); exp = str(t["expiry"])
+            dte = None
+            for fmt in ("%Y-%m-%d", "%m-%d-%Y"):
+                try:
+                    dte = (datetime.strptime(exp, fmt) - datetime.now()).days; break
+                except Exception:
+                    pass
+            if dte is None or K <= 0 or qty == 0:
+                continue
+            T = max(dte, 0) / 365.0
+            entry = float(t["entry_price"] or 0)
+            prem = _plan_prem(conn, tk, K, exp, typ)
+            iv = _implied_vol_hp(prem, spot, K, T, R) if (prem and T > 0) else (float(t["entry_iv"] or 0) or 0.30)
+            ivs.append(iv)
+            gg = bs_greeks(spot, K, T, R, iv, typ) if T > 0 else {"delta": 0, "theta": 0, "price": (prem or entry)}
+            cur = prem if prem else gg.get("price", entry)
+            m = qty * 100
+            tk_dd += gg["delta"] * m * spot * 0.01
+            tk_th += gg["theta"] * m
+            side = "short" if qty < 0 else "long"
+            money = "ITM" if ((spot > K) if typ == "call" else (spot < K)) else "OTM"
+            pnlp = ((cur - entry) / entry * 100 * (1 if qty > 0 else -1)) if entry else 0
+            acts = []
+            if dte <= 7: acts.append(f"{dte}DTE decide")
+            elif dte <= 21: acts.append(f"{dte}DTE roll-plan")
+            if side == "short" and money == "ITM": acts.append("ITM assign-risk")
+            if pnlp >= 50: acts.append("take profit")
+            elif pnlp <= -50: acts.append("cut/roll")
+            a = "; ".join(acts) if acts else "hold"
+            leglines.append(f"  {'🔻' if side == 'short' else '🔹'} {side} ${K:.0f}{typ[0].upper()} "
+                            f"{dte}d {money} {pnlp:+.0f}% → {a}")
+            if acts:
+                checklist.append(f"{tk} ${K:.0f}{typ[0].upper()}: {a}")
+        net_dd += tk_dd; net_th += tk_th
+        ivm = sorted(ivs)[len(ivs) // 2] if ivs else 0.30
+        em = spot * ivm * (1 / 252.0) ** 0.5
+        head = f"<b>{tk}</b> ${spot:.2f} · ±${em:.2f}/1d"
+        lv = []
+        if pw: lv.append(f"PW${pw:.0f}")
+        if cw: lv.append(f"CW${cw:.0f}")
+        if lv:
+            head += " · " + " ".join(lv)
+        stt = _stocktwits_sentiment(tk)
+        if stt:
+            head += f"\n  💬 StockTwits {stt['label']} ({stt['bull']}🟢/{stt['bear']}🔴)"
+        blocks.append(head + "\n" + "\n".join(leglines))
+    L.append(f"Net Δ/+1% <b>${net_dd:,.0f}</b> · Θ/day <b>${net_th:,.0f}</b>")
+    L.append("")
+    L += blocks
+    if checklist:
+        L.append("")
+        L.append("✅ <b>Tomorrow:</b>")
+        for c in checklist[:8]:
+            L.append("• " + c)
+    L.append("")
+    L.append("<i>Educational, not advice.</i>")
+    return "\n".join(L)
+
+async def plan_command(update, ctx):
+    """/plan - condensed next-day game plan for your open positions."""
+    conn = get_conn()
+    try:
+        txt = _next_day_plan(conn)
+    finally:
+        conn.close()
+    await update.message.reply_text(txt, parse_mode=H, reply_markup=_kb_plan())
+
+async def plan_view(query):
+    conn = get_conn()
+    try:
+        txt = _next_day_plan(conn)
+    finally:
+        conn.close()
+    await query.message.reply_text(txt, parse_mode=H, reply_markup=_kb_plan())
+
+async def plan_alert(ctx):
+    """Pre-market auto-send of the next-day game plan."""
+    try:
+        _, chat_id = load_creds()
+        conn = get_conn()
+        try:
+            txt = _next_day_plan(conn)
+        finally:
+            conn.close()
+        await ctx.bot.send_message(chat_id=int(chat_id), text=txt, parse_mode=H)
+    except Exception as e:
+        log.warning(f"plan_alert failed: {e}")
+
 async def briefing_command(update, ctx):
     """/briefing - daily macro event brief with optimistic/pessimistic/balanced views."""
     try:
@@ -16145,6 +16323,7 @@ HUB_MENU_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("🚀 Momentum", callback_data="mom_view"),
      InlineKeyboardButton("🧭 Regime", callback_data="regime_view"),
      InlineKeyboardButton("🌀 Vanna", callback_data="vanna_view")],
+    [InlineKeyboardButton("🌅 Next-Day Plan", callback_data="plan_view")],
     [BACK_BTN],
 ])
 
@@ -16966,6 +17145,7 @@ def main():
     app.add_handler(CommandHandler("opex", opex_command))
     app.add_handler(CommandHandler("event", event_command))
     app.add_handler(CommandHandler("briefing", briefing_command))
+    app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("journal", journal_command))
     app.add_handler(CommandHandler("logevent", logevent_command))
     app.add_handler(CommandHandler("bookmarks", bookmarks_command))
@@ -16990,6 +17170,7 @@ def main():
         from datetime import time as dt_time
         job_queue.run_daily(morning_alert, time=dt_time(14, 0, 0))  # 9 AM ET = 14:00 UTC
         job_queue.run_daily(briefing_alert, time=dt_time(14, 5, 0))  # daily brief 9:05 AM ET
+        job_queue.run_daily(plan_alert, time=dt_time(13, 30, 0))     # next-day game plan ~8:30 AM ET pre-market
         log.info("Scheduled morning alert at 9:00 AM ET daily")
         # 15-min intraday alert (fires every 15 min; function checks market hours internally)
         job_queue.run_repeating(intraday_alert, interval=900, first=30)
