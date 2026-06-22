@@ -1751,7 +1751,7 @@ def _macro_backdrop():
     out = {}
     for name, sym in syms.items():
         try:
-            c = yf.Ticker(sym).history(period="5d")["Close"].dropna()
+            c = _cached_history(sym, "5d")["Close"].dropna()
             if len(c) >= 2:
                 out[name] = {"price": float(c.iloc[-1]),
                              "pct": (float(c.iloc[-1]) / float(c.iloc[-2]) - 1) * 100}
@@ -4958,7 +4958,7 @@ elif page == "🎯 Prop Trading Screen":
             _prop_ext = _prop_ah["spot_ah"] if _prop_ah["spot_ah"] > 0 else _prop_eod
             current_px = _prop_ext if st.session_state.get("use_ah") else _prop_eod
             if current_px <= 0:
-                current_px = float(yf.Ticker(opp["Ticker"]).history(period="1d")["Close"].iloc[-1])
+                current_px = float(_cached_history(opp["Ticker"], "1d")["Close"].iloc[-1])
             _prop_src = (_prop_ah["label"] if _prop_ah["is_extended"] and st.session_state.get("use_ah")
                          else "EOD")
             _prop_icon = "🌙" if "AH" in _prop_src or "PM" in _prop_src else ("☀️" if _prop_src == "EOD" else "📈")
@@ -10186,7 +10186,7 @@ elif page == "⚡ Trade Risk Calculator":
     _sim_spot = 580.0
     try:
         _sim_tk_obj = yf.Ticker(sim_ticker)
-        _sim_eod = float(_sim_tk_obj.history(period="1d")["Close"].iloc[-1])
+        _sim_eod = float(_cached_history(sim_ticker, "1d")["Close"].iloc[-1])
         _sim_ah_d = _get_ah_price(sim_ticker)
         _sim_spot = (_sim_ah_d["spot_ah"] if _sim_ah_d["spot_ah"] > 0 else _sim_eod) \
                     if st.session_state.get("use_ah") else _sim_eod
@@ -10499,6 +10499,11 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             return None
 
         # ── Build per-leg analytics ──
+        _gp_use_ah = st.session_state.get("use_ah", False)
+        if _gp_use_ah:
+            st.info("🌙 **After-hours mode** — analysis uses the latest AH/pre-market price per "
+                    "ticker; each option is re-priced from it (IV anchored to the EOD premium).")
+        _ah_notes = []
         _legs = []
         for _, _t in _gp_tr.iterrows():
             _tk = str(_t["ticker"]).upper()
@@ -10507,27 +10512,35 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _qty = int(_t["quantity"] or 0)
             _exp = str(_t["expiry"])
             _exp_mdy = _gp_to_mdy(_exp)
-            _spot = _gp_spot(_tk)
+            _eod_spot = _gp_spot(_tk)
             _dte = None
             for _fmt in ("%Y-%m-%d", "%m-%d-%Y"):
                 try:
                     _dte = (datetime.strptime(_exp, _fmt) - datetime.now()).days; break
                 except Exception:
                     pass
-            if _spot is None or _dte is None or _K <= 0 or _qty == 0:
+            if _eod_spot is None or _dte is None or _K <= 0 or _qty == 0:
                 continue
             _T = max(_dte, 0) / 365.0
             _entry = float(_t["entry_price"] or 0)
             _prem = _gp_premium(_tk, _K, _exp_mdy, _typ)
-            _iv = _implied_vol(_prem, _spot, _K, _T, _R, _typ) if (_prem and _T > 0) else (float(_t["entry_iv"] or 0) or 0.30)
+            # IV back-solved from the EOD premium at the EOD spot (stable anchor)
+            _iv = _implied_vol(_prem, _eod_spot, _K, _T, _R, _typ) if (_prem and _T > 0) else (float(_t["entry_iv"] or 0) or 0.30)
+            # AH-aware spot: when toggle on, analyze at the after-hours / pre-market price
+            _ahd = _get_ah_price(_tk) if _gp_use_ah else None
+            _ah_on = bool(_gp_use_ah and _ahd and _ahd.get("is_extended") and _ahd.get("spot_ah", 0) > 0)
+            _spot = _ahd["spot_ah"] if _ah_on else _eod_spot
+            if _ah_on and not any(n.startswith(_tk + " ") for n in _ah_notes):
+                _ah_notes.append(f"{_tk} {_ahd['label']} ${_ahd['spot_ah']:.2f} ({_ahd['ah_chg_pct']:+.1f}% vs EOD ${_eod_spot:.2f})")
             _g = bs_greeks(_spot, _K, _T, _R, _iv, _typ) if _T > 0 else {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "price": (_prem or _entry)}
-            _cur = _prem if _prem else _g.get("price", _entry)
+            # current value: AH-repriced via BS when AH on, else EOD market premium
+            _cur = _g.get("price", _prem or _entry) if _ah_on else (_prem if _prem else _g.get("price", _entry))
             _m = _qty * 100                                   # signed contract multiplier
             _side = "short" if _qty < 0 else "long"
             _be = (_K + _entry) if _typ == "call" else (_K - _entry)   # long breakeven ref
             _legs.append({
                 "ticker": _tk, "typ": _typ, "K": _K, "qty": _qty, "side": _side,
-                "exp": _exp, "exp_mdy": _exp_mdy, "dte": _dte, "spot": _spot,
+                "exp": _exp, "exp_mdy": _exp_mdy, "dte": _dte, "spot": _spot, "eod_spot": _eod_spot,
                 "iv": _iv, "entry": _entry, "cur": _cur, "g": _g, "m": _m, "be": _be,
                 "pnl": (_cur - _entry) * _m,
                 "pos_delta": _g["delta"] * _m, "pos_theta": _g["theta"] * _m,
@@ -10540,6 +10553,11 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             try: _gp_conn.close()
             except Exception: pass
             st.stop()
+
+        if _ah_notes:
+            st.caption("🌙 After-hours moves: " + " · ".join(_ah_notes))
+        elif _gp_use_ah:
+            st.caption("🌙 AH mode on, but no extended-hours price available right now — using EOD close.")
 
         # ── Portfolio Greeks strip ──
         _net_ddelta = sum(l["ddelta_1pct"] for l in _legs)
@@ -10736,16 +10754,31 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         _rs = _roll_suggestion(_gp_conn, l)
                         if _rs:
                             action += f" · {_rs}"
+                    # next-session economics: est. open, expected day range (1σ), fill-limit to close
+                    _Tn = max(l["dte"], 0) / 365.0
+                    _sig = l["spot"] * l["iv"] * (1 / 252.0) ** 0.5
+                    _vu = bs_greeks(l["spot"] + _sig, l["K"], _Tn, _R, l["iv"], l["typ"])["price"]
+                    _vd = bs_greeks(max(l["spot"] - _sig, 0.01), l["K"], _Tn, _R, l["iv"], l["typ"])["price"]
+                    _olo, _ohi = min(_vu, _vd), max(_vu, _vd)
+                    _topen = bs_greeks(l["spot"], l["K"], max(l["dte"] - 1, 0) / 365.0, _R, l["iv"], l["typ"])["price"]
+                    _buf = max(0.05, round(l["cur"] * 0.03, 2))     # ~3% / min 5c marketable buffer
+                    _climit = (f"SELL ≤ ${max(l['cur'] - _buf, 0.01):.2f}" if l["side"] == "long"
+                               else f"BUY ≥ ${l['cur'] + _buf:.2f}")
                     _rows.append({
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${l['K']:.0f}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": money,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
+                        "Est Open": round(_topen, 2), "Day L–H": f"${_olo:.2f}–${_ohi:.2f}",
+                        "Close @": _climit,
                         "P&L %": round(pnl_pct), "P&L $": round(l["pnl"]), "Action": action,
                     })
                     if action != "hold & monitor":
                         _checklist.append(f"**{_tk} ${l['K']:.0f}{l['typ'][0].upper()}** ({l['side']}, {l['dte']}DTE): {action}")
                 st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True,
                              column_config={"P&L %": st.column_config.NumberColumn(format="%d%%")})
+                st.caption("**Est Open** = value if flat into next open (1 day decay; AH-adjusted when 🌙 on). "
+                           "**Day L–H** = expected option range on a 1σ daily move. "
+                           "**Close @** = suggested marketable limit to get filled (sell-to-close longs / buy-to-close shorts).")
 
         # ── Morning checklist ──
         st.markdown("#### ✅ Tomorrow's open — action checklist")
@@ -10944,7 +10977,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         with st.spinner(f"Loading {_ep_sel_tk} data..."):
             try:
                 _btk_obj   = yf.Ticker(_ep_sel_tk)
-                _btk_hist  = _btk_obj.history(period="60d")
+                _btk_hist  = _cached_history(_ep_sel_tk, "60d")
                 _btk_eod   = float(_btk_hist["Close"].iloc[-1]) if len(_btk_hist) >= 1 else 0
                 _btk_prev  = float(_btk_hist["Close"].iloc[-2]) if len(_btk_hist) >= 2 else _btk_eod
                 _btk_chg   = (_btk_eod - _btk_prev) / _btk_prev * 100 if _btk_prev else 0
@@ -11289,7 +11322,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         _ep_hist_returns = np.array([])  # for MC calibration
         try:
             _ep_tk_obj = yf.Ticker(ep_ticker)
-            _ep_hist = _ep_tk_obj.history(period="3mo")  # 60+ days for volatility
+            _ep_hist = _cached_history(ep_ticker, "3mo")  # 60+ days for volatility (cached)
             if len(_ep_hist) >= 2:
                 _ep_spot = float(_ep_hist["Close"].iloc[-1])
                 _ep_prev_close = float(_ep_hist["Close"].iloc[-2])
@@ -12322,7 +12355,7 @@ if page == "🔬 OI Comparison Charts":
     if spot is None:
         try:
             t = yf.Ticker(sel_ticker)
-            spot = float(t.history(period="1d")["Close"].iloc[-1])
+            spot = float(_cached_history(sel_ticker, "1d")["Close"].iloc[-1])
         except Exception:
             spot = 0
 
