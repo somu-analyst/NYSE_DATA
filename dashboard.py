@@ -11848,21 +11848,9 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         for l in _legs:
             _by_tk.setdefault(l["ticker"], []).append(l)
         _checklist = []
-        # ── cheap pre-pass: one-liner summaries + portfolio-wide action checklist (keeps page fast) ──
-        _summ = []
+        # ── pre-pass: build the portfolio-wide morning action checklist across every position ──
         for _tk, _tl in _by_tk.items():
-            _ps = _tl[0]["spot"]; _ppnl = sum(x["pnl"] for x in _tl)
-            try:
-                _phc = _cached_history(_tk, "5d")["Close"].dropna()
-                _pprev = float(_phc.iloc[-2]) if len(_phc) >= 2 else float(_phc.iloc[-1])
-            except Exception:
-                _pprev = _tl[0].get("eod_spot", _ps)
-            _pchg = (_ps / _pprev - 1) * 100 if _pprev else 0.0
-            _pnw = _ticker_news(_tk)
-            _pte = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡", "NEUTRAL": "⚪"}[_pnw["label"]]
-            _ppl = "🟢 winning" if _ppnl > 0 else "🔴 losing" if _ppnl < 0 else "⚪ flat"
-            _summ.append((_tk, f"{_pte} **{_tk}** · \\${_ps:.2f} ({_pchg:+.1f}% vs prev \\${_pprev:.2f}) · "
-                               f"{len(_tl)} legs · P&L \\${_ppnl:,.0f} {_ppl} · news {_pnw['label']}"))
+            _ps = _tl[0]["spot"]
             for l in _tl:
                 _mny = "ITM" if ((l["spot"] > l["K"]) if l["typ"] == "call" else (l["spot"] < l["K"])) else "OTM"
                 _pp = ((l["cur"] - l["entry"]) / l["entry"] * 100 * (1 if l["qty"] > 0 else -1)) if l["entry"] else 0
@@ -11881,12 +11869,10 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             for p in _gp_patterns(_tk, _ps, None, None):
                 if p["sig"] in ("BULL", "BEAR") and any(k in p["name"] for k in ("flag", "cross")):
                     _checklist.append(f"**{_tk}** {p['name']}: {p['why']}")
-        st.caption("Each position in one line — pick one below for its full game plan "
-                   "(only the selected stock is analyzed in depth, so the page stays fast).")
-        for _tks, _line in _summ:
-            st.markdown(_line)
-        _focus = st.selectbox("🔍 Full game plan for", [t for t, _ in _summ], key="gp_focus_stock")
-        for _tk, _tl in ([(_focus, _by_tk[_focus])] if _focus in _by_tk else []):
+        st.caption("Every position below is its own dropdown — the one-line header is the summary; "
+                   "open any to see that stock's full ticker-level analysis and individual legs. "
+                   "Portfolio totals are above. (Cached, so opening several stays fast.)")
+        for _tk, _tl in _by_tk.items():
             _spot = _tl[0]["spot"]
             _ivs = sorted(x["iv"] for x in _tl); _ivm = _ivs[len(_ivs) // 2]
             _em = _spot * _ivm * (1 / 252.0) ** 0.5
@@ -11922,7 +11908,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _pnllbl = "🟢 winning" if _tk_pnl > 0 else "🔴 losing" if _tk_pnl < 0 else "⚪ flat"
             with st.expander(f"{_te} {_tk} · ${_spot:.2f} ({_chg:+.1f}% vs prev ${_prev_close:.2f}) · "
                              f"{len(_tl)} legs · P&L ${_tk_pnl:,.0f} {_pnllbl} · news {_nw['label']}",
-                             expanded=True):
+                             expanded=False):
                 _mc = st.columns(4)
                 _mc[0].metric("Spot", f"${_spot:.2f}", f"{_chg:+.2f}% vs prev close",
                               delta_color="normal" if _chg >= 0 else "inverse")
