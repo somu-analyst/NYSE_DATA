@@ -352,12 +352,15 @@ def _get_ah_price(ticker: str) -> dict:
         result["spot_reg"] = reg
 
         post = 0.0; pre = 0.0
-        try:
-            _di = yf.Ticker(ticker).info
-            post = float(_di.get("postMarketPrice") or 0)
-            pre  = float(_di.get("preMarketPrice") or 0)
-        except Exception:
-            pass
+        # The slow .info call is only needed for pre/post-market prices; during regular hours
+        # (or when closed) fast_info.last_price is enough — skip .info to keep live refresh fast.
+        if _market_state() in ("PRE", "AFTER", "UNKNOWN"):
+            try:
+                _di = yf.Ticker(ticker).info
+                post = float(_di.get("postMarketPrice") or 0)
+                pre  = float(_di.get("preMarketPrice") or 0)
+            except Exception:
+                pass
         last = float(getattr(fi, "last_price", 0) or 0)
 
         if post > 0:
@@ -2709,6 +2712,22 @@ def _ahf_run(ticker):
     return {"F": F, "personas": personas, "analysts": analysts, "risk": risk,
             "bull": bull, "bear": bear, "neu": neu, "net": net,
             "action": action, "conf": conf, "size": size}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_hp_engine(ticker):
+    """Cached 24-model engine (telegram_bot.high_prob_signals_engine) so the Game Plan's deep
+    analysis doesn't re-run all 24 models on every rerun / 30s auto-refresh. OI is EOD so a
+    2-min cache loses nothing."""
+    try:
+        import telegram_bot as _tbe
+        conn = get_conn()
+        try:
+            return _tbe.high_prob_signals_engine(ticker, conn)
+        finally:
+            conn.close()
+    except Exception:
+        return None
 
 
 def _render_ahf_pretrade(ticker, key=""):
@@ -12087,8 +12106,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
 
                     # ── 24-model engine: headline + per-model breakdown dropdown ──
                     try:
-                        import telegram_bot as _tbe
-                        _eng = _tbe.high_prob_signals_engine(_tk, _gp_conn)
+                        _eng = _cached_hp_engine(_tk)
                         if isinstance(_eng, dict) and _eng.get("signal"):
                             _ee2 = {"BULL": "🟢", "BEAR": "🔴", "SELL_PREMIUM": "🟠", "NEUTRAL": "⚪"}.get(_eng["signal"], "⚪")
                             st.markdown(f"**🤖 24-Model engine:** {_ee2} **{_eng['signal']}** · "
