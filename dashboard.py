@@ -10432,7 +10432,15 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
     if _ep_mode == "🌅 Next-Day Game Plan":
         st.caption("Whole-portfolio view: what tomorrow's open could do to your positions, the key "
                    "levels to watch, and a ranked action checklist. Built from your DB (latest close + "
-                   "stored option prices) with Black-Scholes — no waiting on live feeds.")
+                   "stored option prices) with Black-Scholes.")
+        _gp_ah_tog, _gp_ah_note = st.columns([1, 3])
+        _gp_use_ah = _gp_ah_tog.toggle("🌙 Use after-hours / pre-market prices",
+                                       value=st.session_state.get("use_ah", False), key="use_ah",
+                                       help="Re-runs the whole plan on live extended-hours prices: "
+                                            "spot, moneyness, Greeks, scenarios and P&L all shift to AH.")
+        if _gp_use_ah:
+            _gp_ah_note.caption("🌙 **After-hours mode** — options are re-priced at the live AH/PM spot "
+                                "(IV held from the EOD premium). Reflects tonight's move into tomorrow's open.")
         _gp_conn = get_conn()
         try:
             _gp_tr = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", _gp_conn)
@@ -10498,11 +10506,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 pass
             return None
 
-        # ── Build per-leg analytics ──
-        _gp_use_ah = st.session_state.get("use_ah", False)
-        if _gp_use_ah:
-            st.info("🌙 **After-hours mode** — analysis uses the latest AH/pre-market price per "
-                    "ticker; each option is re-priced from it (IV anchored to the EOD premium).")
+        # ── Build per-leg analytics ──  (_gp_use_ah set by the toggle above)
         _ah_notes = []
         _legs = []
         for _, _t in _gp_tr.iterrows():
