@@ -11482,6 +11482,37 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     st.plotly_chart(_gp_levels_fig(_tk, _spot, _w, _r1, _s1, _em), use_container_width=True)
                 except Exception:
                     pass
+
+                # ── 🎯 Which signal to trust (inline accuracy → priority) ──
+                _sa_gp = _signal_accuracy_backtest(_tk, 5)
+                _tr_rows = []
+                if _sa_gp and _sa_gp.get("signals"):
+                    for s in _sa_gp["signals"]:
+                        if s["hit"] is not None:
+                            _tr_rows.append({"Signal": s["name"], "Hit-rate": s["hit"],
+                                             "Edge/call": s["edge"], "Fires": s["n"]})
+                _sa24_gp = _signal_accuracy_24model(_tk)
+                if _sa24_gp:
+                    _tr_rows.append({"Signal": "24-model ensemble", "Hit-rate": _sa24_gp["overall_hit"],
+                                     "Edge/call": None, "Fires": _sa24_gp["n_total"]})
+                _slog_gp = _sentiment_log_view(_tk, 0.005)
+                if _slog_gp and _slog_gp.get("overall_hit") is not None:
+                    _tr_rows.append({"Signal": "Sentiment (crowd/news)", "Hit-rate": _slog_gp["overall_hit"],
+                                     "Edge/call": None, "Fires": _slog_gp["n_resolved"]})
+                if _tr_rows:
+                    st.markdown("**🎯 Which signal to trust here** — track record on this ticker "
+                                "(5-day forward); prioritize the top row")
+                    _trdf = pd.DataFrame(_tr_rows).sort_values(
+                        "Edge/call", ascending=False, na_position="last").reset_index(drop=True)
+                    _best_row = _trdf.iloc[0]
+                    st.dataframe(_trdf, hide_index=True, use_container_width=True,
+                                 column_config={
+                                     "Hit-rate": st.column_config.NumberColumn(format="%.1f%%"),
+                                     "Edge/call": st.column_config.NumberColumn(format="%+.2f%%"),
+                                     "Fires": st.column_config.NumberColumn(format="%d")})
+                    st.caption(f"➡️ **Prioritize _{_best_row['Signal']}_** for {_tk} — best historical "
+                               "edge here. Full breakdown on the 🎯 Signal Accuracy page.")
+
                 if _stt:
                     _ste = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}.get(_stt["label"], "⚪")
                     st.markdown(f"**💬 StockTwits crowd:** {_ste} {_stt['label']} "
