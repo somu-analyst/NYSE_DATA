@@ -1942,6 +1942,37 @@ def _gp_levels_fig(tk, spot, w, r1, s1, em):
     return fig
 
 
+def _bs_price_vec(S, K, T, r, sigma, typ):
+    """Vectorized Black-Scholes price over an array of spots (for Monte Carlo)."""
+    S = np.maximum(S, 1e-9)
+    if T <= 0:
+        return np.maximum(S - K, 0.0) if typ == "call" else np.maximum(K - S, 0.0)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    if typ == "call":
+        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+
+def _gp_montecarlo(legs, horizon_days=1, n=10000, rho=0.6, r=0.045):
+    """Monte Carlo P&L distribution for the whole book: GBM per underlying (annualized IV),
+    correlated through a shared market factor (rho), options repriced with BS at the horizon."""
+    dt = max(horizon_days, 0) / 252.0
+    zm = np.random.standard_normal(n)
+    tot = np.zeros(n)
+    for l in legs:
+        zi = np.random.standard_normal(n)
+        z = rho * zm + np.sqrt(max(1 - rho * rho, 0.0)) * zi
+        st_ = l["spot"] * np.exp(-0.5 * l["iv"] ** 2 * dt + l["iv"] * np.sqrt(dt) * z)
+        t2 = max(l["dte"] - horizon_days, 0) / 365.0
+        val = _bs_price_vec(st_, l["K"], t2, r, l["iv"], l["typ"])
+        tot += (val - l["cur"]) * l["m"]
+    return {"mean": float(tot.mean()), "p_profit": float((tot > 0).mean() * 100),
+            "p5": float(np.percentile(tot, 5)), "p50": float(np.percentile(tot, 50)),
+            "p95": float(np.percentile(tot, 95)), "worst": float(tot.min()),
+            "best": float(tot.max()), "samples": tot, "n": n, "horizon": horizon_days}
+
+
 def _gp_exec_timing(tk, tl, spot, chg):
     """Scenario-based execution timing: close at open vs wait, order type, and the time-of-day
     windows where liquidity/institutions concentrate. Uses volatility, swings and volume."""
@@ -10877,6 +10908,33 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         _up = next(r["_pnl"] for r in _scn_rows if abs(r["_s"] - 0.02) < 1e-9)
         st.caption(f"A **−2%** gap tomorrow ≈ **${_down:,.0f}**; a **+2%** gap ≈ **${_up:,.0f}**. "
                    "Includes one day of theta and a simple vol bump on down moves.")
+
+        # ── Monte Carlo simulation (portfolio P&L distribution) ──
+        st.markdown("#### 🎲 Monte Carlo — portfolio P&L distribution")
+        _mc1, _mc2, _mc3 = st.columns([1, 1, 2])
+        _mc_hsel = _mc1.selectbox("Horizon", ["1 day", "5 days", "To nearest expiry"], key="gp_mc_h")
+        _mc_nsel = _mc2.select_slider("Simulations", [2000, 5000, 10000, 20000], value=10000, key="gp_mc_n")
+        _mc_days = {"1 day": 1, "5 days": 5,
+                    "To nearest expiry": max(min(x["dte"] for x in _legs), 1)}[_mc_hsel]
+        if _mc3.button("🎲 Run Monte Carlo", key="gp_mc_run"):
+            with st.spinner(f"Simulating {_mc_nsel:,} paths…"):
+                _mc = _gp_montecarlo(_legs, _mc_days, _mc_nsel)
+            _mr = st.columns(4)
+            _mr[0].metric("Expected P&L", f"${_mc['mean']:,.0f}")
+            _mr[1].metric("Probability of profit", f"{_mc['p_profit']:.0f}%")
+            _mr[2].metric("P5 / median / P95", f"${_mc['p5']:,.0f} / ${_mc['p50']:,.0f} / ${_mc['p95']:,.0f}")
+            _mr[3].metric("Worst / Best", f"${_mc['worst']:,.0f} / ${_mc['best']:,.0f}")
+            _mcf = go.Figure(go.Histogram(x=_mc["samples"], nbinsx=60, marker_color="#3d8bff"))
+            _mcf.add_vline(x=0, line_dash="dash", line_color="#ffffff")
+            _mcf.add_vline(x=_mc["mean"], line_dash="dot", line_color="#00e676",
+                           annotation_text="mean", annotation_position="top")
+            _mcf.update_layout(template="plotly_dark", height=320,
+                               title=f"{_mc['n']:,} sims · {_mc_hsel} · portfolio P&L distribution",
+                               xaxis_title="P&L $", yaxis_title="frequency", margin=dict(t=44, b=10))
+            st.plotly_chart(_mcf, use_container_width=True)
+            st.caption("GBM per underlying (annualized IV), correlated via a shared market factor (ρ=0.6); "
+                       "options repriced with Black-Scholes at the horizon. Probability of profit = share of "
+                       "simulated paths with positive book P&L. Educational, not advice.")
 
         # ── Stock-by-stock game plan (levels + news + sentiment + writeup + legs) ──
         st.markdown("#### 🏢 Stock-by-stock game plan")
