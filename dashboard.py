@@ -2711,6 +2711,34 @@ def _ahf_run(ticker):
             "action": action, "conf": conf, "size": size}
 
 
+def _render_ahf_pretrade(ticker, key=""):
+    """Compact 'should I take this?' pre-trade check (reuses the AI Hedge Fund committee):
+    one-line verdict + risk + suggested size, expandable to the per-agent vote. Drop-in for
+    any tab that surfaces a trade idea."""
+    if not ticker:
+        return
+    res = _ahf_run(str(ticker).upper())
+    if not res:
+        st.caption(f"🧑‍💼 Pre-trade check: no fundamentals for {ticker} (ETF/index or not covered).")
+        return
+    _ac = {"BUY": "🟢", "HOLD / WATCH": "🟡", "AVOID / SELL": "🔴"}.get(res["action"], "⚪")
+    _rk = res["risk"]; _rkc = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(_rk["level"], "⚪")
+    with st.expander(f"🧑‍💼 Pre-trade check — {_ac} **{res['action']}** ({res['conf']:.0f}%) · "
+                     f"{res['bull']}🟢/{res['bear']}🔴 agents · {_rkc} {_rk['level']} risk · "
+                     f"size ≤{_rk['max_pos']}%", expanded=False):
+        st.markdown(
+            (f"Committee on **{str(ticker).upper()}**: **{res['bull']} bullish / {res['bear']} bearish / "
+             f"{res['neu']} neutral** → **{res['action']}**"
+             + (f" · suggest **{res['size']}%** of book" if res["size"] else "")
+             + (f" · stop ≈ {_rk['stop']*100:.0f}% " if _rk["stop"] else "")).replace("$", "\\$"))
+        _pe = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
+        st.dataframe(pd.DataFrame([
+            {"Investor": p["agent"], "Call": f"{_pe[p['signal']]} {p['signal']}", "Why": p["reason"]}
+            for p in res["personas"]]), hide_index=True, use_container_width=True)
+        st.caption("Fundamental committee view — pair with the OI/flow read above. Full detail on the "
+                   "🧑‍💼 AI Hedge Fund page. Educational, not advice.")
+
+
 def _bs_price_vec(S, K, T, r, sigma, typ):
     """Vectorized Black-Scholes price over an array of spots (for Monte Carlo)."""
     S = np.maximum(S, 1e-9)
@@ -5278,6 +5306,7 @@ elif page == "🔥 OI Analytics & Prediction":
                 st.caption(
                     f"Strikes where OI has been consistently building for {_oi_days} days. "
                     "Score ≥6/10. Not financial advice — confirm with price action.")
+                _render_ahf_pretrade(sel_ticker, key="hc")
 
                 for _, _r in _hc.iterrows():
                     _sk = float(_r["strike"])
@@ -5985,6 +6014,8 @@ elif page == "🎯 Prop Trading Screen":
     ]
     sel_idx = st.selectbox("Select Setup", range(len(setup_labels)), format_func=lambda i: setup_labels[i])
     opp = opps.iloc[sel_idx]
+
+    _render_ahf_pretrade(opp["Ticker"], key="prop")
 
     with st.spinner(f"Analyzing {opp['Ticker']} ${opp['Strike']:.0f}..."):
         try:
