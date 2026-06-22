@@ -1789,6 +1789,218 @@ def _macro_backdrop():
     return out, label, score
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _gp_indicators(tk):
+    """Technical read for a ticker: each indicator with value, signal, plain explanation,
+    and whether to weight it. Computed from cached daily history."""
+    h = _cached_history(tk, "14mo")
+    if h is None or len(h) < 60:
+        return []
+    c = h["Close"].dropna()
+    v = h["Volume"].fillna(0) if "Volume" in h else pd.Series(0, index=c.index)
+    px = float(c.iloc[-1])
+    out = []
+    for n in (20, 50, 200):
+        if len(c) >= n:
+            sma = float(c.rolling(n).mean().iloc[-1])
+            out.append({"name": f"Price vs SMA{n}", "val": f"${sma:.2f}",
+                        "sig": "BULL" if px > sma else "BEAR",
+                        "why": f"Price is {'above' if px > sma else 'below'} its {n}-day average → "
+                               f"{'up' if px > sma else 'down'}trend on that horizon.",
+                        "use": "Trend filter. SMA200 = most reliable (long-term); SMA20 is noisy/short."})
+    d = c.diff()
+    up = d.clip(lower=0).rolling(14).mean(); dn = (-d.clip(upper=0)).rolling(14).mean()
+    rsi = float((100 - 100 / (1 + up / dn.replace(0, np.nan))).iloc[-1])
+    out.append({"name": "RSI(14)", "val": f"{rsi:.0f}",
+                "sig": "BEAR" if rsi > 70 else "BULL" if rsi < 30 else "NEUTRAL",
+                "why": ("Overbought (>70) — pullback risk." if rsi > 70 else
+                        "Oversold (<30) — bounce potential." if rsi < 30 else "Neutral momentum."),
+                "use": "Strong only at extremes. In trends RSI can stay >70 for weeks — don't fade blindly."})
+    macd = c.ewm(span=12).mean() - c.ewm(span=26).mean()
+    mv2 = float((macd - macd.ewm(span=9).mean()).iloc[-1])
+    out.append({"name": "MACD", "val": f"{mv2:+.2f}", "sig": "BULL" if mv2 > 0 else "BEAR",
+                "why": f"MACD is {'above' if mv2 > 0 else 'below'} its signal → "
+                       f"{'bullish' if mv2 > 0 else 'bearish'} momentum.",
+                "use": "Momentum confirm; lags in chop. Crossovers matter more than level."})
+    if {"High", "Low"} <= set(h.columns):
+        pc = c.shift(1)
+        tr = pd.concat([(h["High"] - h["Low"]), (h["High"] - pc).abs(), (h["Low"] - pc).abs()], axis=1).max(axis=1)
+        atr = float(tr.rolling(14).mean().iloc[-1])
+        out.append({"name": "ATR(14)", "val": f"${atr:.2f} ({atr/px*100:.1f}%)", "sig": "NEUTRAL",
+                    "why": f"Typical daily range ≈ {atr/px*100:.1f}%.",
+                    "use": "Risk sizing, NOT direction. Stops tighter than ~1×ATR get whipsawed."})
+        tp = (h["High"] + h["Low"] + c) / 3
+        vwap = float((tp * v).rolling(20).sum().iloc[-1] / v.rolling(20).sum().replace(0, np.nan).iloc[-1])
+        out.append({"name": "VWAP (20d)", "val": f"${vwap:.2f}", "sig": "BULL" if px > vwap else "BEAR",
+                    "why": f"Price is {'above' if px > vwap else 'below'} the volume-weighted avg → "
+                           f"{'buyers' if px > vwap else 'sellers'} in control (20-day).",
+                    "use": "Institutions anchor to VWAP. Daily approximation (no intraday). Above = demand."})
+    hi52, lo52 = float(c.max()), float(c.min())
+    pos = (px - lo52) / (hi52 - lo52) * 100 if hi52 > lo52 else 50
+    out.append({"name": "52-week range", "val": f"{pos:.0f}% of range",
+                "sig": "BULL" if pos > 70 else "BEAR" if pos < 30 else "NEUTRAL",
+                "why": f"Trading at {pos:.0f}% of its 52-week range.",
+                "use": "High = momentum/strength; low = value or falling knife. Pair with trend."})
+    if float(v.rolling(20).mean().iloc[-1] or 0) > 0:
+        vr = float(v.iloc[-1]) / float(v.rolling(20).mean().iloc[-1])
+        out.append({"name": "Volume vs 20d", "val": f"{vr:.1f}×", "sig": "NEUTRAL",
+                    "why": f"Last session volume was {vr:.1f}× the 20-day average.",
+                    "use": "Confirms moves: breakout on >1.5× volume is real; low-volume moves are suspect."})
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _gp_orderflow(tk):
+    """Free options order-flow proxy from the latest stored chain: net OI build (calls vs puts)
+    and volume PCR → who's positioning which way."""
+    conn = get_conn()
+    try:
+        df = pd.read_sql(
+            "SELECT change_OI_Call, change_OI_Put, vol_Call_now, vol_Put_now FROM options_change "
+            "WHERE UPPER(ticker)=? AND trade_date_now=(SELECT trade_date_now FROM options_change "
+            "WHERE UPPER(ticker)=? ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)"
+            "||substr(trade_date_now,4,2) DESC LIMIT 1)", conn, params=(tk.upper(), tk.upper()))
+    except Exception:
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+    if df.empty:
+        return None
+    coi = float(pd.to_numeric(df["change_OI_Call"], errors="coerce").sum())
+    poi = float(pd.to_numeric(df["change_OI_Put"], errors="coerce").sum())
+    cv = float(pd.to_numeric(df["vol_Call_now"], errors="coerce").sum())
+    pv = float(pd.to_numeric(df["vol_Put_now"], errors="coerce").sum())
+    net = coi - poi
+    pcrv = pv / cv if cv else 0.0
+    flow = ("BULLISH" if net > 0 and pcrv < 1 else "BEARISH" if (net < 0 or pcrv > 1.3) else "MIXED")
+    return {"coi": coi, "poi": poi, "net": net, "cv": cv, "pv": pv, "pcrv": pcrv, "flow": flow}
+
+
+def _gp_debate(tk, tl, spot, em, dd, th, w, nw, stt, ivr, earn):
+    """Both-sides assessment: reasons to HOLD vs reasons to CLOSE/adjust, then a verdict."""
+    holds, closes = [], []
+    pnl = sum(x["pnl"] for x in tl)
+    min_dte = min(x["dte"] for x in tl)
+    has_short = any(x["side"] == "short" for x in tl)
+    short_itm = any(x["side"] == "short" and ((spot > x["K"]) if x["typ"] == "call" else (spot < x["K"])) for x in tl)
+    # HOLD case
+    if th > 0:
+        holds.append(f"You **collect ${th:,.0f}/day** in theta — time decay works *for* you.")
+    if th < 0 and min_dte > 21:
+        holds.append(f"Long premium but **{min_dte} DTE** left — the thesis still has time to play out.")
+    if w.get("put_wall") and w.get("call_wall") and w["put_wall"] < spot < w["call_wall"]:
+        holds.append(f"Spot is **pinned between ${w['put_wall']:.0f}–${w['call_wall']:.0f} walls** → range-bound, "
+                     "which favors holding (esp. short premium).")
+    if ivr and ivr.get("rank", 50) < 30 and th < 0:
+        holds.append(f"IV is **cheap (rank {ivr['rank']:.0f})** — your long options aren't overpaying.")
+    if stt and stt.get("label") == "BULLISH" and dd > 0:
+        holds.append("Crowd is bullish and your book is net-long — sentiment aligns.")
+    # CLOSE case
+    if min_dte <= 7:
+        closes.append(f"**{min_dte} DTE** — gamma/theta risk spikes into expiry; decide now.")
+    if th < 0:
+        closes.append(f"You **pay ${abs(th):,.0f}/day** in decay — it bleeds unless the move comes soon.")
+    if pnl >= 0.5 * sum(abs(x["entry"] * x["m"]) for x in tl if x["side"] == "long") and pnl > 0:
+        closes.append(f"Open P&L **${pnl:,.0f}** — consider locking gains / taking profit.")
+    if short_itm:
+        closes.append("A **short leg is ITM** — assignment risk; roll or close it.")
+    if ivr and ivr.get("rank", 50) > 70 and th < 0:
+        closes.append(f"IV is **rich (rank {ivr['rank']:.0f})** — long premium is overpaying; roll down/out.")
+    if earn and earn.get("days", 99) <= min_dte:
+        closes.append(f"**Earnings in {earn['days']}d** (before expiry) — binary gap risk.")
+    if nw and nw.get("label") == "BEARISH" and dd > 0:
+        closes.append("News skews bearish while you're net-long — headline gap-down risk.")
+    if nw and nw.get("label") == "BULLISH" and dd < 0:
+        closes.append("News skews bullish while you're net-short — squeeze/gap-up risk.")
+    # verdict
+    if len(closes) >= len(holds) + 2 or short_itm or min_dte <= 3:
+        verdict = "⚠️ **Lean CLOSE / adjust** — risks outweigh the carry here."
+    elif len(holds) >= len(closes) + 1:
+        verdict = "✅ **Lean HOLD** — the structure still works in your favor."
+    else:
+        verdict = "🟡 **Lean TRIM** — take some off, keep a runner; it's balanced."
+    return holds, closes, verdict
+
+
+def _gp_levels_fig(tk, spot, w, r1, s1, em):
+    """Compact number-line of key levels around spot with the 1σ expected-move band."""
+    pts = [("Spot", spot, "#ffffff")]
+    if w.get("put_wall"): pts.append(("Put wall", w["put_wall"], "#00e676"))
+    if w.get("call_wall"): pts.append(("Call wall", w["call_wall"], "#ff5c6c"))
+    if s1: pts.append(("S1", s1, "#26a69a"))
+    if r1: pts.append(("R1", r1, "#ef5350"))
+    fig = go.Figure()
+    if em:
+        fig.add_vrect(x0=spot - em, x1=spot + em, fillcolor="rgba(61,139,255,0.12)", line_width=0)
+    for nm, x, col in pts:
+        fig.add_trace(go.Scatter(x=[x], y=[0], mode="markers+text", marker=dict(size=12, color=col),
+                                 text=[f"{nm}<br>${x:.0f}"], textposition="top center",
+                                 textfont=dict(size=10), showlegend=False, hoverinfo="x"))
+    fig.update_layout(template="plotly_dark", height=150, margin=dict(t=30, b=10, l=10, r=10),
+                      title=f"{tk} key levels (blue band = 1-day expected move)",
+                      yaxis=dict(visible=False, range=[-1, 1.5]), xaxis_title="Price")
+    return fig
+
+
+def _gp_exec_timing(tk, tl, spot, chg):
+    """Scenario-based execution timing: close at open vs wait, order type, and the time-of-day
+    windows where liquidity/institutions concentrate. Uses volatility, swings and volume."""
+    atrp = volr = swing5 = None
+    try:
+        h = _cached_history(tk, "3mo")
+        if h is not None and len(h) > 20 and {"High", "Low"} <= set(h.columns):
+            c = h["Close"]; pc = c.shift(1)
+            tr = pd.concat([(h["High"] - h["Low"]), (h["High"] - pc).abs(), (h["Low"] - pc).abs()], axis=1).max(axis=1)
+            atrp = float(tr.rolling(14).mean().iloc[-1]) / float(c.iloc[-1]) * 100
+            swing5 = float((h["High"].iloc[-5:].max() - h["Low"].iloc[-5:].min()) / float(c.iloc[-1]) * 100)
+            if "Volume" in h:
+                va = float(h["Volume"].rolling(20).mean().iloc[-1] or 0)
+                volr = float(h["Volume"].iloc[-1]) / va if va else None
+    except Exception:
+        pass
+    min_dte = min(x["dte"] for x in tl)
+    short_itm = any(x["side"] == "short" and ((spot > x["K"]) if x["typ"] == "call" else (spot < x["K"])) for x in tl)
+    net_long = sum(x["ddelta_1pct"] for x in tl) > 0
+    urgent = min_dte <= 2 or short_itm
+    B = []
+    B.append("**Don't trade the first 5–15 min blind.** 9:30–10:00 ET is the most volatile window and often "
+             "*reverses* the opening gap; spreads are widest and market orders slip. Let it settle, reassess ~10:00.")
+    if chg > 0.3 and net_long:
+        B.append("You're **gapping up, net-long** — the open is frequently the day's high. If trimming, **sell into "
+                 "opening strength with a limit** near the ask; don't wait for a dip that may not come.")
+    elif chg < -0.3 and net_long:
+        B.append("**Gapping down, net-long** — avoid panic-selling at 9:30. The **10:00–10:30 stabilization** usually "
+                 "gives a better exit; if it's not urgent, wait.")
+    elif chg < -0.3 and not net_long:
+        B.append("**Gapping down, net-short** — the move favors you; consider banking profit into the open weakness with a limit.")
+    elif chg > 0.3 and not net_long:
+        B.append("**Gapping up, net-short** — squeeze risk; don't chase the cover at the open, wait for the ~10:00 fade or define risk.")
+    B.append("**Best fills:** ~**9:45–10:30** and the **power hour 3:00–3:55** (institutions, index funds & MOC desks "
+             "most active). **Avoid 12:00–1:30** lunch lull — thin, wide spreads, drifty.")
+    B.append("**Close auction 3:50–4:00:** market-on-close imbalances + passive/index flows can shove price — biggest "
+             "on OPEX (3rd Fri) and month/quarter-end.")
+    if atrp is not None:
+        if atrp > 3 or (swing5 and swing5 > 9):
+            B.append(f"Volatility **high** (ATR ≈ {atrp:.1f}%/day, 5-day swing ≈ {swing5:.0f}%) — use **limits & scale out "
+                     "in pieces**; a single market order will slip.")
+        else:
+            B.append(f"Volatility **moderate** (ATR ≈ {atrp:.1f}%/day) — limits near mid should fill; you can be patient.")
+    if volr is not None:
+        B.append(f"Volume **{volr:.1f}× the 20-day avg** — "
+                 + ("real conviction behind the move; trust it more." if volr > 1.3
+                    else "below average; moves are less reliable — don't overreact." if volr < 0.8 else "normal."))
+    if urgent:
+        head = ("⏱ **Act today** (≤2 DTE or short-ITM) — don't carry the gamma. Work the **9:45–10:30** window with "
+                "limit orders; if it must go at the open, use a *marketable limit*, never a plain market order.")
+    elif chg < -0.3 and net_long:
+        head = "⏱ **No need to close at the open** — non-urgent long into a gap-down; let the first 30 min shake out, reassess at 10:00."
+    elif chg > 0.3 and net_long:
+        head = "⏱ **Opening strength is your friend** — if you want out, sell into the first hour with a limit rather than waiting for a dip."
+    else:
+        head = "⏱ **No rush** — use the 9:45–10:30 or 3:00–3:55 windows; skip the open and the lunch lull."
+    return head, B
+
+
 def _macro_writeup(mac, label):
     def mv(k):
         if k in mac:
@@ -10472,26 +10684,26 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             st.stop()
 
         # ── Global / cross-asset backdrop (oil, gold, FX, rates, China/EM, crypto) ──
-        st.markdown("#### 🌐 Global macro backdrop (overnight)")
         try:
             _mac, _mlab, _mscore = _macro_backdrop()
         except Exception:
             _mac, _mlab, _mscore = {}, "MIXED", 0
-        if _mac:
-            _mcol = {"RISK-ON": "🟢", "RISK-OFF": "🔴", "MIXED": "🟡"}[_mlab]
-            st.markdown(f"**{_mcol} Risk read: {_mlab}** (score {_mscore:+d})")
-            _order = ["S&P fut", "Nasdaq fut", "VIX", "WTI oil", "Gold", "Dollar (DXY)",
-                      "US 10y", "China (FXI)", "EM (EEM)", "Bitcoin"]
-            _shown = [k for k in _order if k in _mac]
-            for _i in range(0, len(_shown), 5):
-                _cols = st.columns(5)
-                for _j, _k in enumerate(_shown[_i:_i + 5]):
-                    _v = _mac[_k]
-                    _cols[_j].metric(_k, f"{_v['price']:,.2f}", f"{_v['pct']:+.2f}%",
-                                     delta_color="normal" if _v["pct"] >= 0 else "inverse")
-            st.info(_macro_writeup(_mac, _mlab))
-        else:
-            st.caption("Macro feed unavailable right now (yfinance rate-limited).")
+        _mcol = {"RISK-ON": "🟢", "RISK-OFF": "🔴", "MIXED": "🟡"}.get(_mlab, "🟡")
+        with st.expander(f"🌐 Global macro backdrop (overnight) — {_mcol} {_mlab}", expanded=False):
+            if _mac:
+                st.markdown(f"**{_mcol} Risk read: {_mlab}** (score {_mscore:+d})")
+                _order = ["S&P fut", "Nasdaq fut", "VIX", "WTI oil", "Gold", "Dollar (DXY)",
+                          "US 10y", "China (FXI)", "EM (EEM)", "Bitcoin"]
+                _shown = [k for k in _order if k in _mac]
+                for _i in range(0, len(_shown), 5):
+                    _cols = st.columns(5)
+                    for _j, _k in enumerate(_shown[_i:_i + 5]):
+                        _v = _mac[_k]
+                        _cols[_j].metric(_k, f"{_v['price']:,.2f}", f"{_v['pct']:+.2f}%",
+                                         delta_color="normal" if _v["pct"] >= 0 else "inverse")
+                st.markdown(_macro_writeup(_mac, _mlab).replace("$", "\\$"))
+            else:
+                st.caption("Macro feed unavailable right now (yfinance rate-limited).")
 
         _R = 0.045
 
@@ -10697,12 +10909,23 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _nw = _ticker_news(_tk)
             _stt = _stocktwits_sentiment(_tk)
             _te = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡", "NEUTRAL": "⚪"}[_nw["label"]]
-            with st.expander(f"{_te} {_tk} · ${_spot:.2f} · {len(_tl)} legs · open P&L ${_tk_pnl:,.0f} · news {_nw['label']}",
+            # previous close + day change
+            try:
+                _hc = _cached_history(_tk, "5d")["Close"].dropna()
+                _prev_close = float(_hc.iloc[-2]) if len(_hc) >= 2 else float(_hc.iloc[-1])
+            except Exception:
+                _prev_close = _tl[0].get("eod_spot", _spot)
+            _chg = (_spot / _prev_close - 1) * 100 if _prev_close else 0.0
+            _daylbl = "🟢 up day" if _chg > 0.2 else "🔴 down day" if _chg < -0.2 else "⚪ flat"
+            _pnllbl = "🟢 winning" if _tk_pnl > 0 else "🔴 losing" if _tk_pnl < 0 else "⚪ flat"
+            with st.expander(f"{_te} {_tk} · ${_spot:.2f} ({_chg:+.1f}% vs prev ${_prev_close:.2f}) · "
+                             f"{len(_tl)} legs · P&L ${_tk_pnl:,.0f} {_pnllbl} · news {_nw['label']}",
                              expanded=True):
                 _mc = st.columns(4)
-                _mc[0].metric("Spot", f"${_spot:.2f}")
+                _mc[0].metric("Spot", f"${_spot:.2f}", f"{_chg:+.2f}% vs prev close",
+                              delta_color="normal" if _chg >= 0 else "inverse")
                 _mc[1].metric("1-day exp. move", f"±${_em:.2f}", f"±{_em/_spot*100:.1f}%")
-                _mc[2].metric("Δ per +1%", f"${_tk_dd:,.0f}")
+                _mc[2].metric("Δ per +1%", f"${_tk_dd:,.0f}", _daylbl)
                 _mc[3].metric("Theta / day", f"${_tk_th:,.0f}")
                 _lv = []
                 if _w.get("put_wall"): _lv.append(f"🟩 put wall ${_w['put_wall']:.0f}")
@@ -10711,6 +10934,10 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 if _r1: _lv.append(f"R1 ${_r1:.0f}")
                 if _lv:
                     st.markdown("**Key levels:** " + " · ".join(_lv))
+                try:
+                    st.plotly_chart(_gp_levels_fig(_tk, _spot, _w, _r1, _s1, _em), use_container_width=True)
+                except Exception:
+                    pass
                 if _stt:
                     _ste = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}.get(_stt["label"], "⚪")
                     st.markdown(f"**💬 StockTwits crowd:** {_ste} {_stt['label']} "
@@ -10734,8 +10961,72 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                                "risk; consider sizing down or closing options before the print.")
                 elif _earn:
                     st.caption(f"📅 Next {_tk} earnings: {_earn['date']} ({_earn['days']}d out).")
-                st.info(_gp_writeup(_tk, _spot, _em, _w, _r1, _s1, _tk_dd, _tk_th, _nw, _tl, _stt))
+                st.markdown("**📋 Plain-English read**")
+                st.info(_gp_writeup(_tk, _spot, _em, _w, _r1, _s1, _tk_dd, _tk_th, _nw, _tl, _stt).replace("$", "\\$"))
 
+                # ── Hold vs Close debate (both sides + verdict) ──
+                _holds, _closes, _verdict = _gp_debate(_tk, _tl, _spot, _em, _tk_dd, _tk_th, _w, _nw, _stt, _ivr, _earn)
+                st.markdown("**⚖️ Hold vs Close — the debate**")
+                _dbc1, _dbc2 = st.columns(2)
+                with _dbc1:
+                    st.markdown("✅ **Reasons to HOLD**")
+                    for _h in (_holds or ["— no strong hold case right now."]):
+                        st.markdown(("- " + _h).replace("$", "\\$"))
+                with _dbc2:
+                    st.markdown("⚠️ **Reasons to CLOSE / adjust**")
+                    for _cl in (_closes or ["— no urgent close case right now."]):
+                        st.markdown(("- " + _cl).replace("$", "\\$"))
+                st.markdown("**Assessment:** " + _verdict.replace("$", "\\$"))
+
+                # ── Execution & timing (close at open vs wait; time-of-day windows) ──
+                _eh, _eb = _gp_exec_timing(_tk, _tl, _spot, _chg)
+                with st.expander("⏱ Execution & timing — close at open or wait?", expanded=False):
+                    st.markdown(_eh.replace("$", "\\$"))
+                    for _x in _eb:
+                        st.markdown(("- " + _x).replace("$", "\\$"))
+                    st.caption("These are well-documented intraday liquidity patterns (open/close auctions, power "
+                               "hour, lunch lull) — i.e. *when* big players (market makers, index funds, MOC desks) "
+                               "are most active. Real-time HFT order flow (Jane Street etc.) isn't public; this is "
+                               "timing/liquidity edge, not their order book. All times ET.")
+
+                # ── Deep analysis (indicators / order flow / 24-model) — gated for speed ──
+                if st.checkbox(f"🔬 Deep analysis — indicators, order flow & 24-model ({_tk})",
+                               key=f"gp_deep_{_tk}"):
+                    _inds = _gp_indicators(_tk)
+                    if _inds:
+                        st.markdown("**📊 Indicators — what each says & whether to weight it**")
+                        st.dataframe(pd.DataFrame([
+                            {"Indicator": i["name"], "Value": i["val"], "Signal": i["sig"],
+                             "What it means": i["why"], "How to use it": i["use"]} for i in _inds]),
+                            hide_index=True, use_container_width=True)
+                        _b = sum(i["sig"] == "BULL" for i in _inds); _br = sum(i["sig"] == "BEAR" for i in _inds)
+                        st.caption(f"Tally: **{_b} bullish vs {_br} bearish** → "
+                                   + ("net bullish lean." if _b > _br else
+                                      "net bearish lean." if _br > _b else "mixed / neutral."))
+                    _of = _gp_orderflow(_tk)
+                    if _of:
+                        _ofe = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}[_of["flow"]]
+                        st.markdown(
+                            (f"**💧 Options order flow:** {_ofe} **{_of['flow']}** — net OI build "
+                             f"{_of['net']:+,.0f} (calls {_of['coi']:+,.0f} / puts {_of['poi']:+,.0f}), "
+                             f"vol PCR {_of['pcrv']:.2f}. " + (
+                                 "Call buildup + calls outvoting puts = bullish positioning." if _of["flow"] == "BULLISH"
+                                 else "Put buildup / puts outvoting calls = bearish or hedging." if _of["flow"] == "BEARISH"
+                                 else "Two-sided — no clear lean.")).replace("$", "\\$"))
+                    try:
+                        import telegram_bot as _tbe
+                        _eng = _tbe.high_prob_signals_engine(_tk, _gp_conn)
+                        if isinstance(_eng, dict) and _eng.get("signal"):
+                            _ee2 = {"BULL": "🟢", "BEAR": "🔴", "SELL_PREMIUM": "🟠", "NEUTRAL": "⚪"}.get(_eng["signal"], "⚪")
+                            st.markdown(f"**🤖 24-Model engine:** {_ee2} **{_eng['signal']}** · "
+                                        f"{_eng.get('prob',0):.0f}% · {_eng.get('conf','')} conf "
+                                        f"({_eng.get('bull_v','?')}🟢 / {_eng.get('bear_v','?')}🔴 of {_eng.get('total_m',24)})")
+                            if _eng.get("strategy"):
+                                st.caption(("Engine play: " + str(_eng["strategy"])).replace("$", "\\$"))
+                    except Exception as _ee:
+                        st.caption(f"(24-model engine unavailable: {_ee})")
+
+                st.markdown("**📉 Tomorrow's scenarios — this stock's P&L vs its move**")
                 _sm = []
                 for s in (-0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03):
                     tot = 0.0
@@ -10749,13 +11040,13 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 st.dataframe(pd.DataFrame(_sm), hide_index=True, use_container_width=True,
                              column_config={"P&L $": st.column_config.NumberColumn(format="$%d")})
 
-                if _nw["items"]:
-                    st.markdown("**📰 Latest headlines & tone:**")
-                    for it in _nw["items"]:
-                        e = "🟢" if it["tone"] > 0 else ("🔴" if it["tone"] < 0 else "⚪")
-                        st.markdown(f"- {e} [{it['title']}]({it['link']}) · _{it['source']} {it['when']}_")
-                else:
-                    st.caption("No fresh headlines found (feeds may be rate-limited).")
+                with st.expander(f"📰 Latest headlines & tone ({len(_nw['items'])})", expanded=False):
+                    if _nw["items"]:
+                        for it in _nw["items"]:
+                            e = "🟢" if it["tone"] > 0 else ("🔴" if it["tone"] < 0 else "⚪")
+                            st.markdown(f"- {e} [{it['title']}]({it['link']}) · _{it['source']} {it['when']}_")
+                    else:
+                        st.caption("No fresh headlines found (feeds may be rate-limited).")
 
                 _rows = []
                 for l in _tl:
