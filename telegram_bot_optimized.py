@@ -19582,6 +19582,160 @@ def _kb_plan():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="plan_view"),
                                   InlineKeyboardButton("⬅️ Hub", callback_data="hub_menu")]])
 
+def _plan_oi_flow(conn, tk, spot):
+    """Compact OI-flow line for /plan: net build, vol-PCR, buy/sell/hedge split, calendar tilt."""
+    try:
+        df = pd.read_sql(
+            "SELECT strike, expiry_date, change_OI_Call, change_OI_Put, vol_Call_now, vol_Put_now "
+            "FROM options_change WHERE UPPER(ticker)=? AND trade_date_now=(SELECT trade_date_now "
+            "FROM options_change WHERE UPPER(ticker)=? ORDER BY substr(trade_date_now,7,4)||"
+            "substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1)",
+            conn, params=(tk.upper(), tk.upper()))
+    except Exception:
+        return None
+    if df is None or df.empty or not spot:
+        return None
+    for c in df.columns:
+        if c != "expiry_date":
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    coi = df["change_OI_Call"].sum(); poi = df["change_OI_Put"].sum()
+    cv = df["vol_Call_now"].sum(); pv = df["vol_Put_now"].sum()
+    pcrv = pv / cv if cv else 0.0; net = coi - poi
+    e = "🟢" if net > 0 and pcrv < 1 else "🔴" if (net < 0 or pcrv > 1.3) else "🟡"
+    split = ""
+    try:
+        bystrike = df.groupby("strike", as_index=False).agg(
+            call_oi_change=("change_OI_Call", "sum"), put_oi_change=("change_OI_Put", "sum"))
+        enr, _, _, _, _ = _oi_intent_algo(bystrike, spot)
+        enr["wt"] = enr["call_oi_change"].abs() + enr["put_oi_change"].abs()
+        BMAP = {"BULLISH": "buy", "BULLISH_BREAK": "buy", "BEARISH": "bear", "NEAR_BEARISH": "bear",
+                "HEDGE": "hedge", "HEDGE_UNWIND": "hedge", "COVERED_CALL": "cc-sell",
+                "STRADDLE": "vol", "UNWIND": "unwind", "NEUTRAL": "neut"}
+        agg = {}
+        for _, r in enr.iterrows():
+            b = BMAP.get(r["intent"], "neut"); agg[b] = agg.get(b, 0) + r["wt"]
+        tot = sum(agg.values()) or 1
+        top = sorted(agg.items(), key=lambda x: -x[1])[:3]
+        split = " · ".join(f"{int(v/tot*100)}% {k}" for k, v in top if v > 0)
+    except Exception:
+        pass
+
+    def _ek(s):
+        for f in ("%m-%d-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(str(s), f)
+            except Exception:
+                pass
+        return datetime.max
+    tilt = ""
+    try:
+        cal = df.groupby("expiry_date").agg(c=("change_OI_Call", "sum"), p=("change_OI_Put", "sum"))
+        cal["k"] = [_ek(i) for i in cal.index]; cal = cal.sort_values("k")
+        if len(cal) >= 2:
+            med = cal["k"].median()
+            fn = (cal[cal["k"] <= med]["c"] - cal[cal["k"] <= med]["p"]).sum()
+            bn = (cal[cal["k"] > med]["c"] - cal[cal["k"] > med]["p"]).sum()
+            tilt = "near-dated" if abs(fn) > abs(bn) else "later-dated"
+    except Exception:
+        pass
+    lines = [f"  💧 OI {e} net {net:+,.0f} (C{coi:+,.0f}/P{poi:+,.0f}) PCRv {pcrv:.2f}"]
+    if split:
+        lines.append(f"     flow: {split}")
+    if tilt:
+        lines.append(f"     new OI → {tilt}")
+    return "\n".join(lines)
+
+
+def _plan_patterns(tk, spot, pw=None, cw=None):
+    """Compact pattern/regime line for /plan: EMA sequence, golden/death cross, flag, gamma."""
+    parts = []
+    try:
+        c = yf.Ticker(tk).history(period="1y")["Close"].dropna()
+    except Exception:
+        c = pd.Series(dtype=float)
+    if len(c) >= 30:
+        px = float(c.iloc[-1])
+        e8 = float(c.ewm(span=8).mean().iloc[-1]); e21 = float(c.ewm(span=21).mean().iloc[-1])
+        e50 = float(c.ewm(span=50).mean().iloc[-1])
+        if e8 > e21 > e50 and px >= e8:
+            parts.append("EMA 8>21>50 🟢")
+        elif e8 < e21 < e50 and px <= e8:
+            parts.append("EMA 8<21<50 🔴")
+        if len(c) >= 200:
+            a50 = c.rolling(50).mean().iloc[-1]; a200 = c.rolling(200).mean().iloc[-1]
+            parts.append("golden-cross 🟢" if a50 > a200 else "death-cross 🔴")
+        pole = px / float(c.iloc[-21]) - 1
+        last5 = c.iloc[-5:]; drift = float(last5.iloc[-1] / last5.iloc[0] - 1)
+        rng = float((last5.max() - last5.min()) / last5.mean())
+        if pole > 0.08 and -0.04 < drift <= 0.01 and rng < 0.06:
+            parts.append("bull-flag 🟢")
+        elif pole < -0.08 and -0.01 <= drift < 0.04 and rng < 0.06:
+            parts.append("bear-flag 🔴")
+    if pw and cw and spot:
+        flip = (float(pw) + float(cw)) / 2.0
+        if spot < min(float(pw), flip):
+            parts.append(f"neg-gamma<${flip:.0f} 🔴")
+        elif spot > max(float(cw), flip):
+            parts.append("above-walls 🟢")
+        else:
+            parts.append(f"pinned~${flip:.0f} ⚪")
+    return ("  🔺 " + " · ".join(parts)) if parts else None
+
+
+def _plan_trust(conn, tk, hold=5, thr=0.005):
+    """Inline signal track-record for /plan: per-signal hit-rate so the user can prioritize.
+    Backtests OI-bias / momentum / RSI from DB and pulls the 24-model's resolved accuracy."""
+    out = []
+    try:
+        sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+        sd = pd.read_sql(f"SELECT trade_date, close FROM stock_daily WHERE ticker=? ORDER BY {sk}",
+                         conn, params=(tk.upper(),))
+        if len(sd) >= 30:
+            sd["close"] = pd.to_numeric(sd["close"], errors="coerce")
+            oi = pd.read_sql(
+                "SELECT trade_date_now AS trade_date, SUM(COALESCE(change_OI_Call,0)) cb, "
+                "SUM(COALESCE(change_OI_Put,0)) pb FROM options_change WHERE ticker=? "
+                "GROUP BY trade_date_now", conn, params=(tk.upper(),))
+            sd = sd.merge(oi, on="trade_date", how="left")
+            sd["oin"] = sd["cb"].fillna(0) - sd["pb"].fillna(0)
+            sd["oiz"] = (sd["oin"] - sd["oin"].rolling(20, min_periods=8).mean()) \
+                / (sd["oin"].rolling(20, min_periods=8).std() + 1e-9)
+            sd["mom"] = sd["close"] / sd["close"].shift(10) - 1
+            d = sd["close"].diff()
+            up = d.clip(lower=0).rolling(14).mean(); dn = (-d.clip(upper=0)).rolling(14).mean()
+            sd["rsi"] = 100 - 100 / (1 + up / dn.replace(0, np.nan))
+            sd["fwd"] = sd["close"].shift(-hold) / sd["close"] - 1
+            d2 = sd.dropna(subset=["fwd"])
+
+            def _hit(mask, direction):
+                s = d2[mask]
+                if len(s) < 5:
+                    return None
+                dr = direction(s)
+                return float(((dr > 0) & (s["fwd"] > thr)).sum()
+                             + ((dr < 0) & (s["fwd"] < -thr)).sum()) / len(s) * 100
+            for nm, h in (("OI", _hit(d2["oiz"].abs() > 0.5, lambda s: np.sign(s["oiz"]))),
+                          ("Mom", _hit(d2["mom"].abs() > 0.01, lambda s: np.sign(s["mom"]))),
+                          ("RSI", _hit((d2["rsi"] < 35) | (d2["rsi"] > 65),
+                                       lambda s: np.where(s["rsi"] < 35, 1, -1)))):
+                if h is not None:
+                    out.append((nm, h))
+    except Exception:
+        pass
+    try:
+        m = pd.read_sql("SELECT AVG(correct)*100 h, COUNT(*) n FROM signal_accuracy "
+                        "WHERE ticker=? AND correct>=0", conn, params=(tk.upper(),))
+        if not m.empty and m["n"].iloc[0] and int(m["n"].iloc[0]) >= 5:
+            out.append(("24M", float(m["h"].iloc[0])))
+    except Exception:
+        pass
+    if not out:
+        return None
+    best = max(out, key=lambda x: x[1])
+    body = " · ".join(f"{k} {v:.0f}%" for k, v in out)
+    return f"  🎯 Track record: {body} → trust {best[0]}"
+
+
 def _next_day_plan(conn):
     """Condensed whole-portfolio next-day plan: regime + Greeks + per-stock levels,
     expected move, StockTwits sentiment, per-leg actions, and a morning checklist."""
@@ -19674,7 +19828,17 @@ def _next_day_plan(conn):
         ea = _next_earnings(tk)
         if ea and ea["days"] <= 14:
             head += f"\n  📅 ⚠️ Earnings {ea['date']} ({ea['days']}d) — gap risk"
-        blocks.append(head + "\n" + "\n".join(leglines))
+        extra = []
+        _ofl = _plan_oi_flow(conn, tk, spot)
+        if _ofl:
+            extra.append(_ofl)
+        _ptl = _plan_patterns(tk, spot, pw, cw)
+        if _ptl:
+            extra.append(_ptl)
+        _trl = _plan_trust(conn, tk)
+        if _trl:
+            extra.append(_trl)
+        blocks.append(head + "\n" + ("\n".join(extra) + "\n" if extra else "") + "\n".join(leglines))
     L.append(f"Net Δ/+1% <b>${net_dd:,.0f}</b> · Θ/day <b>${net_th:,.0f}</b>")
     L.append("")
     L += blocks
