@@ -337,9 +337,11 @@ def _db_option_price(ticker: str, expiry_iso: str, strike: float, opt_type: str)
     return None
 
 @st.cache_data(ttl=180, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def _get_ah_price(ticker: str) -> dict:
-    """Fetch after-hours / pre-market price via yfinance fast_info. Returns dict with
-    spot_reg, spot_ah, ah_chg_pct, is_extended, label ('AH'/'PM'/'EOD')."""
+    """Fetch after-hours / pre-market / live price via yfinance fast_info. Returns dict with
+    spot_reg, spot_ah, ah_chg_pct, is_extended, label ('AH'/'PM'/'Live'/'EOD').
+    Cached 20s so a page with many legs hits yfinance once per ticker, not once per leg."""
     result = {"spot_reg": 0.0, "spot_ah": 0.0, "ah_chg_pct": 0.0, "is_extended": False, "label": "EOD"}
     try:
         fi = yf.Ticker(ticker).fast_info
@@ -385,6 +387,37 @@ def _spot(ticker: str) -> float:
         d = _get_ah_price(ticker)
         return d["spot_ah"] if d["spot_ah"] > 0 else d["spot_reg"]
     return _cached_price(ticker)
+
+def _market_state():
+    """US market session by Eastern time: 'OPEN' (RTH), 'PRE', 'AFTER', or 'CLOSED'."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return "UNKNOWN"
+    if now.weekday() >= 5:
+        return "CLOSED"
+    t = now.hour * 60 + now.minute
+    if 4 * 60 <= t < 9 * 60 + 30:
+        return "PRE"
+    if 9 * 60 + 30 <= t < 16 * 60:
+        return "OPEN"
+    if 16 * 60 <= t < 20 * 60:
+        return "AFTER"
+    return "CLOSED"
+
+
+def _auto_refresh(seconds: int):
+    """Reload the app after `seconds` (live mode). Session state + cache_data persist across the
+    reload, so it's cheap; cache TTLs keep network calls bounded."""
+    try:
+        import streamlit.components.v1 as _components
+        _components.html(
+            f"<script>setTimeout(function(){{window.parent.location.reload();}}, {int(seconds)*1000});</script>",
+            height=0)
+    except Exception:
+        pass
+
 
 def _spot_label(ticker: str) -> str:
     """Short label showing EOD and AH price, e.g. 'EOD $248.50 → AH $251.20 (+1.1%)'."""
@@ -11435,21 +11468,100 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         st.caption("Whole-portfolio view: what tomorrow's open could do to your positions, the key "
                    "levels to watch, and a ranked action checklist. Built from your DB (latest close + "
                    "stored option prices) with Black-Scholes.")
-        _gp_ah_tog, _gp_ah_note = st.columns([1, 3])
-        _gp_use_ah = _gp_ah_tog.toggle("🌙 Use after-hours / pre-market prices",
-                                       value=st.session_state.get("use_ah", False), key="use_ah",
-                                       help="Re-runs the whole plan on live extended-hours prices: "
-                                            "spot, moneyness, Greeks, scenarios and P&L all shift to AH.")
-        if _gp_use_ah:
-            _gp_ah_note.caption("🌙 **After-hours mode** — options are re-priced at the live AH/PM spot "
-                                "(IV held from the EOD premium). Reflects tonight's move into tomorrow's open.")
+        _ms = _market_state()
+        _ms_badge = {"OPEN": "🟢 Market OPEN (live)", "PRE": "🌅 Pre-market",
+                     "AFTER": "🌙 After-hours", "CLOSED": "🔴 Market closed",
+                     "UNKNOWN": "⏱ Session unknown"}.get(_ms, _ms)
+        _gp_ah_tog, _gp_ref_tog, _gp_ah_note = st.columns([1.3, 1.1, 2.6])
+        _gp_use_ah = _gp_ah_tog.toggle(
+            "🔴 Live prices", value=st.session_state.get("use_ah", True), key="use_ah",
+            help="Use live / after-hours / pre-market prices: spot, moneyness, Greeks, scenarios and "
+                 "P&L all re-price off the live quote. Turn off to freeze on the last EOD close.")
+        _gp_autoref = _gp_ref_tog.toggle(
+            "🔁 Auto-refresh", value=st.session_state.get("gp_autoref", True), key="gp_autoref",
+            help="Reload every 30s during market hours so quotes stay live.")
+        _gp_ah_note.caption(f"**{_ms_badge}** · "
+                            + ("live quotes feed spot, Greeks & P&L." if _gp_use_ah
+                               else "showing frozen EOD close (Live off)."))
+        if _gp_use_ah and _gp_autoref and _ms in ("OPEN", "PRE", "AFTER"):
+            _auto_refresh(30)
+            st.caption(f"🔁 Auto-refreshing every 30s · last update "
+                       f"{datetime.now().strftime('%H:%M:%S')}")
         _gp_conn = get_conn()
         try:
             _gp_tr = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", _gp_conn)
         except Exception:
             _gp_tr = pd.DataFrame()
+
+        # ── ➕ Manage positions (add a new trade / close an open one) ──
+        with st.expander("➕ Manage positions — add a new trade or close one", expanded=_gp_tr.empty):
+            _ac1, _ac2 = st.columns(2)
+            with _ac1:
+                st.markdown("**Add a new position**")
+                _na_tk = st.text_input("Ticker", key="gp_add_tk", placeholder="e.g. AAPL").strip().upper()
+                _na_c1, _na_c2 = st.columns(2)
+                _na_typ = _na_c1.selectbox("Type", ["call", "put"], key="gp_add_typ")
+                _na_side = _na_c2.selectbox("Side", ["long", "short"], key="gp_add_side")
+                _na_c3, _na_c4 = st.columns(2)
+                _na_K = _na_c3.number_input("Strike", min_value=0.0, step=1.0, key="gp_add_K")
+                _na_qty = _na_c4.number_input("Contracts", min_value=1, step=1, value=1, key="gp_add_qty")
+                _na_c5, _na_c6 = st.columns(2)
+                _na_exp = _na_c5.text_input("Expiry (YYYY-MM-DD)", key="gp_add_exp", placeholder="2026-07-18")
+                _na_px = _na_c6.number_input("Entry premium", min_value=0.0, step=0.05, key="gp_add_px")
+                if st.button("➕ Add position", key="gp_add_btn"):
+                    _ok = False
+                    try:
+                        datetime.strptime(_na_exp, "%Y-%m-%d")
+                        _ok = bool(_na_tk and _na_K > 0 and _na_px > 0)
+                    except Exception:
+                        _ok = False
+                    if not _ok:
+                        st.error("Need ticker, strike>0, premium>0 and expiry as YYYY-MM-DD.")
+                    else:
+                        _sq = _na_qty if _na_side == "long" else -_na_qty
+                        try:
+                            _gp_conn.execute(
+                                "INSERT INTO trades (ticker, option_type, strike, expiry, entry_price, "
+                                "quantity, entry_date, status) VALUES (?,?,?,?,?,?,?, 'OPEN')",
+                                (_na_tk, _na_typ, float(_na_K), _na_exp, float(_na_px), int(_sq),
+                                 datetime.now().strftime("%Y-%m-%d")))
+                            _gp_conn.commit()
+                            st.success(f"Added {_na_side} {_na_qty}× {_na_tk} ${_na_K:.0f}{_na_typ[0].upper()} {_na_exp}.")
+                            st.cache_data.clear(); st.rerun()
+                        except Exception as _e:
+                            st.error(f"Could not add: {_e}")
+            with _ac2:
+                st.markdown("**Close an open position**")
+                if _gp_tr.empty:
+                    st.caption("No open positions to close.")
+                else:
+                    _cl_map = {
+                        f"{r['ticker']} ${float(r['strike']):.0f}{str(r['option_type'])[0].upper()} "
+                        f"{r['expiry']} ×{int(r['quantity'])} (id {int(r['trade_id'])})": int(r["trade_id"])
+                        for _, r in _gp_tr.iterrows()}
+                    _cl_pick = st.selectbox("Position", list(_cl_map), key="gp_close_pick")
+                    _cl_px = st.number_input("Exit premium (optional)", min_value=0.0, step=0.05, key="gp_close_px")
+                    if st.button("✖️ Close position", key="gp_close_btn"):
+                        try:
+                            _tid = _cl_map[_cl_pick]
+                            if _cl_px > 0:
+                                _gp_conn.execute(
+                                    "UPDATE trades SET status='CLOSED', exit_price=?, exit_date=?, "
+                                    "exit_reason='manual (planner)' WHERE trade_id=?",
+                                    (float(_cl_px), datetime.now().strftime("%Y-%m-%d"), _tid))
+                            else:
+                                _gp_conn.execute(
+                                    "UPDATE trades SET status='CLOSED', exit_date=?, "
+                                    "exit_reason='manual (planner)' WHERE trade_id=?",
+                                    (datetime.now().strftime("%Y-%m-%d"), _tid))
+                            _gp_conn.commit()
+                            st.success("Position closed.")
+                            st.cache_data.clear(); st.rerun()
+                        except Exception as _e:
+                            st.error(f"Could not close: {_e}")
+
         if _gp_tr.empty:
-            st.info("No open positions in the portfolio.")
+            st.info("No open positions in the portfolio. Add one above to build your game plan.")
             try: _gp_conn.close()
             except Exception: pass
             st.stop()
@@ -13900,6 +14012,15 @@ if page == "🔬 OI Comparison Charts":
     if not dates or len(dates) < 2:
         st.warning("Need at least 2 trade dates in DB for comparison.")
         st.stop()
+
+    _today = datetime.now().strftime("%m-%d-%Y")
+    _stale = dates[0] != _today
+    st.info(
+        f"📅 Latest snapshot in DB: **{dates[0]}**"
+        + (f" (today is {_today})" if _stale else " — up to date")
+        + ".  ℹ️ **Open Interest is end-of-day by design** — OCC only publishes OI overnight, so there is "
+        "no intraday/'realtime' OI anywhere; this page always compares stored EOD snapshots. Run the EOD "
+        "pipeline after the close to add the newest date (weekends/holidays won't have a new one).")
 
     # ── Selectors row ──
     col_d1, col_d2, col_tk = st.columns([1, 1, 1])
