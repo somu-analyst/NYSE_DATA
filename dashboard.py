@@ -1436,6 +1436,75 @@ def _signal_accuracy_24model(ticker):
             "n_total": int(len(df))}
 
 
+def _log_sentiment(ticker, source, label, score=None):
+    """Forward-log a daily sentiment reading so it can be OBSERVED over time (not scored —
+    sentiment is noisy/reflexive, so we record it for eyeballing, not as a validated edge).
+    Keyed by ticker+date+source; idempotent within a day."""
+    try:
+        today_s = datetime.now().strftime("%m-%d-%Y")
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sentiment_log ("
+                "ticker TEXT, trade_date TEXT, source TEXT, label TEXT, score REAL, "
+                "fwd_ret REAL, PRIMARY KEY (ticker, trade_date, source))")
+            conn.execute(
+                "INSERT OR REPLACE INTO sentiment_log (ticker, trade_date, source, label, score) "
+                "VALUES (?,?,?,?,?)",
+                (ticker.upper(), today_s, source, str(label),
+                 float(score) if score is not None else None))
+            conn.commit()
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _sentiment_log_view(ticker=None):
+    """Read the forward-logged sentiment, resolve forward returns from stock_daily, and return
+    an OBSERVATIONAL summary (avg next-day move that followed each sentiment label). Deliberately
+    NOT framed as accuracy / hit-rate — sentiment is recorded, not graded."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                                "AND name='sentiment_log'").fetchone():
+                return None
+            q = "SELECT ticker, trade_date, source, label, score, fwd_ret FROM sentiment_log"
+            params = ()
+            if ticker and ticker != "(All)":
+                q += " WHERE ticker=?"; params = (ticker.upper(),)
+            df = pd.read_sql(q, conn, params=params)
+            if df.empty:
+                return None
+            # resolve next-day forward return for any unresolved rows
+            need = df[df["fwd_ret"].isna()]
+            for tk in need["ticker"].unique():
+                px = pd.read_sql(
+                    "SELECT trade_date, close FROM stock_daily WHERE ticker=? ORDER BY "
+                    "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)",
+                    conn, params=(tk,))
+                if len(px) < 2:
+                    continue
+                px["close"] = pd.to_numeric(px["close"], errors="coerce")
+                px["nret"] = px["close"].shift(-1) / px["close"] - 1
+                rmap = dict(zip(px["trade_date"], px["nret"]))
+                for _, r in need[need["ticker"] == tk].iterrows():
+                    rr = rmap.get(r["trade_date"])
+                    if rr is not None and pd.notna(rr):
+                        conn.execute("UPDATE sentiment_log SET fwd_ret=? WHERE ticker=? AND "
+                                     "trade_date=? AND source=?",
+                                     (round(float(rr), 5), r["ticker"], r["trade_date"], r["source"]))
+            conn.commit()
+            df = pd.read_sql(q, conn, params=params)
+    except Exception:
+        return None
+    res = df[df["fwd_ret"].notna()]
+    obs = None
+    if not res.empty:
+        obs = res.groupby("label").agg(
+            n=("fwd_ret", "size"), avg_next=("fwd_ret", "mean")).reset_index()
+        obs["avg_next"] = (obs["avg_next"] * 100).round(2)
+    return {"n_logged": int(len(df)), "n_resolved": int(len(res)), "obs": obs}
+
+
 def _oi_idea_metrics(conn, ticker, strike, direction, spot, r=0.045):
     """Concrete economics for an OI-conviction idea: entry premium (from DB), expiry/DTE,
     IV (back-solved), POP (~|delta|), a 1-sigma expected-move target + the option's value
@@ -2013,6 +2082,198 @@ def _gp_orderflow(tk):
     return {"coi": coi, "poi": poi, "net": net, "cv": cv, "pv": pv, "pcrv": pcrv, "flow": flow}
 
 
+# intent label → human bucket (buying / selling / hedging)
+_OI_BUCKET = {
+    "BULLISH":       ("🟢 Bullish call buying",      "Calls accumulating near/at-the-money — directional upside bets."),
+    "BULLISH_BREAK": ("🟢 Bullish call buying",      "Calls building above spot — breakout/upside positioning."),
+    "BEARISH":       ("🔴 Bearish put buying",       "Puts accumulating at-the-money — directional downside bets."),
+    "NEAR_BEARISH":  ("🔴 Bearish put buying",       "Puts building just below spot — bearish lean."),
+    "HEDGE":         ("🔵 Downside hedging",         "Deep-OTM puts added — protective insurance, NOT directional shorts."),
+    "HEDGE_UNWIND":  ("🔵 Hedge unwind",             "Protective puts being removed — risk appetite returning."),
+    "COVERED_CALL":  ("🟡 Call selling (overwrite)", "Far-OTM calls added — likely covered-call income / supply, caps upside."),
+    "STRADDLE":      ("🟣 Vol / straddle",           "Both sides built at-the-money — event/vol play, not direction."),
+    "UNWIND":        ("⚪ Position unwind",           "OI falling both sides — positions closing, conviction fading."),
+    "NEUTRAL":       ("⚪ Neutral / balanced",        "No clear opening flow."),
+}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _gp_oi_analytics(tk, spot):
+    """Deep options-flow analytics from the latest stored chain: classifies opening flow as
+    buying / selling / hedging per strike (via the hedge-aware intent algo), shows the biggest
+    ΔOI strikes within the front expiry (across-strike), and net ΔOI per expiry (across-expiry /
+    calendar). Returns a dict for rendering, or None."""
+    if not spot or spot <= 0:
+        return None
+    conn = get_conn()
+    try:
+        df = pd.read_sql(
+            "SELECT strike, expiry_date, change_OI_Call, change_OI_Put, "
+            "openInt_Call_now, openInt_Put_now, vol_Call_now, vol_Put_now FROM options_change "
+            "WHERE UPPER(ticker)=? AND trade_date_now=(SELECT trade_date_now FROM options_change "
+            "WHERE UPPER(ticker)=? ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)"
+            "||substr(trade_date_now,4,2) DESC LIMIT 1)", conn, params=(tk.upper(), tk.upper()))
+    except Exception:
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+    if df.empty:
+        return None
+    for c in df.columns:
+        if c != "expiry_date":
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    # ── per-strike intent (buying/selling/hedging), aggregated over all expiries ──
+    bystrike = df.groupby("strike", as_index=False).agg(
+        call_oi_change=("change_OI_Call", "sum"), put_oi_change=("change_OI_Put", "sum"))
+    enr, isig, _icol, idesc, idet = _oi_intent_algo(bystrike, spot)
+    enr["flow_wt"] = enr["call_oi_change"].abs() + enr["put_oi_change"].abs()
+    buckets = {}
+    for _, rr in enr.iterrows():
+        lbl, why = _OI_BUCKET.get(rr["intent"], _OI_BUCKET["NEUTRAL"])
+        b = buckets.setdefault(lbl, {"wt": 0.0, "why": why})
+        b["wt"] += float(rr["flow_wt"])
+    tot_wt = sum(b["wt"] for b in buckets.values()) or 1.0
+    bucket_rows = sorted(
+        ({"Flow type": k, "% of activity": round(v["wt"] / tot_wt * 100, 1),
+          "What it signals": v["why"]} for k, v in buckets.items() if v["wt"] > 0),
+        key=lambda r: r["% of activity"], reverse=True)
+
+    # ── across-strike: biggest ΔOI strikes (front-most expiry only) ──
+    def _exp_key(s):
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(str(s), fmt)
+            except Exception:
+                continue
+        return datetime.max
+    exps = sorted(df["expiry_date"].unique(), key=_exp_key)
+    front = exps[0] if exps else None
+    fdf = df[df["expiry_date"] == front].copy() if front else df.copy()
+    fdf["net"] = fdf["change_OI_Call"] - fdf["change_OI_Put"]
+    fdf["tot_chg"] = fdf["change_OI_Call"].abs() + fdf["change_OI_Put"].abs()
+    top_strikes = fdf.sort_values("tot_chg", ascending=False).head(8)
+    strike_rows = [{
+        "Strike": f"${r['strike']:.0f}",
+        "vs spot": f"{(r['strike']/spot-1)*100:+.1f}%",
+        "Call ΔOI": int(r["change_OI_Call"]), "Put ΔOI": int(r["change_OI_Put"]),
+        "Read": ("call build" if r["change_OI_Call"] > abs(r["change_OI_Put"]) and r["change_OI_Call"] > 0
+                 else "put build" if r["change_OI_Put"] > abs(r["change_OI_Call"]) and r["change_OI_Put"] > 0
+                 else "unwind" if r["change_OI_Call"] < 0 and r["change_OI_Put"] < 0 else "mixed"),
+    } for _, r in top_strikes.iterrows()]
+
+    # ── across-expiry (calendar): where new OI is going ──
+    cal = df.groupby("expiry_date", as_index=False).agg(
+        call=("change_OI_Call", "sum"), put=("change_OI_Put", "sum"))
+    cal["__k"] = cal["expiry_date"].map(_exp_key)
+    cal = cal.sort_values("__k")
+    today = datetime.now()
+    cal_rows = [{
+        "Expiry": str(r["expiry_date"]),
+        "DTE": max((_exp_key(r["expiry_date"]) - today).days, 0),
+        "Call ΔOI": int(r["call"]), "Put ΔOI": int(r["put"]),
+        "Net": int(r["call"] - r["put"]),
+    } for _, r in cal.iterrows()]
+    # front vs back tilt
+    if len(cal) >= 2:
+        half = cal["__k"].median()
+        fb = cal[cal["__k"] <= half]; bk = cal[cal["__k"] > half]
+        front_net = float((fb["call"] - fb["put"]).sum())
+        back_net = float((bk["call"] - bk["put"]).sum())
+        cal_tilt = ("Most new positioning is in NEAR expiries — short-dated, tactical."
+                    if abs(front_net) > abs(back_net)
+                    else "New positioning skews to LATER expiries — longer-horizon conviction.")
+    else:
+        front_net = back_net = 0.0
+        cal_tilt = "Only one expiry has flow."
+
+    return {"intent_sig": isig, "intent_desc": idesc, "hedge_pct": idet.get("hedge_pct", 0),
+            "buckets": bucket_rows, "front": front, "strikes": strike_rows,
+            "calendar": cal_rows, "cal_tilt": cal_tilt,
+            "front_net": front_net, "back_net": back_net}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _gp_patterns(tk, spot, put_wall=None, call_wall=None):
+    """Technical-pattern checklist: EMA sequence (8/21/50 stacking), golden/death cross
+    (50/200 DMA), bull/bear flag continuation, and dealer gamma regime (positive = pinned/
+    mean-revert, negative 'golden gamma' = moves amplified). Returns list of dicts
+    {name, val, sig, why, use}."""
+    out = []
+    try:
+        h = _cached_history(tk, "1y")
+        c = h["Close"].dropna() if (h is not None and "Close" in getattr(h, "columns", [])) else pd.Series(dtype=float)
+    except Exception:
+        c = pd.Series(dtype=float)
+    if len(c) >= 30:
+        px = float(c.iloc[-1])
+        e8 = float(c.ewm(span=8).mean().iloc[-1])
+        e21 = float(c.ewm(span=21).mean().iloc[-1])
+        e50 = float(c.ewm(span=50).mean().iloc[-1])
+        if e8 > e21 > e50 and px >= e8:
+            _s, _w = "BULL", "8>21>50 EMAs stacked up & price on top — clean uptrend sequence."
+        elif e8 < e21 < e50 and px <= e8:
+            _s, _w = "BEAR", "8<21<50 EMAs stacked down & price below — bearish EMA sequence."
+        else:
+            _s, _w = "NEUTRAL", "EMAs tangled — no clean trend sequence."
+        out.append({"name": "EMA sequence (8/21/50)", "val": f"{e8:.1f}/{e21:.1f}/{e50:.1f}",
+                    "sig": _s, "why": _w,
+                    "use": "Trade with the stack; avoid counter-trend entries when cleanly stacked."})
+        # golden / death cross (50 vs 200 DMA)
+        if len(c) >= 200:
+            s50 = c.rolling(50).mean(); s200 = c.rolling(200).mean()
+            a50, a200 = float(s50.iloc[-1]), float(s200.iloc[-1])
+            p50, p200 = float(s50.iloc[-6]), float(s200.iloc[-6])
+            if a50 > a200:
+                gs = "BULL"
+                gw = ("Fresh GOLDEN CROSS (50-DMA just crossed above 200) — bullish regime shift."
+                      if p50 <= p200 else "50-DMA above 200-DMA (golden-cross regime) — long-term bull.")
+            else:
+                gs = "BEAR"
+                gw = ("Fresh DEATH CROSS (50-DMA just crossed below 200) — bearish regime shift."
+                      if p50 >= p200 else "50-DMA below 200-DMA (death-cross regime) — long-term bear.")
+            out.append({"name": "Golden/Death cross (50/200)", "val": f"{a50:.0f}/{a200:.0f}",
+                        "sig": gs, "why": gw,
+                        "use": "Defines the dominant regime; trade pullbacks in its direction."})
+        # bull / bear flag continuation
+        if len(c) >= 25:
+            pole = px / float(c.iloc[-21]) - 1
+            last5 = c.iloc[-5:]
+            drift = float(last5.iloc[-1] / last5.iloc[0] - 1)
+            rng = float((last5.max() - last5.min()) / last5.mean())
+            if pole > 0.08 and -0.04 < drift <= 0.01 and rng < 0.06:
+                out.append({"name": "Bull flag (continuation)", "val": f"pole {pole*100:+.0f}%",
+                            "sig": "BULL",
+                            "why": "Strong up-move then a tight, slightly-down pause — classic bull flag; "
+                                   "breakouts usually resolve UP.",
+                            "use": "Look for a break above the flag high to add/hold longs."})
+            elif pole < -0.08 and -0.01 <= drift < 0.04 and rng < 0.06:
+                out.append({"name": "Bear flag (continuation)", "val": f"pole {pole*100:+.0f}%",
+                            "sig": "BEAR",
+                            "why": "Sharp down-move then a tight, slightly-up bounce — bear-flag "
+                                   "continuation; usually resolves DOWN.",
+                            "use": "A break below the flag low favors staying short / cutting longs."})
+    # dealer gamma regime ("golden gamma" flip)
+    if put_wall and call_wall and spot:
+        flip = (float(put_wall) + float(call_wall)) / 2.0
+        if spot < min(float(put_wall), flip):
+            out.append({"name": "Dealer gamma regime", "val": f"flip ≈ ${flip:.0f}", "sig": "BEAR",
+                        "why": f"Spot ${spot:.0f} is BELOW the gamma-flip (~${flip:.0f}) → **negative gamma**: "
+                               "dealers hedge *with* the move, amplifying swings (especially downside).",
+                        "use": "Expect bigger, trendier moves; respect stops, fade less."})
+        elif spot > max(float(call_wall), flip):
+            out.append({"name": "Dealer gamma regime", "val": f"flip ≈ ${flip:.0f}", "sig": "BULL",
+                        "why": f"Spot is above the call wall — stretched; dealers may cap further upside.",
+                        "use": f"Chase less; watch for mean-reversion back toward ${flip:.0f}."})
+        else:
+            out.append({"name": "Dealer gamma regime", "val": f"pinned ${float(put_wall):.0f}–${float(call_wall):.0f}",
+                        "sig": "NEUTRAL",
+                        "why": f"Spot is between the put/call walls → **positive gamma**: dealers fade moves, "
+                               f"price tends to pin / mean-revert toward ${flip:.0f}.",
+                        "use": "Favor range / premium-selling; breakouts need volume to stick."})
+    return out
+
+
 def _gp_debate(tk, tl, spot, em, dd, th, w, nw, stt, ivr, earn):
     """Both-sides assessment: reasons to HOLD vs reasons to CLOSE/adjust, then a verdict."""
     holds, closes = [], []
@@ -2060,22 +2321,39 @@ def _gp_debate(tk, tl, spot, em, dd, th, w, nw, stt, ivr, earn):
 
 
 def _gp_levels_fig(tk, spot, w, r1, s1, em):
-    """Compact number-line of key levels around spot with the 1σ expected-move band."""
-    pts = [("Spot", spot, "#ffffff")]
-    if w.get("put_wall"): pts.append(("Put wall", w["put_wall"], "#00e676"))
-    if w.get("call_wall"): pts.append(("Call wall", w["call_wall"], "#ff5c6c"))
-    if s1: pts.append(("S1", s1, "#26a69a"))
-    if r1: pts.append(("R1", r1, "#ef5350"))
+    """Simple, glanceable number-line: today's price (white line) inside the shaded 1-day
+    expected-move band, with support (green, below) and resistance (red, above) levels."""
     fig = go.Figure()
+    # 1-day expected-move band around spot, with labeled edges
     if em:
-        fig.add_vrect(x0=spot - em, x1=spot + em, fillcolor="rgba(61,139,255,0.12)", line_width=0)
-    for nm, x, col in pts:
-        fig.add_trace(go.Scatter(x=[x], y=[0], mode="markers+text", marker=dict(size=12, color=col),
+        fig.add_vrect(x0=spot - em, x1=spot + em, fillcolor="rgba(61,139,255,0.15)", line_width=0,
+                      annotation_text=f"±${em:.0f} (1-day expected move)",
+                      annotation_position="top left",
+                      annotation_font=dict(size=10, color="#3d8bff"))
+        for edge, lab in ((spot - em, f"-${em:.0f}"), (spot + em, f"+${em:.0f}")):
+            fig.add_trace(go.Scatter(x=[edge], y=[0], mode="markers+text", marker=dict(size=7, color="#3d8bff"),
+                                     text=[f"${edge:.0f}"], textposition="bottom center",
+                                     textfont=dict(size=9, color="#9db8ff"), showlegend=False, hoverinfo="skip"))
+    # support levels (below) green, resistance (above) red — auto colored by side vs spot
+    seen = set()
+    for nm, x in (("Put wall", w.get("put_wall")), ("Call wall", w.get("call_wall")),
+                  ("S1", s1), ("R1", r1)):
+        if not x or round(x) in seen:
+            continue
+        seen.add(round(x))
+        col = "#00e676" if x < spot else "#ff5c6c"
+        fig.add_trace(go.Scatter(x=[x], y=[0], mode="markers+text", marker=dict(size=11, color=col),
                                  text=[f"{nm}<br>${x:.0f}"], textposition="top center",
-                                 textfont=dict(size=10), showlegend=False, hoverinfo="x"))
-    fig.update_layout(template="plotly_dark", height=150, margin=dict(t=30, b=10, l=10, r=10),
-                      title=f"{tk} key levels (blue band = 1-day expected move)",
-                      yaxis=dict(visible=False, range=[-1, 1.5]), xaxis_title="Price")
+                                 textfont=dict(size=10, color=col), showlegend=False, hoverinfo="skip"))
+    # spot as a bold white vertical marker — the "you are here"
+    fig.add_vline(x=spot, line_color="#ffffff", line_width=2)
+    fig.add_trace(go.Scatter(x=[spot], y=[0], mode="markers+text", marker=dict(size=14, color="#ffffff"),
+                             text=[f"now ${spot:.0f}"], textposition="top center",
+                             textfont=dict(size=11, color="#ffffff"), showlegend=False, hoverinfo="skip"))
+    fig.update_layout(template="plotly_dark", height=160, margin=dict(t=28, b=24, l=10, r=10),
+                      title=f"{tk} — where price sits vs key levels",
+                      yaxis=dict(visible=False, range=[-1, 1.6]),
+                      xaxis=dict(title="Price ($)", showgrid=False))
     return fig
 
 
@@ -11081,7 +11359,45 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         for l in _legs:
             _by_tk.setdefault(l["ticker"], []).append(l)
         _checklist = []
+        # ── cheap pre-pass: one-liner summaries + portfolio-wide action checklist (keeps page fast) ──
+        _summ = []
         for _tk, _tl in _by_tk.items():
+            _ps = _tl[0]["spot"]; _ppnl = sum(x["pnl"] for x in _tl)
+            try:
+                _phc = _cached_history(_tk, "5d")["Close"].dropna()
+                _pprev = float(_phc.iloc[-2]) if len(_phc) >= 2 else float(_phc.iloc[-1])
+            except Exception:
+                _pprev = _tl[0].get("eod_spot", _ps)
+            _pchg = (_ps / _pprev - 1) * 100 if _pprev else 0.0
+            _pnw = _ticker_news(_tk)
+            _pte = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡", "NEUTRAL": "⚪"}[_pnw["label"]]
+            _ppl = "🟢 winning" if _ppnl > 0 else "🔴 losing" if _ppnl < 0 else "⚪ flat"
+            _summ.append((_tk, f"{_pte} **{_tk}** · \\${_ps:.2f} ({_pchg:+.1f}% vs prev \\${_pprev:.2f}) · "
+                               f"{len(_tl)} legs · P&L \\${_ppnl:,.0f} {_ppl} · news {_pnw['label']}"))
+            for l in _tl:
+                _mny = "ITM" if ((l["spot"] > l["K"]) if l["typ"] == "call" else (l["spot"] < l["K"])) else "OTM"
+                _pp = ((l["cur"] - l["entry"]) / l["entry"] * 100 * (1 if l["qty"] > 0 else -1)) if l["entry"] else 0
+                _ac = []
+                if l["dte"] <= 7: _ac.append(f"{l['dte']}DTE — decide now")
+                elif l["dte"] <= 21: _ac.append(f"{l['dte']}DTE — plan exit/roll")
+                if l["side"] == "short" and _mny == "ITM": _ac.append("ITM short — assignment risk")
+                if _pp >= 50: _ac.append("up ≥50% — take profit")
+                elif _pp <= -50: _ac.append("down ≥50% — cut/roll")
+                if _ac:
+                    _act = "; ".join(_ac)
+                    if l["dte"] <= 21 or (l["side"] == "short" and _mny == "ITM"):
+                        _rs = _roll_suggestion(_gp_conn, l)
+                        if _rs: _act += f" · {_rs}"
+                    _checklist.append(f"**{_tk} ${l['K']:.0f}{l['typ'][0].upper()}** ({l['side']}, {l['dte']}DTE): {_act}")
+            for p in _gp_patterns(_tk, _ps, None, None):
+                if p["sig"] in ("BULL", "BEAR") and any(k in p["name"] for k in ("flag", "cross")):
+                    _checklist.append(f"**{_tk}** {p['name']}: {p['why']}")
+        st.caption("Each position in one line — pick one below for its full game plan "
+                   "(only the selected stock is analyzed in depth, so the page stays fast).")
+        for _tks, _line in _summ:
+            st.markdown(_line)
+        _focus = st.selectbox("🔍 Full game plan for", [t for t, _ in _summ], key="gp_focus_stock")
+        for _tk, _tl in ([(_focus, _by_tk[_focus])] if _focus in _by_tk else []):
             _spot = _tl[0]["spot"]
             _ivs = sorted(x["iv"] for x in _tl); _ivm = _ivs[len(_ivs) // 2]
             _em = _spot * _ivm * (1 / 252.0) ** 0.5
@@ -11139,12 +11455,15 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _ste = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}.get(_stt["label"], "⚪")
                     st.markdown(f"**💬 StockTwits crowd:** {_ste} {_stt['label']} "
                                 f"({_stt['bull']} bullish / {_stt['bear']} bearish)")
+                    _log_sentiment(_tk, "stocktwits", _stt["label"])
                 _fh = _finnhub_sentiment(_tk)
                 if _fh:
                     _fhe = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}.get(_fh["label"], "⚪")
                     _buzz = f" · buzz {_fh['buzz']:.1f}×" if _fh.get("buzz") else ""
                     st.markdown(f"**🛰 Finnhub news-sentiment:** {_fhe} {_fh['label']} "
                                 f"({_fh['bull_pct']:.0f}% bullish){_buzz}")
+                    _log_sentiment(_tk, "finnhub", _fh["label"], _fh.get("bull_pct"))
+                _log_sentiment(_tk, "news_tone", _nw["label"])
                 _ivr = _iv_rank(_tk)
                 if _ivr:
                     _hint = ("🟢 cheap — favor buying premium / long options" if _ivr["rank"] < 30
@@ -11200,6 +11519,22 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         st.caption(f"Tally: **{_b} bullish vs {_br} bearish** → "
                                    + ("net bullish lean." if _b > _br else
                                       "net bearish lean." if _br > _b else "mixed / neutral."))
+                    # ── Chart-pattern & gamma-regime checklist ──
+                    _pats = _gp_patterns(_tk, _spot, _w.get("put_wall"), _w.get("call_wall"))
+                    if _pats:
+                        st.markdown("**🔺 Patterns & regime — EMA sequence · golden/death cross · "
+                                    "bull/bear flag · gamma regime**")
+                        _pe = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪"}
+                        st.dataframe(pd.DataFrame([
+                            {"Pattern": f"{_pe.get(p['sig'],'⚪')} {p['name']}", "Reading": p["val"],
+                             "What it means": p["why"], "How to use it": p["use"]} for p in _pats]),
+                            hide_index=True, use_container_width=True)
+                        _pb = sum(p["sig"] == "BULL" for p in _pats)
+                        _pbr = sum(p["sig"] == "BEAR" for p in _pats)
+                        st.caption(f"Pattern tally: **{_pb} bullish vs {_pbr} bearish** → "
+                                   + ("net bullish technical lean." if _pb > _pbr else
+                                      "net bearish technical lean." if _pbr > _pb else "mixed / no clear lean."))
+                    # ── Options order flow: headline + full OI analytics dropdown ──
                     _of = _gp_orderflow(_tk)
                     if _of:
                         _ofe = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}[_of["flow"]]
@@ -11210,6 +11545,50 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                                  "Call buildup + calls outvoting puts = bullish positioning." if _of["flow"] == "BULLISH"
                                  else "Put buildup / puts outvoting calls = bearish or hedging." if _of["flow"] == "BEARISH"
                                  else "Two-sided — no clear lean.")).replace("$", "\\$"))
+                        with st.expander("💧 Full OI analytics — buying / selling / hedging, across strikes & expiries",
+                                         expanded=False):
+                            _oa = _gp_oi_analytics(_tk, _spot)
+                            if not _oa:
+                                st.caption("No chain snapshot available for this ticker.")
+                            else:
+                                st.markdown(f"**Hedge-aware verdict:** {_oa['intent_sig']} — "
+                                            f"{_oa['intent_desc']}"
+                                            + (f"  ·  *{_oa['hedge_pct']:.0f}% of put flow looks like hedging.*"
+                                               if _oa["hedge_pct"] > 20 else ""))
+                                if _of["cv"]:
+                                    _voi = (_of["cv"] + _of["pv"]) / (abs(_of["coi"]) + abs(_of["poi"]) + 1)
+                                    st.caption(f"Volume vs ΔOI ≈ {_voi:.1f}× — "
+                                               + ("high turnover → fresh positions opening aggressively (likely institutional)."
+                                                  if _voi > 1.5 else
+                                                  "low turnover → mostly existing positions, little new conviction."))
+                                st.markdown("**1) What is the flow doing — buying, selling or hedging?**")
+                                if _oa["buckets"]:
+                                    st.dataframe(pd.DataFrame(_oa["buckets"]), hide_index=True,
+                                                 use_container_width=True,
+                                                 column_config={"% of activity": st.column_config.NumberColumn(
+                                                     format="%.1f%%")})
+                                st.caption("Classified by the hedge-aware intent algo (strike-zone heuristics). "
+                                           "Opening flow can't be tagged buy/sell with certainty without the trade "
+                                           "aggressor — treat as a well-grounded proxy, not tape.")
+                                st.markdown(f"**2) Across strikes** — biggest ΔOI in the front expiry "
+                                            f"(*{_oa['front']}*):")
+                                if _oa["strikes"]:
+                                    st.dataframe(pd.DataFrame(_oa["strikes"]), hide_index=True,
+                                                 use_container_width=True,
+                                                 column_config={
+                                                     "Call ΔOI": st.column_config.NumberColumn(format="%+d"),
+                                                     "Put ΔOI": st.column_config.NumberColumn(format="%+d")})
+                                st.markdown("**3) Across expiries (calendar)** — where new OI is going:")
+                                if _oa["calendar"]:
+                                    st.dataframe(pd.DataFrame(_oa["calendar"]), hide_index=True,
+                                                 use_container_width=True,
+                                                 column_config={
+                                                     "Call ΔOI": st.column_config.NumberColumn(format="%+d"),
+                                                     "Put ΔOI": st.column_config.NumberColumn(format="%+d"),
+                                                     "Net": st.column_config.NumberColumn(format="%+d")})
+                                st.caption("📅 " + _oa["cal_tilt"])
+
+                    # ── 24-model engine: headline + per-model breakdown dropdown ──
                     try:
                         import telegram_bot as _tbe
                         _eng = _tbe.high_prob_signals_engine(_tk, _gp_conn)
@@ -11220,6 +11599,50 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                                         f"({_eng.get('bull_v','?')}🟢 / {_eng.get('bear_v','?')}🔴 of {_eng.get('total_m',24)})")
                             if _eng.get("strategy"):
                                 st.caption(("Engine play: " + str(_eng["strategy"])).replace("$", "\\$"))
+                            with st.expander("🤖 24-model breakdown — every model's vote, weight & reason",
+                                             expanded=False):
+                                st.caption(f"Votes: {_eng.get('bull_v',0)} bull · {_eng.get('bear_v',0)} bear · "
+                                           f"{_eng.get('neut_v',0)} neutral · {_eng.get('sell_v',0)} sell-premium "
+                                           f"→ ensemble **{_eng['signal']} {_eng.get('prob',0):.0f}%** "
+                                           f"({_eng.get('conf','')} confidence). Probabilities are weighted by each "
+                                           "model's recent hit-rate (adaptive weights).")
+                                _vb = _eng.get("vrvp_box") or {}
+                                if _vb.get("poc"):
+                                    st.markdown(("**Volume profile (VRVP):** value area "
+                                                 f"\\${_vb.get('val','?')}–\\${_vb.get('vah','?')}, "
+                                                 f"POC \\${_vb.get('poc','?')}"
+                                                 + (f", box \\${_vb.get('lo')}–\\${_vb.get('hi')}" if _vb.get('lo') else "")
+                                                 + " — high-volume nodes act as magnets/support-resistance."))
+                                _mods = _eng.get("models") or {}
+                                _wts = _eng.get("weights") or {}
+                                if isinstance(_mods, dict) and _mods:
+                                    _mrows = []
+                                    _eord = {"BULL": 0, "BEAR": 1, "SELL_PREMIUM": 2, "NEUTRAL": 3}
+                                    for _mn, _md in _mods.items():
+                                        if not isinstance(_md, dict):
+                                            continue
+                                        _msig = _md.get("signal", "NEUTRAL")
+                                        _me = {"BULL": "🟢", "BEAR": "🔴", "SELL_PREMIUM": "🟠",
+                                               "NEUTRAL": "⚪"}.get(_msig, "⚪")
+                                        _mrows.append({
+                                            "Model": _mn, "Vote": f"{_me} {_msig}",
+                                            "Prob": round(float(_md.get("prob", 50)), 0),
+                                            "Weight": round(float(_wts.get(_mn, 1.0)), 2),
+                                            "Why": str(_md.get("reason", ""))[:90],
+                                            "_o": _eord.get(_msig, 3)})
+                                    _mrows.sort(key=lambda r: (r["_o"], -r["Prob"]))
+                                    for _r in _mrows:
+                                        _r.pop("_o", None)
+                                    st.dataframe(pd.DataFrame(_mrows), hide_index=True,
+                                                 use_container_width=True,
+                                                 column_config={
+                                                     "Prob": st.column_config.NumberColumn(format="%d%%"),
+                                                     "Weight": st.column_config.NumberColumn(
+                                                         format="%.2f×",
+                                                         help="Adaptive weight from the model's recent accuracy")})
+                                    st.caption("Weight >1.0 = the model has been more accurate recently and counts "
+                                               "for more; <1.0 = recently unreliable, down-weighted. See the "
+                                               "🎯 Signal Accuracy page for each model's forward-tracked hit-rate.")
                     except Exception as _ee:
                         st.caption(f"(24-model engine unavailable: {_ee})")
 
@@ -11283,8 +11706,6 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         "Close @": _climit,
                         "P&L %": round(pnl_pct), "P&L $": round(l["pnl"]), "Action": action,
                     })
-                    if action != "hold & monitor":
-                        _checklist.append(f"**{_tk} ${l['K']:.0f}{l['typ'][0].upper()}** ({l['side']}, {l['dte']}DTE): {action}")
                 st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True,
                              column_config={"P&L %": st.column_config.NumberColumn(format="%d%%")})
                 st.caption("**Est Open** = value if flat into next open (1 day decay; AH-adjusted when 🌙 on). "
@@ -12953,11 +13374,29 @@ historical one) — its numbers come from predictions logged live and resolved o
             })
 
     st.markdown("---")
-    st.markdown("### 💬 Sentiment signals")
-    st.info("Sentiment (news tone, StockTwits/Finnhub crowd) is **not stored historically**, so "
-            "it can't be backtested from the DB. It's evaluated live inside the Game Plan / "
-            "`/plan` flow. To score it, predictions would need to be forward-logged over time — "
-            "say the word and I'll add a sentiment forward-log table.")
+    st.markdown("### 💬 Sentiment — observational log (not scored)")
+    st.caption("Sentiment (news tone, StockTwits/Finnhub crowd) is **recorded forward**, not graded. "
+               "It's noisy and reflexive — often coincident or contrarian, not a clean predictor — so "
+               "we log it to *observe* what tended to follow each reading, **without** a hit-rate verdict.")
+    _slog = _sentiment_log_view(_sa_tk)
+    if not _slog:
+        st.info("No sentiment logged yet. Open a stock in the 🌅 Next-Day Game Plan — each view records "
+                "that day's news/crowd reading here, and forward returns fill in automatically.")
+    else:
+        st.caption(f"Logged readings: **{_slog['n_logged']}** · resolved with a next-day return: "
+                   f"**{_slog['n_resolved']}**")
+        if _slog["obs"] is not None and not _slog["obs"].empty:
+            st.markdown("**What tended to happen the next day after each reading** (observational only):")
+            st.dataframe(
+                _slog["obs"].rename(columns={"label": "Sentiment", "n": "Times seen",
+                                             "avg_next": "Avg next-day move"}),
+                hide_index=True, use_container_width=True,
+                column_config={
+                    "Avg next-day move": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Times seen": st.column_config.NumberColumn(format="%d")})
+            st.caption("⚠️ Descriptive, tiny-sample, and NOT a validated edge — do not trade off this table. "
+                       "It exists so you can watch whether crowd/news sentiment has *any* relationship to "
+                       "forward moves over time.")
 
 
 # ===================================================================
