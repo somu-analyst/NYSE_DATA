@@ -252,6 +252,25 @@ def _cached_price(ticker: str) -> float:
     except Exception:
         return 0.0
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_info(ticker: str) -> dict:
+    """yfinance .info dict — cached 15 min (it's a slow call; reruns shouldn't refetch)."""
+    try:
+        return dict(yf.Ticker(ticker).info or {})
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_option_chain(ticker: str, expiry: str):
+    """yfinance option_chain — cached 5 min. Returns an object with .calls/.puts (or None),
+    so existing call sites keep working unchanged."""
+    from types import SimpleNamespace
+    try:
+        oc = yf.Ticker(ticker).option_chain(expiry)
+        return SimpleNamespace(calls=oc.calls, puts=oc.puts)
+    except Exception:
+        return None
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _historical_vol(ticker: str, window: int = 30) -> float:
     """Annualised 30-day realised volatility from daily log-returns. Fallback 0.30."""
@@ -3700,7 +3719,7 @@ if page == "🌍 Market Overview":
                         with st.expander("📉 Short Interest & Float"):
                             try:
                                 _si_ticker = _inst_sym.replace("^", "")
-                                _si_info = yf.Ticker(_si_ticker).info
+                                _si_info = _cached_info(_si_ticker)
                                 _si_float  = _si_info.get("floatShares")
                                 _si_ss     = _si_info.get("sharesShort")
                                 _si_spf    = _si_info.get("shortPercentOfFloat")
@@ -4533,7 +4552,7 @@ elif page == "🔥 OI Analytics & Prediction":
 
                 # Current option price estimate
                 try:
-                    _opt_chain = yf.Ticker(sel_ticker).option_chain(_expiry[:10])
+                    _opt_chain = _cached_option_chain(sel_ticker, _expiry[:10])
                     _chain_df  = _opt_chain.calls if _otype == "CALL" else _opt_chain.puts
                     _near      = _chain_df[_chain_df["strike"] == _strike]
                     _cur_px    = float(_near["lastPrice"].iloc[0]) if not _near.empty else _entry
@@ -6601,7 +6620,7 @@ elif page == "🔮 Live Position Predictor":
                 _wl_iv = 0.30
                 _wl_iv_src = "Default"
                 try:
-                    _wl_chain = yf.Ticker(tk).option_chain(_wl_expiry.strftime("%Y-%m-%d"))
+                    _wl_chain = _cached_option_chain(tk, _wl_expiry.strftime("%Y-%m-%d"))
                     _wl_oc = _wl_chain.calls if _wl_otype == "call" else _wl_chain.puts
                     _wl_m = _wl_oc[_wl_oc["strike"] == float(_wl_strike)]
                     if not _wl_m.empty and "impliedVolatility" in _wl_m.columns:
@@ -7505,7 +7524,7 @@ elif page == "📈 Insider / Congress / Whales":
                             if _ss and _ssp and _ssp > 0:
                                 _mom = (_ss - _ssp) / _ssp * 100
                             try:
-                                _inf = yf.Ticker(_stk).info
+                                _inf = _cached_info(_stk)
                                 _px   = _inf.get("currentPrice") or _inf.get("regularMarketPrice") or 0
                                 _mcap = _inf.get("marketCap") or 0
                                 _name = _inf.get("shortName", _stk)[:22]
@@ -10193,7 +10212,7 @@ elif page == "⚡ Trade Risk Calculator":
         if _sim_ah_d["is_extended"]:
             st.caption(f"🌙 AH price: **${_sim_ah_d['spot_ah']:.2f}** ({_sim_ah_d['ah_chg_pct']:+.1f}%)  EOD: ${_sim_eod:.2f}")
         try:
-            _sim_chain = _sim_tk_obj.option_chain(sim_expiry.strftime("%Y-%m-%d"))
+            _sim_chain = _cached_option_chain(sim_ticker, sim_expiry.strftime("%Y-%m-%d"))
             _sim_oc = _sim_chain.calls if sim_opt_type == "call" else _sim_chain.puts
             _sim_m = _sim_oc[_sim_oc["strike"] == float(sim_strike)]
             if not _sim_m.empty and "impliedVolatility" in _sim_m.columns:
@@ -10830,7 +10849,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 avail_dts = [datetime.strptime(e, "%Y-%m-%d").date() for e in available]
                 nearest = min(avail_dts, key=lambda d: abs((d - exp_dt).days))
                 exp_str = nearest.strftime("%Y-%m-%d")
-            chain = tk.option_chain(exp_str)
+            chain = _cached_option_chain(ticker, exp_str)
             df_c = chain.calls if opt_type.lower() == "call" else chain.puts
             row = df_c[abs(df_c["strike"] - strike) < 0.01]
             if row.empty:
@@ -11431,7 +11450,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         _ep_iv_raw = 0.0  # raw fetched value (before sanity check)
         _ep_iv_suspect = False
         try:
-            _ep_chain = _ep_tk_obj.option_chain(ep_expiry.strftime("%Y-%m-%d"))
+            _ep_chain = _cached_option_chain(ep_ticker, ep_expiry.strftime("%Y-%m-%d"))
             _ep_oc = _ep_chain.puts if ep_type == "put" else _ep_chain.calls
             _ep_m = _ep_oc[_ep_oc["strike"] == float(ep_strike)]
             if not _ep_m.empty and "impliedVolatility" in _ep_m.columns:
