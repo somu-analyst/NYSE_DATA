@@ -11520,24 +11520,31 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                    "levels to watch, and a ranked action checklist. Built from your DB (latest close + "
                    "stored option prices) with Black-Scholes.")
         _ms = _market_state()
-        _ms_badge = {"OPEN": "🟢 Market OPEN (live)", "PRE": "🌅 Pre-market",
+        _ms_badge = {"OPEN": "🟢 Market OPEN", "PRE": "🌅 Pre-market",
                      "AFTER": "🌙 After-hours", "CLOSED": "🔴 Market closed",
                      "UNKNOWN": "⏱ Session unknown"}.get(_ms, _ms)
-        _gp_ah_tog, _gp_ref_tog, _gp_int_col, _gp_ah_note = st.columns([1.2, 1.0, 1.0, 2.2])
-        _gp_use_ah = _gp_ah_tog.toggle(
-            "🔴 Live prices", value=st.session_state.get("use_ah", True), key="use_ah",
-            help="Use live / after-hours / pre-market prices: spot, moneyness, Greeks, scenarios and "
-                 "P&L all re-price off the live quote. Turn off to freeze on the last EOD close.")
+        # Price source is AUTOMATIC: live during RTH, AH/PM when extended hours, EOD when closed.
+        # The only control is an EOD override.
+        _gp_eod_col, _gp_ref_tog, _gp_int_col, _gp_ah_note = st.columns([1.2, 1.0, 1.0, 2.2])
+        _gp_force_eod = _gp_eod_col.toggle(
+            "🕘 EOD close", value=st.session_state.get("gp_force_eod", False), key="gp_force_eod",
+            help="Default: live prices during market hours, after-hours/pre-market (AH/PM) when "
+                 "extended, EOD close when fully closed. Turn this ON to force the last EOD close.")
+        _gp_use_ah = not _gp_force_eod
+        st.session_state["use_ah"] = _gp_use_ah          # drives _spot() everywhere
+        # auto source label for this session
+        _src_tag = "EOD" if _gp_force_eod else {"OPEN": "LIVE", "PRE": "PM", "AFTER": "AH",
+                                                "CLOSED": "EOD", "UNKNOWN": "EOD"}.get(_ms, "LIVE")
+        _src_emoji = {"LIVE": "🔴", "PM": "🌅", "AH": "🌙", "EOD": "🕘"}.get(_src_tag, "🔴")
         _gp_autoref = _gp_ref_tog.toggle(
             "🔁 Auto-refresh", value=st.session_state.get("gp_autoref", True), key="gp_autoref",
-            help="Reload at the chosen interval during market hours so quotes stay live.")
+            help="Reload at the chosen interval during market/extended hours so quotes stay live.")
         _gp_int = _gp_int_col.select_slider(
             "every", options=[15, 30, 60, 120], value=st.session_state.get("gp_refresh_int", 60),
             key="gp_refresh_int", format_func=lambda s: f"{s}s",
             help="How often to reload while live. Longer = lighter on the page.")
-        _gp_ah_note.caption(f"**{_ms_badge}** · "
-                            + ("live quotes feed spot, Greeks & P&L." if _gp_use_ah
-                               else "showing frozen EOD close (Live off)."))
+        _gp_ah_note.caption(f"**{_ms_badge}** · price source: {_src_emoji} **{_src_tag}**"
+                            + (" (forced)" if _gp_force_eod else " (auto)"))
         if _gp_use_ah and _gp_autoref and _ms in ("OPEN", "PRE", "AFTER"):
             _auto_refresh(_gp_int)
             st.caption(f"🔁 Auto-refreshing every {_gp_int}s · last update "
@@ -11978,11 +11985,11 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _chg = (_spot / _prev_close - 1) * 100 if _prev_close else 0.0
             _daylbl = "🟢 up day" if _chg > 0.2 else "🔴 down day" if _chg < -0.2 else "⚪ flat"
             _pnllbl = "🟢 winning" if _tk_pnl > 0 else "🔴 losing" if _tk_pnl < 0 else "⚪ flat"
-            with st.expander(f"{_te} {_tk} · ${_spot:.2f} ({_chg:+.1f}% vs prev ${_prev_close:.2f}) · "
+            with st.expander(f"{_te} {_tk} · ${_spot:.2f} {_src_tag} ({_chg:+.1f}% vs prev ${_prev_close:.2f}) · "
                              f"{len(_tl)} legs · P&L ${_tk_pnl:,.0f} {_pnllbl} · news {_nw['label']}",
                              expanded=False):
                 _mc = st.columns(4)
-                _mc[0].metric("Spot", f"${_spot:.2f}", f"{_chg:+.2f}% vs prev close",
+                _mc[0].metric(f"Spot · {_src_tag}", f"${_spot:.2f}", f"{_chg:+.2f}% vs prev close",
                               delta_color="normal" if _chg >= 0 else "inverse")
                 _mc[1].metric("1-day exp. move", f"±${_em:.2f}", f"±{_em/_spot*100:.1f}%")
                 _mc[2].metric("Δ per +1%", f"${_tk_dd:,.0f}", _daylbl)
