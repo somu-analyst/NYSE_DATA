@@ -337,7 +337,7 @@ def _db_option_price(ticker: str, expiry_iso: str, strike: float, opt_type: str)
     return None
 
 @st.cache_data(ttl=180, show_spinner=False)
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def _get_ah_price(ticker: str) -> dict:
     """Fetch after-hours / pre-market / live price via yfinance fast_info. Returns dict with
     spot_reg, spot_ah, ah_chg_pct, is_extended, label ('AH'/'PM'/'Live'/'EOD').
@@ -411,14 +411,25 @@ def _market_state():
     return "CLOSED"
 
 
+@st.fragment(run_every=5)
+def _gp_live_tick():
+    """Lightweight 5s heartbeat fragment. When the chosen refresh interval has elapsed it triggers
+    a full SCRIPT rerun (st.rerun) — NOT a browser reload — so charts/tables/values update in place,
+    the old values stay on screen until the new ones render, and there's no flash or scroll reset."""
+    import time as _t
+    interval = int(st.session_state.get("gp_refresh_int", 60))
+    if _t.time() - st.session_state.get("_app_run_ts", 0.0) >= max(interval, 5):
+        st.rerun(scope="app")
+
+
 def _auto_refresh(seconds: int):
-    """Reload the app after `seconds` (live mode). Session state + cache_data persist across the
-    reload, so it's cheap; cache TTLs keep network calls bounded."""
+    """Arm the in-place live refresh: records this run's timestamp and renders the heartbeat
+    fragment. The fragment quietly checks the clock every 5s and reruns the app only when the
+    interval elapses (so no tight loop on first render)."""
+    import time as _t
+    st.session_state["_app_run_ts"] = _t.time()
     try:
-        import streamlit.components.v1 as _components
-        _components.html(
-            f"<script>setTimeout(function(){{window.parent.location.reload();}}, {int(seconds)*1000});</script>",
-            height=0)
+        _gp_live_tick()
     except Exception:
         pass
 
@@ -11547,8 +11558,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                             + (" (forced)" if _gp_force_eod else " (auto)"))
         if _gp_use_ah and _gp_autoref and _ms in ("OPEN", "PRE", "AFTER"):
             _auto_refresh(_gp_int)
-            st.caption(f"🔁 Auto-refreshing every {_gp_int}s · last update "
-                       f"{datetime.now().strftime('%H:%M:%S')}")
+            st.caption(f"🔁 Live — updating in place every {_gp_int}s (no page reload) · "
+                       f"last update {datetime.now().strftime('%H:%M:%S')}")
         _gp_conn = get_conn()
         try:
             _gp_tr = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", _gp_conn)
