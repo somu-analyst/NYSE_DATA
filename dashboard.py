@@ -385,8 +385,9 @@ def _get_ah_price(ticker: str) -> dict:
     return result
 
 def _spot(ticker: str) -> float:
-    """Return AH price when toggle is on, else EOD close. Use this everywhere instead of _cached_price()."""
-    if st.session_state.get("use_ah", False):
+    """Live / after-hours price by DEFAULT; only returns the EOD close if the user explicitly
+    turns the 'Live prices' toggle off (use_ah=False). Use this everywhere instead of _cached_price()."""
+    if st.session_state.get("use_ah", True):
         d = _get_ah_price(ticker)
         return d["spot_ah"] if d["spot_ah"] > 0 else d["spot_reg"]
     return _cached_price(ticker)
@@ -11548,20 +11549,28 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _gp_tr = pd.DataFrame()
 
         # ── ➕ Manage positions (add a new trade / close an open one) ──
-        with st.expander("➕ Manage positions — add a new trade or close one", expanded=_gp_tr.empty):
-            _ac1, _ac2 = st.columns(2)
-            with _ac1:
-                st.markdown("**Add a new position**")
+        try:
+            _all_tr = pd.read_sql(
+                "SELECT * FROM trades ORDER BY CASE WHEN status='OPEN' THEN 0 ELSE 1 END, trade_id DESC",
+                _gp_conn)
+        except Exception:
+            _all_tr = pd.DataFrame()
+        with st.expander("➕ Manage positions — add, edit, or close trades", expanded=_gp_tr.empty):
+            _mtab_add, _mtab_edit = st.tabs(["➕ Add new", "✏️ Edit / Close existing"])
+
+            # ── Add new ──
+            with _mtab_add:
                 _na_tk = st.text_input("Ticker", key="gp_add_tk", placeholder="e.g. AAPL").strip().upper()
-                _na_c1, _na_c2 = st.columns(2)
+                _na_c1, _na_c2, _na_c3, _na_c4 = st.columns(4)
                 _na_typ = _na_c1.selectbox("Type", ["call", "put"], key="gp_add_typ")
                 _na_side = _na_c2.selectbox("Side", ["long", "short"], key="gp_add_side")
-                _na_c3, _na_c4 = st.columns(2)
                 _na_K = _na_c3.number_input("Strike", min_value=0.0, step=1.0, key="gp_add_K")
                 _na_qty = _na_c4.number_input("Contracts", min_value=1, step=1, value=1, key="gp_add_qty")
-                _na_c5, _na_c6 = st.columns(2)
+                _na_c5, _na_c6, _na_c7 = st.columns(3)
                 _na_exp = _na_c5.text_input("Expiry (YYYY-MM-DD)", key="gp_add_exp", placeholder="2026-07-18")
                 _na_px = _na_c6.number_input("Entry premium", min_value=0.0, step=0.05, key="gp_add_px")
+                _na_date = _na_c7.date_input("Entry date", value=datetime.now().date(), key="gp_add_date")
+                _na_notes = st.text_input("Notes (optional)", key="gp_add_notes")
                 if st.button("➕ Add position", key="gp_add_btn"):
                     _ok = False
                     try:
@@ -11576,43 +11585,122 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         try:
                             _gp_conn.execute(
                                 "INSERT INTO trades (ticker, option_type, strike, expiry, entry_price, "
-                                "quantity, entry_date, status) VALUES (?,?,?,?,?,?,?, 'OPEN')",
+                                "quantity, entry_date, notes, status) VALUES (?,?,?,?,?,?,?,?, 'OPEN')",
                                 (_na_tk, _na_typ, float(_na_K), _na_exp, float(_na_px), int(_sq),
-                                 datetime.now().strftime("%Y-%m-%d")))
+                                 _na_date.strftime("%Y-%m-%d"), _na_notes or None))
                             _gp_conn.commit()
                             st.success(f"Added {_na_side} {_na_qty}× {_na_tk} ${_na_K:.0f}{_na_typ[0].upper()} {_na_exp}.")
                             st.cache_data.clear(); st.rerun()
                         except Exception as _e:
                             st.error(f"Could not add: {_e}")
-            with _ac2:
-                st.markdown("**Close an open position**")
-                if _gp_tr.empty:
-                    st.caption("No open positions to close.")
+
+            # ── Edit / Close existing ──
+            with _mtab_edit:
+                if _all_tr.empty:
+                    st.caption("No trades yet. Add one in the other tab.")
                 else:
-                    _cl_map = {
-                        f"{r['ticker']} ${float(r['strike']):.0f}{str(r['option_type'])[0].upper()} "
-                        f"{r['expiry']} ×{int(r['quantity'])} (id {int(r['trade_id'])})": int(r["trade_id"])
-                        for _, r in _gp_tr.iterrows()}
-                    _cl_pick = st.selectbox("Position", list(_cl_map), key="gp_close_pick")
-                    _cl_px = st.number_input("Exit premium (optional)", min_value=0.0, step=0.05, key="gp_close_px")
-                    if st.button("✖️ Close position", key="gp_close_btn"):
+                    def _trlabel(r):
+                        _s = "🟢" if str(r["status"]).upper() == "OPEN" else "⚪"
+                        return (f"{_s} {r['ticker']} ${float(r['strike'] or 0):.0f}"
+                                f"{str(r['option_type'])[0].upper()} {r['expiry']} ×{int(r['quantity'] or 0)} "
+                                f"· {r['status']} (id {int(r['trade_id'])})")
+                    _em_map = {_trlabel(r): int(r["trade_id"]) for _, r in _all_tr.iterrows()}
+                    _em_pick = st.selectbox("Select a trade", list(_em_map), key="gp_edit_pick")
+                    _tid = _em_map[_em_pick]
+                    _row = _all_tr[_all_tr["trade_id"] == _tid].iloc[0]
+                    _is_open = str(_row["status"]).upper() == "OPEN"
+                    _cur_qty = int(_row["quantity"] or 0)
+
+                    def _sv(col, default=0.0):
                         try:
-                            _tid = _cl_map[_cl_pick]
-                            if _cl_px > 0:
+                            v = _row.get(col)
+                            return float(v) if v is not None and str(v) != "" and not pd.isna(v) else default
+                        except Exception:
+                            return default
+                    st.caption(f"Trade **{_tid}** · opened {_row.get('entry_date') or '?'} · status **{_row['status']}**"
+                               + (f" · exit {_row.get('exit_price')} on {_row.get('exit_date')}" if not _is_open else ""))
+
+                    st.markdown("**Edit details**")
+                    _e1, _e2, _e3 = st.columns(3)
+                    _ed_tk = _e1.text_input("Ticker", value=str(_row["ticker"]), key=f"ed_tk_{_tid}").strip().upper()
+                    _ed_typ = _e2.selectbox("Type", ["call", "put"],
+                                            index=0 if str(_row["option_type"]).lower().startswith("c") else 1,
+                                            key=f"ed_typ_{_tid}")
+                    _ed_side = _e3.selectbox("Side", ["long", "short"],
+                                             index=0 if _cur_qty >= 0 else 1, key=f"ed_side_{_tid}")
+                    _e4, _e5, _e6 = st.columns(3)
+                    _ed_K = _e4.number_input("Strike", min_value=0.0, step=1.0, value=_sv("strike"), key=f"ed_K_{_tid}")
+                    _ed_qty = _e5.number_input("Contracts", min_value=1, step=1, value=max(abs(_cur_qty), 1), key=f"ed_qty_{_tid}")
+                    _ed_px = _e6.number_input("Entry premium", min_value=0.0, step=0.05, value=_sv("entry_price"), key=f"ed_px_{_tid}")
+                    _e7, _e8, _e9 = st.columns(3)
+                    _ed_exp = _e7.text_input("Expiry (YYYY-MM-DD)", value=str(_row["expiry"]), key=f"ed_exp_{_tid}")
+                    _ed_entry_date = _e8.text_input("Entry date", value=str(_row.get("entry_date") or ""), key=f"ed_ed_{_tid}")
+                    _ed_iv = _e9.number_input("Entry IV (opt)", min_value=0.0, step=0.01, value=_sv("entry_iv"), key=f"ed_iv_{_tid}")
+                    _e10, _e11, _e12 = st.columns(3)
+                    _ed_sl = _e10.number_input("Stop price (opt)", min_value=0.0, step=0.05, value=_sv("stop_loss_price"), key=f"ed_sl_{_tid}")
+                    _ed_tp = _e11.number_input("Target price (opt)", min_value=0.0, step=0.05, value=_sv("take_profit_price"), key=f"ed_tp_{_tid}")
+                    _ed_notes = _e12.text_input("Notes", value=str(_row.get("notes") or ""), key=f"ed_notes_{_tid}")
+                    if st.button("💾 Save changes", key=f"ed_save_{_tid}"):
+                        _ok = True
+                        try:
+                            datetime.strptime(_ed_exp, "%Y-%m-%d")
+                        except Exception:
+                            _ok = False; st.error("Expiry must be YYYY-MM-DD.")
+                        if _ok:
+                            try:
+                                _sq = _ed_qty if _ed_side == "long" else -_ed_qty
                                 _gp_conn.execute(
-                                    "UPDATE trades SET status='CLOSED', exit_price=?, exit_date=?, "
-                                    "exit_reason='manual (planner)' WHERE trade_id=?",
-                                    (float(_cl_px), datetime.now().strftime("%Y-%m-%d"), _tid))
-                            else:
+                                    "UPDATE trades SET ticker=?, option_type=?, strike=?, quantity=?, expiry=?, "
+                                    "entry_price=?, entry_date=?, entry_iv=?, stop_loss_price=?, take_profit_price=?, "
+                                    "notes=?, updated_at=? WHERE trade_id=?",
+                                    (_ed_tk, _ed_typ, float(_ed_K), int(_sq), _ed_exp, float(_ed_px),
+                                     _ed_entry_date or None, (_ed_iv or None), (_ed_sl or None), (_ed_tp or None),
+                                     _ed_notes or None, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), _tid))
+                                _gp_conn.commit()
+                                st.success("Saved."); st.cache_data.clear(); st.rerun()
+                            except Exception as _e:
+                                st.error(f"Could not save: {_e}")
+
+                    st.markdown("---")
+                    if _is_open:
+                        st.markdown("**Close this position**")
+                        _c1, _c2, _c3 = st.columns(3)
+                        _cl_px = _c1.number_input("Exit premium", min_value=0.0, step=0.05, key=f"cl_px_{_tid}")
+                        _cl_date = _c2.date_input("Exit date", value=datetime.now().date(), key=f"cl_date_{_tid}")
+                        _cl_reason = _c3.text_input("Exit reason", value="manual (planner)", key=f"cl_rsn_{_tid}")
+                        if st.button("✖️ Close position", key=f"cl_btn_{_tid}"):
+                            try:
+                                _pnl = None
+                                if _cl_px > 0:
+                                    _pnl = (float(_cl_px) - _sv("entry_price")) * _cur_qty * 100
                                 _gp_conn.execute(
-                                    "UPDATE trades SET status='CLOSED', exit_date=?, "
-                                    "exit_reason='manual (planner)' WHERE trade_id=?",
-                                    (datetime.now().strftime("%Y-%m-%d"), _tid))
+                                    "UPDATE trades SET status='CLOSED', exit_price=?, exit_date=?, exit_reason=?, "
+                                    "pnl=?, updated_at=? WHERE trade_id=?",
+                                    ((float(_cl_px) or None), _cl_date.strftime("%Y-%m-%d"),
+                                     _cl_reason or "manual", _pnl, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), _tid))
+                                _gp_conn.commit()
+                                st.success(f"Closed (P&L ${_pnl:,.0f})." if _pnl is not None else "Closed.")
+                                st.cache_data.clear(); st.rerun()
+                            except Exception as _e:
+                                st.error(f"Could not close: {_e}")
+                    else:
+                        if st.button("↩️ Re-open position", key=f"reopen_{_tid}"):
+                            try:
+                                _gp_conn.execute(
+                                    "UPDATE trades SET status='OPEN', exit_price=NULL, exit_date=NULL, "
+                                    "exit_reason=NULL, pnl=NULL, updated_at=? WHERE trade_id=?",
+                                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), _tid))
+                                _gp_conn.commit()
+                                st.success("Re-opened."); st.cache_data.clear(); st.rerun()
+                            except Exception as _e:
+                                st.error(f"Could not re-open: {_e}")
+                    if st.button("🗑 Delete permanently", key=f"del_btn_{_tid}"):
+                        try:
+                            _gp_conn.execute("DELETE FROM trades WHERE trade_id=?", (_tid,))
                             _gp_conn.commit()
-                            st.success("Position closed.")
-                            st.cache_data.clear(); st.rerun()
+                            st.warning("Deleted."); st.cache_data.clear(); st.rerun()
                         except Exception as _e:
-                            st.error(f"Could not close: {_e}")
+                            st.error(f"Could not delete: {_e}")
 
         if _gp_tr.empty:
             st.info("No open positions in the portfolio. Add one above to build your game plan.")
@@ -11879,23 +11967,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _tk_dd = sum(x["ddelta_1pct"] for x in _tl)
             _tk_th = sum(x["pos_theta"] for x in _tl)
             _tk_pnl = sum(x["pnl"] for x in _tl)
-            _near = min(_tl, key=lambda x: x["dte"])
-            try:
-                _chain = pd.read_sql(
-                    "SELECT strike, openInt_Call_now, openInt_Put_now, R1, S1 FROM options_change "
-                    "WHERE UPPER(ticker)=? AND expiry_date=?",
-                    _gp_conn, params=(_tk, _near["exp_mdy"]))
-            except Exception:
-                _chain = pd.DataFrame()
-            _w = compute_walls(_chain, _spot) if not _chain.empty else {}
-            _r1 = _s1 = None
-            if not _chain.empty:
-                try:
-                    _r1 = float(_chain["R1"].dropna().iloc[0]); _s1 = float(_chain["S1"].dropna().iloc[0])
-                except Exception:
-                    pass
             _nw = _ticker_news(_tk)
-            _stt = _stocktwits_sentiment(_tk)
             _te = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡", "NEUTRAL": "⚪"}[_nw["label"]]
             # previous close + day change
             try:
@@ -11915,6 +11987,29 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 _mc[1].metric("1-day exp. move", f"±${_em:.2f}", f"±{_em/_spot*100:.1f}%")
                 _mc[2].metric("Δ per +1%", f"${_tk_dd:,.0f}", _daylbl)
                 _mc[3].metric("Theta / day", f"${_tk_th:,.0f}")
+
+                # ── lazy gate: heavy detail only computes/renders when this stock is opened ──
+                if not st.toggle("🔬 Load full analysis (chart · signals · scenarios · legs)",
+                                 key=f"gp_open_{_tk}"):
+                    st.caption("Toggle on for this stock's full plan — kept off by default so the "
+                               "page loads in <1–2s. The metrics above are always live.")
+                    continue
+                _near = min(_tl, key=lambda x: x["dte"])
+                try:
+                    _chain = pd.read_sql(
+                        "SELECT strike, openInt_Call_now, openInt_Put_now, R1, S1 FROM options_change "
+                        "WHERE UPPER(ticker)=? AND expiry_date=?",
+                        _gp_conn, params=(_tk, _near["exp_mdy"]))
+                except Exception:
+                    _chain = pd.DataFrame()
+                _w = compute_walls(_chain, _spot) if not _chain.empty else {}
+                _r1 = _s1 = None
+                if not _chain.empty:
+                    try:
+                        _r1 = float(_chain["R1"].dropna().iloc[0]); _s1 = float(_chain["S1"].dropna().iloc[0])
+                    except Exception:
+                        pass
+                _stt = _stocktwits_sentiment(_tk)
                 _lv = []
                 if _w.get("put_wall"): _lv.append(f"🟩 put wall ${_w['put_wall']:.0f}")
                 if _w.get("call_wall"): _lv.append(f"🟥 call wall ${_w['call_wall']:.0f}")
