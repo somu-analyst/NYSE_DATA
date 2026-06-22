@@ -208,9 +208,10 @@ def q(sql, params=None):
     with get_conn() as c:
         return pd.read_sql(sql, c, params=params or [])
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def _cached_history(ticker: str, period: str = "5d", interval: str = "1d"):
-    """yfinance history — cached 60 s to avoid hammering the API on every rerender."""
+    """yfinance history — cached 5 min to avoid hammering the API on every rerender
+    (use the page's Refresh button to force-refresh)."""
     try:
         return yf.Ticker(ticker).history(period=period, interval=interval)
     except Exception:
@@ -232,9 +233,9 @@ def _db_spot(ticker: str) -> float:
         pass
     return 0.0
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def _cached_price(ticker: str) -> float:
-    """Latest confirmed close — DB first (stock_daily), then yfinance history fallback."""
+    """Latest confirmed close — DB first (stock_daily), then yfinance history fallback. Cached 5 min."""
     db = _db_spot(ticker)
     if db > 0:
         return db
@@ -316,7 +317,7 @@ def _db_option_price(ticker: str, expiry_iso: str, strike: float, opt_type: str)
         pass
     return None
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def _get_ah_price(ticker: str) -> dict:
     """Fetch after-hours / pre-market price via yfinance fast_info. Returns dict with
     spot_reg, spot_ah, ah_chg_pct, is_extended, label ('AH'/'PM'/'EOD')."""
@@ -377,7 +378,7 @@ def _spot_label(ticker: str) -> str:
         return f"EOD ${reg:.2f}  →  {lbl} <b>${ah:.2f}</b> ({chg:+.1f}%)"
     return f"EOD ${reg:.2f}"
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def _cached_trades(status: str = None):
     """Load trades from DB — cached 30 s."""
     sql = "SELECT * FROM trades" + (" WHERE status=?" if status else "")
@@ -860,7 +861,7 @@ SYMBOL_ICONS = {
     "10Y Yield": "📋", "30Y Yield": "📋",
 }
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def fetch_market_snapshot():
     rows = []
     tickers_str = " ".join(GLOBAL_SYMBOLS.values())
@@ -913,13 +914,13 @@ def _sort_dates_chrono(dates_list, descending=True):
     return [p[0] for p in parsed]
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def available_trade_dates():
     raw = q("SELECT DISTINCT trade_date_now FROM options_change")["trade_date_now"].tolist()
     return _sort_dates_chrono(raw, descending=True)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_oi_for_date(td):
     return q("SELECT * FROM options_change WHERE trade_date_now=?", [td])
 
@@ -1162,7 +1163,7 @@ def oi_prediction_analysis(ticker, dates_back=5):
 # ──  MULTI-DAY OI ACCUMULATION  (cumulative build + conviction)
 # ===================================================================
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def _load_oi_multi_day(ticker, n_days=7):
     """Load OI data for last n_days trade dates for a ticker.
     Returns (DataFrame with trade_date column, list of dates newest-first).
@@ -2083,29 +2084,30 @@ def _iv_rank(ticker, r=0.045):
     return {"iv": cur, "rank": rank, "pct": pct, "lo": lo, "hi": hi, "n": len(ivs)}
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)
 def _next_earnings(ticker):
-    """Next earnings date + days away via yfinance. Returns dict(date, days) or None."""
+    """Next earnings date + days away via yfinance. Cached 6h. Tries the fast .calendar
+    first (one quick call) and only falls back to the slow get_earnings_dates."""
     try:
         import pandas as _pd
         t = yf.Ticker(ticker)
         now = _pd.Timestamp.now().normalize()
         dts = []
-        try:
-            ed = t.get_earnings_dates(limit=12)
-            if ed is not None and len(ed):
-                for ix in ed.index:
-                    ts = _pd.Timestamp(ix)
-                    ts = ts.tz_localize(None) if ts.tzinfo else ts
-                    dts.append(ts.normalize())
+        try:                                            # fast path: .calendar
+            cal = t.calendar
+            e = cal.get("Earnings Date") if isinstance(cal, dict) else None
+            for x in (e if isinstance(e, (list, tuple)) else [e]) if e else []:
+                dts.append(_pd.Timestamp(x).normalize())
         except Exception:
             pass
-        if not dts:
+        if not dts:                                     # slow fallback only if needed
             try:
-                cal = t.calendar
-                e = cal.get("Earnings Date") if isinstance(cal, dict) else None
-                for x in (e if isinstance(e, (list, tuple)) else [e]) if e else []:
-                    dts.append(_pd.Timestamp(x).normalize())
+                ed = t.get_earnings_dates(limit=12)
+                if ed is not None and len(ed):
+                    for ix in ed.index:
+                        ts = _pd.Timestamp(ix)
+                        ts = ts.tz_localize(None) if ts.tzinfo else ts
+                        dts.append(ts.normalize())
             except Exception:
                 pass
         fut = sorted(d for d in dts if d >= now)
@@ -7872,7 +7874,7 @@ elif page == "\U0001f9e0 Smart Money Hub":
                 "**Below 100% = safer zone. Above 100% = reduce risk immediately.**"
             )
             try:
-                _oil_hist = yf.Ticker("CL=F").history(period="14mo")["Close"].dropna()
+                _oil_hist = _cached_history("CL=F", "14mo")["Close"].dropna()
                 _oil_now  = float(_oil_hist.iloc[-1]) if len(_oil_hist) else 0
                 if len(_oil_hist) >= 250:
                     _roc = (_oil_hist.iloc[-1]/_oil_hist.iloc[-252]-1)*100
@@ -7910,10 +7912,10 @@ elif page == "\U0001f9e0 Smart Money Hub":
                 "like a canary in a coal mine. Also: when VIX > VIX3M, short-term fear > long-term fear = volatility spike coming."
             )
             try:
-                _spy5 = yf.Ticker("SPY").history(period="15d")["Close"].dropna()
-                _hyg5 = yf.Ticker("HYG").history(period="15d")["Close"].dropna()
-                _vix  = yf.Ticker("^VIX").history(period="5d")["Close"].dropna()
-                _vix3m= yf.Ticker("^VIX3M").history(period="5d")["Close"].dropna()
+                _spy5 = _cached_history("SPY", "15d")["Close"].dropna()
+                _hyg5 = _cached_history("HYG", "15d")["Close"].dropna()
+                _vix  = _cached_history("^VIX", "5d")["Close"].dropna()
+                _vix3m= _cached_history("^VIX3M", "5d")["Close"].dropna()
                 _spy_r = (_spy5.iloc[-1]/_spy5.iloc[-6]-1)*100 if len(_spy5)>=6 else 0
                 _hyg_r = (_hyg5.iloc[-1]/_hyg5.iloc[-6]-1)*100 if len(_hyg5)>=6 else 0
                 _div = _spy_r - _hyg_r
