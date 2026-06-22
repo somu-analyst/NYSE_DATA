@@ -1458,10 +1458,10 @@ def _log_sentiment(ticker, source, label, score=None):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _sentiment_log_view(ticker=None):
-    """Read the forward-logged sentiment, resolve forward returns from stock_daily, and return
-    an OBSERVATIONAL summary (avg next-day move that followed each sentiment label). Deliberately
-    NOT framed as accuracy / hit-rate — sentiment is recorded, not graded."""
+def _sentiment_log_view(ticker=None, move_thr=0.005):
+    """Read the forward-logged sentiment, resolve next-day returns from stock_daily, and SCORE
+    it: hit-rate + directional edge per label and per source (BULLISH→up, BEARISH→down,
+    MIXED/NEUTRAL→flat). Sample is small/forward-only, so it's scored *and* caveated."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
@@ -1496,13 +1496,44 @@ def _sentiment_log_view(ticker=None):
             df = pd.read_sql(q, conn, params=params)
     except Exception:
         return None
-    res = df[df["fwd_ret"].notna()]
-    obs = None
-    if not res.empty:
-        obs = res.groupby("label").agg(
-            n=("fwd_ret", "size"), avg_next=("fwd_ret", "mean")).reset_index()
-        obs["avg_next"] = (obs["avg_next"] * 100).round(2)
-    return {"n_logged": int(len(df)), "n_resolved": int(len(res)), "obs": obs}
+    res = df[df["fwd_ret"].notna()].copy()
+    if res.empty:
+        return {"n_logged": int(len(df)), "n_resolved": 0, "by_label": None,
+                "by_source": None, "overall_hit": None}
+
+    def _dir(lbl):
+        return 1 if lbl == "BULLISH" else -1 if lbl == "BEARISH" else 0
+    res["dir"] = res["label"].map(_dir)
+    res["signed"] = res["dir"] * res["fwd_ret"]
+
+    def _hit(r):
+        if r["dir"] == 1:
+            return 1.0 if r["fwd_ret"] > move_thr else 0.0
+        if r["dir"] == -1:
+            return 1.0 if r["fwd_ret"] < -move_thr else 0.0
+        return 1.0 if abs(r["fwd_ret"]) < move_thr else 0.0
+    res["correct"] = res.apply(_hit, axis=1)
+
+    by_label = res.groupby("label").agg(
+        n=("correct", "size"), hit=("correct", "mean"),
+        edge=("signed", "mean"), avg_next=("fwd_ret", "mean")).reset_index()
+    by_label["hit"] = (by_label["hit"] * 100).round(1)
+    by_label["edge"] = (by_label["edge"] * 100).round(2)
+    by_label["avg_next"] = (by_label["avg_next"] * 100).round(2)
+
+    # directional rows only (exclude neutral/mixed) for the per-source scorecard
+    dres = res[res["dir"] != 0]
+    by_source = None
+    if not dres.empty:
+        by_source = dres.groupby("source").agg(
+            n=("correct", "size"), hit=("correct", "mean"), edge=("signed", "mean")).reset_index()
+        by_source["hit"] = (by_source["hit"] * 100).round(1)
+        by_source["edge"] = (by_source["edge"] * 100).round(2)
+        by_source = by_source.sort_values("hit", ascending=False)
+
+    overall_hit = round(float(dres["correct"].mean()) * 100, 1) if not dres.empty else None
+    return {"n_logged": int(len(df)), "n_resolved": int(len(res)),
+            "by_label": by_label, "by_source": by_source, "overall_hit": overall_hit}
 
 
 def _oi_idea_metrics(conn, ticker, strike, direction, spot, r=0.045):
@@ -13374,29 +13405,42 @@ historical one) — its numbers come from predictions logged live and resolved o
             })
 
     st.markdown("---")
-    st.markdown("### 💬 Sentiment — observational log (not scored)")
-    st.caption("Sentiment (news tone, StockTwits/Finnhub crowd) is **recorded forward**, not graded. "
-               "It's noisy and reflexive — often coincident or contrarian, not a clean predictor — so "
-               "we log it to *observe* what tended to follow each reading, **without** a hit-rate verdict.")
-    _slog = _sentiment_log_view(_sa_tk)
+    st.markdown("### 💬 Sentiment — forward-tracked & scored")
+    st.caption("Sentiment (news tone, StockTwits/Finnhub crowd) is recorded forward and scored the same "
+               "way as the other signals: BULLISH→up, BEARISH→down, MIXED/NEUTRAL→flat, vs the next-day "
+               "move. Sample is small and forward-only — treat it as a developing read, not a proven edge.")
+    _slog = _sentiment_log_view(_sa_tk, float(_sa_thr))
     if not _slog:
         st.info("No sentiment logged yet. Open a stock in the 🌅 Next-Day Game Plan — each view records "
                 "that day's news/crowd reading here, and forward returns fill in automatically.")
     else:
         st.caption(f"Logged readings: **{_slog['n_logged']}** · resolved with a next-day return: "
-                   f"**{_slog['n_resolved']}**")
-        if _slog["obs"] is not None and not _slog["obs"].empty:
-            st.markdown("**What tended to happen the next day after each reading** (observational only):")
+                   f"**{_slog['n_resolved']}**"
+                   + (f" · directional accuracy **{_slog['overall_hit']}%**" if _slog["overall_hit"] is not None else ""))
+        if _slog["by_source"] is not None and not _slog["by_source"].empty:
+            st.markdown("**Scorecard by source** (directional readings only):")
             st.dataframe(
-                _slog["obs"].rename(columns={"label": "Sentiment", "n": "Times seen",
-                                             "avg_next": "Avg next-day move"}),
+                _slog["by_source"].rename(columns={"source": "Source", "n": "Calls",
+                                                   "hit": "Hit-rate", "edge": "Edge/call"}),
                 hide_index=True, use_container_width=True,
                 column_config={
-                    "Avg next-day move": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Hit-rate": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Edge/call": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Calls": st.column_config.NumberColumn(format="%d")})
+        if _slog["by_label"] is not None and not _slog["by_label"].empty:
+            st.markdown("**By reading** — hit-rate, edge, and average next-day move:")
+            st.dataframe(
+                _slog["by_label"].rename(columns={"label": "Sentiment", "n": "Times seen",
+                                                  "hit": "Hit-rate", "edge": "Edge/call",
+                                                  "avg_next": "Avg next-day"}),
+                hide_index=True, use_container_width=True,
+                column_config={
+                    "Hit-rate": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Edge/call": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Avg next-day": st.column_config.NumberColumn(format="%+.2f%%"),
                     "Times seen": st.column_config.NumberColumn(format="%d")})
-            st.caption("⚠️ Descriptive, tiny-sample, and NOT a validated edge — do not trade off this table. "
-                       "It exists so you can watch whether crowd/news sentiment has *any* relationship to "
-                       "forward moves over time.")
+        st.caption("⚠️ Small, forward-only sample. A high score here is suggestive, not conclusive — "
+                   "sentiment is often coincident/contrarian, so confirm against the OI and price signals above.")
 
 
 # ===================================================================
