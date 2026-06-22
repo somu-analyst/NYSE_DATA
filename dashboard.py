@@ -2352,40 +2352,330 @@ def _gp_debate(tk, tl, spot, em, dd, th, w, nw, stt, ivr, earn):
 
 
 def _gp_levels_fig(tk, spot, w, r1, s1, em):
-    """Simple, glanceable number-line: today's price (white line) inside the shaded 1-day
-    expected-move band, with support (green, below) and resistance (red, above) levels."""
-    fig = go.Figure()
-    # 1-day expected-move band around spot, with labeled edges
-    if em:
-        fig.add_vrect(x0=spot - em, x1=spot + em, fillcolor="rgba(61,139,255,0.15)", line_width=0,
-                      annotation_text=f"±${em:.0f} (1-day expected move)",
-                      annotation_position="top left",
-                      annotation_font=dict(size=10, color="#3d8bff"))
-        for edge, lab in ((spot - em, f"-${em:.0f}"), (spot + em, f"+${em:.0f}")):
-            fig.add_trace(go.Scatter(x=[edge], y=[0], mode="markers+text", marker=dict(size=7, color="#3d8bff"),
-                                     text=[f"${edge:.0f}"], textposition="bottom center",
-                                     textfont=dict(size=9, color="#9db8ff"), showlegend=False, hoverinfo="skip"))
-    # support levels (below) green, resistance (above) red — auto colored by side vs spot
+    """Horizontal bar chart of key levels: each level is a bar at its price, ordered high→low
+    (resistance on top, support on bottom), green below spot / red above, with the spot line and
+    the shaded 1-day expected-move band. Bar labels show price + % distance from spot."""
+    rows = []
     seen = set()
-    for nm, x in (("Put wall", w.get("put_wall")), ("Call wall", w.get("call_wall")),
-                  ("S1", s1), ("R1", r1)):
-        if not x or round(x) in seen:
+    for nm, x in (("🟥 Call wall", w.get("call_wall")), ("R1 resistance", r1),
+                  ("⚪ Spot (now)", spot), ("S1 support", s1), ("🟩 Put wall", w.get("put_wall"))):
+        if not x or round(x, 2) in seen:
             continue
-        seen.add(round(x))
-        col = "#00e676" if x < spot else "#ff5c6c"
-        fig.add_trace(go.Scatter(x=[x], y=[0], mode="markers+text", marker=dict(size=11, color=col),
-                                 text=[f"{nm}<br>${x:.0f}"], textposition="top center",
-                                 textfont=dict(size=10, color=col), showlegend=False, hoverinfo="skip"))
-    # spot as a bold white vertical marker — the "you are here"
-    fig.add_vline(x=spot, line_color="#ffffff", line_width=2)
-    fig.add_trace(go.Scatter(x=[spot], y=[0], mode="markers+text", marker=dict(size=14, color="#ffffff"),
-                             text=[f"now ${spot:.0f}"], textposition="top center",
-                             textfont=dict(size=11, color="#ffffff"), showlegend=False, hoverinfo="skip"))
-    fig.update_layout(template="plotly_dark", height=160, margin=dict(t=28, b=24, l=10, r=10),
-                      title=f"{tk} — where price sits vs key levels",
-                      yaxis=dict(visible=False, range=[-1, 1.6]),
-                      xaxis=dict(title="Price ($)", showgrid=False))
+        seen.add(round(x, 2))
+        rows.append((nm, float(x)))
+    rows.sort(key=lambda r: r[1])                       # low → high (Plotly bars stack bottom→top)
+    names = [r[0] for r in rows]
+    prices = [r[1] for r in rows]
+
+    def _col(nm, x):
+        if "Spot" in nm:
+            return "#ffffff"
+        return "#00e676" if x < spot else "#ff5c6c"
+    cols = [_col(nm, x) for nm, x in rows]
+    labels = [f"${x:,.0f}  ({(x/spot-1)*100:+.1f}%)" if "Spot" not in nm else f"${x:,.0f}  ← now"
+              for nm, x in rows]
+
+    fig = go.Figure(go.Bar(
+        x=prices, y=names, orientation="h", marker_color=cols,
+        text=labels, textposition="outside", cliponaxis=False,
+        hovertemplate="%{y}: $%{x:,.2f}<extra></extra>"))
+    if em:
+        fig.add_vrect(x0=spot - em, x1=spot + em, fillcolor="rgba(61,139,255,0.16)", line_width=0,
+                      annotation_text=f"±${em:.0f} 1-day expected move",
+                      annotation_position="top left", annotation_font=dict(size=10, color="#7fa8ff"))
+    fig.add_vline(x=spot, line_color="#ffffff", line_width=1.5, line_dash="dot")
+    _lo = min(prices + [spot - (em or 0)]); _hi = max(prices + [spot + (em or 0)])
+    _pad = (_hi - _lo) * 0.12 or spot * 0.02
+    fig.update_layout(template="plotly_dark", height=240, margin=dict(t=30, b=24, l=10, r=10),
+                      title=f"{tk} — key levels vs spot",
+                      xaxis=dict(title="Price ($)", range=[_lo - _pad, _hi + _pad * 1.6], showgrid=False),
+                      yaxis=dict(title=""), showlegend=False, bargap=0.45)
     return fig
+
+
+# ===================================================================
+# 🧑‍💼 AI HEDGE FUND — rule-based multi-persona investor ensemble
+# (inspired by virattt/ai-hedge-fund, but free/deterministic: no LLM keys,
+#  no paid data — yfinance fundamentals + your DB/technicals/sentiment.)
+# ===================================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def _ahf_fundamentals(ticker):
+    """Free fundamentals snapshot from yfinance for the investor agents."""
+    info = _cached_info(ticker) or {}
+    if not info:
+        return None
+    g = info.get
+    price = g("currentPrice") or g("regularMarketPrice")
+    pb = g("priceToBook"); eps = g("trailingEps")
+    bvps = (price / pb) if (price and pb) else None
+    mcap = g("marketCap"); fcf = g("freeCashflow")
+    F = dict(price=price, pe=g("trailingPE"), fpe=g("forwardPE"), pb=pb, peg=g("pegRatio"),
+             pm=g("profitMargins"), om=g("operatingMargins"), gm=g("grossMargins"),
+             roe=g("returnOnEquity"), roa=g("returnOnAssets"), de=g("debtToEquity"),
+             cr=g("currentRatio"), rg=g("revenueGrowth"), eg=g("earningsGrowth"),
+             fcf=fcf, mcap=mcap, beta=g("beta"), dy=g("dividendYield"),
+             ev_ebitda=g("enterpriseToEbitda"), ps=g("priceToSalesTrailing12Months"),
+             reckey=g("recommendationKey"), target=g("targetMeanPrice"),
+             cash=g("totalCash"), debt=g("totalDebt"), eps=eps, bvps=bvps,
+             sector=g("sector"), name=g("shortName") or ticker)
+    F["fcf_yield"] = (fcf / mcap) if (fcf and mcap) else None
+    F["upside"] = (F["target"] / price - 1) if (F.get("target") and price) else None
+    F["graham_num"] = ((22.5 * eps * bvps) ** 0.5) if (eps and bvps and eps > 0 and bvps > 0) else None
+    try:
+        h = _cached_history(ticker, "1y")["Close"].dropna()
+        if len(h) > 20 and price:
+            F["mom6"] = float(h.iloc[-1] / h.iloc[-126] - 1) if len(h) >= 126 else float(h.iloc[-1] / h.iloc[0] - 1)
+            F["sma200"] = float(h.rolling(200).mean().iloc[-1]) if len(h) >= 200 else float(h.mean())
+            F["above200"] = price > F["sma200"]
+    except Exception:
+        pass
+    return F
+
+
+def _ahf_tally(votes):
+    """votes: list of (vote ∈ {+1,-1,0}, message). Returns signal/conf/reason dict."""
+    votes = [(v, m) for v, m in votes if m]
+    s = sum(v for v, _ in votes)
+    sig = "BULLISH" if s > 0 else "BEARISH" if s < 0 else "NEUTRAL"
+    conf = min(95, 50 + abs(s) * 11) if votes else 0
+    pos = [m for v, m in votes if v > 0]; neg = [m for v, m in votes if v < 0]
+    pick = (pos if s > 0 else neg if s < 0 else [m for _, m in votes])[:3]
+    return {"signal": sig, "conf": conf, "reason": "; ".join(pick) or "insufficient fundamentals"}
+
+
+def _v(cond, bull, bear):
+    """Helper: emit (+1, bull) if cond True, (-1, bear) if False, skip if cond is None."""
+    if cond is None:
+        return (0, "")
+    return (1, bull) if cond else (-1, bear)
+
+
+def _ag_buffett(F):
+    g = F.get
+    return _ahf_tally([
+        _v(None if g("roe") is None else g("roe") > 0.15, f"ROE {(g('roe') or 0)*100:.0f}% (moat)", f"ROE {(g('roe') or 0)*100:.0f}% weak"),
+        _v(None if g("om") is None else g("om") > 0.15, f"op margin {(g('om') or 0)*100:.0f}%", f"thin margin {(g('om') or 0)*100:.0f}%"),
+        _v(None if g("de") is None else g("de") < 100, f"low debt D/E {g('de'):.0f}" if g('de') else "", f"high debt D/E {g('de'):.0f}" if g('de') else ""),
+        _v(None if g("fcf_yield") is None else g("fcf_yield") > 0.04, f"FCF yield {(g('fcf_yield') or 0)*100:.1f}%", f"weak FCF yield {(g('fcf_yield') or 0)*100:.1f}%"),
+        _v(None if g("pe") is None else g("pe") < 25, f"fair PE {g('pe'):.0f}" if g('pe') else "", f"rich PE {g('pe'):.0f}" if g('pe') else ""),
+    ])
+
+
+def _ag_graham(F):
+    g = F.get
+    mos = (g("price") < g("graham_num")) if (g("price") and g("graham_num")) else None
+    return _ahf_tally([
+        _v(None if g("pe") is None else g("pe") < 15, f"cheap PE {g('pe'):.0f}" if g('pe') else "", f"PE>15 ({g('pe'):.0f})" if g('pe') else ""),
+        _v(None if g("pb") is None else g("pb") < 1.5, f"low P/B {g('pb'):.1f}" if g('pb') else "", f"P/B>1.5 ({g('pb'):.1f})" if g('pb') else ""),
+        _v(None if g("cr") is None else g("cr") > 2, f"strong current ratio {g('cr'):.1f}" if g('cr') else "", f"current ratio {g('cr'):.1f}<2" if g('cr') else ""),
+        _v(None if g("de") is None else g("de") < 50, "conservative balance sheet", "leverage too high for Graham"),
+        _v(mos, "trades below Graham number (margin of safety)", "above Graham number (no margin)"),
+    ])
+
+
+def _ag_munger(F):
+    g = F.get
+    return _ahf_tally([
+        _v(None if g("roe") is None else g("roe") > 0.15, "high return on equity", "mediocre returns"),
+        _v(None if g("roa") is None else g("roa") > 0.08, "efficient assets (ROA)", "low ROA"),
+        _v(None if g("gm") is None else g("gm") > 0.40, f"high gross margin {(g('gm') or 0)*100:.0f}%", "low gross margin"),
+        _v(None if g("fcf_yield") is None else g("fcf_yield") > 0.03, "cash-generative", "weak cash generation"),
+        _v(None if g("pe") is None else g("pe") < 30, "fair price for quality", "overpaying"),
+    ])
+
+
+def _ag_wood(F):
+    g = F.get
+    return _ahf_tally([
+        _v(None if g("rg") is None else g("rg") > 0.20, f"revenue growth {(g('rg') or 0)*100:.0f}%", f"slow growth {(g('rg') or 0)*100:.0f}%"),
+        _v(None if g("eg") is None else g("eg") > 0.20, "fast earnings growth", "earnings not scaling"),
+        _v(None if g("gm") is None else g("gm") > 0.50, "software-like gross margins", "low-margin business"),
+        _v(g("above200"), "uptrend confirms adoption", "downtrend — disruption stalling"),
+    ])
+
+
+def _ag_lynch(F):
+    g = F.get
+    peg = g("peg")
+    return _ahf_tally([
+        _v(None if peg is None else peg < 1, f"PEG {peg:.2f} (<1 bargain growth)" if peg else "", f"PEG {peg:.2f} pricey" if peg else ""),
+        _v(None if peg is None else peg < 2, "reasonable growth-adjusted price", "growth too expensive"),
+        _v(None if g("eg") is None else g("eg") > 0.10, "double-digit earnings growth", "growth too slow"),
+        _v(None if g("pe") is None else g("pe") < 25, "not overpaying", "PE stretched"),
+    ])
+
+
+def _ag_burry(F):
+    g = F.get
+    return _ahf_tally([
+        _v(None if g("pe") is None else g("pe") < 12, f"deep-value PE {g('pe'):.0f}" if g('pe') else "", "not cheap enough"),
+        _v(None if g("pb") is None else g("pb") < 1.5, "trades near book", "P/B too high"),
+        _v(None if g("ev_ebitda") is None else g("ev_ebitda") < 8, f"cheap EV/EBITDA {g('ev_ebitda'):.0f}" if g('ev_ebitda') else "", "EV/EBITDA rich"),
+        _v(None if g("fcf_yield") is None else g("fcf_yield") > 0.08, f"high FCF yield {(g('fcf_yield') or 0)*100:.0f}%", "low FCF yield"),
+        _v(None if g("above200") is None else (not g("above200")), "beaten down (contrarian setup)", "already extended"),
+    ])
+
+
+def _ag_druck(F):
+    g = F.get
+    return _ahf_tally([
+        _v(None if g("mom6") is None else g("mom6") > 0.10, f"strong 6-mo momentum {(g('mom6') or 0)*100:+.0f}%", f"weak momentum {(g('mom6') or 0)*100:+.0f}%"),
+        _v(g("above200"), "above 200-DMA (trend up)", "below 200-DMA (trend down)"),
+        _v(None if g("rg") is None else g("rg") > 0.10, "growing top line", "stagnant growth"),
+        _v(None if g("eg") is None else g("eg") > 0, "positive earnings momentum", "earnings declining"),
+    ])
+
+
+def _ag_damodaran(F):
+    g = F.get
+    return _ahf_tally([
+        _v(None if g("upside") is None else g("upside") > 0.10, f"analyst upside {(g('upside') or 0)*100:+.0f}% to fair value", f"limited upside {(g('upside') or 0)*100:+.0f}%"),
+        _v(None if g("fcf_yield") is None else g("fcf_yield") > 0.05, "FCF supports valuation", "FCF doesn't justify price"),
+        _v(None if g("peg") is None else g("peg") < 2, "story matches the numbers (PEG ok)", "price ahead of fundamentals"),
+        _v(None if not g("reckey") else g("reckey") in ("buy", "strong_buy"), f"street rates it '{g('reckey')}'", f"street cautious ('{g('reckey')}')"),
+    ])
+
+
+def _ag_ackman(F):
+    g = F.get
+    return _ahf_tally([
+        _v(None if g("roe") is None else g("roe") > 0.15, "high-quality franchise", "quality lacking"),
+        _v(None if g("om") is None else g("om") > 0.15, "strong operating margins", "weak margins"),
+        _v(None if g("upside") is None else g("upside") > 0.10, "upside to fair value (catalyst room)", "fully valued"),
+        _v(None if not g("reckey") else g("reckey") in ("buy", "strong_buy"), "consensus supportive", "consensus lukewarm"),
+    ])
+
+
+def _ag_fisher(F):
+    g = F.get
+    return _ahf_tally([
+        _v(None if g("rg") is None else g("rg") > 0.15, "durable revenue growth", "growth fading"),
+        _v(None if g("gm") is None else g("gm") > 0.40, "pricing power (gross margin)", "commoditized margins"),
+        _v(None if g("om") is None else g("om") > 0.15, "operational excellence", "operational drag"),
+        _v(None if g("eg") is None else g("eg") > 0.10, "earnings compounding", "earnings flat"),
+    ])
+
+
+def _ag_taleb(F):
+    g = F.get
+    cash_robust = (g("cash") > g("debt")) if (g("cash") is not None and g("debt") is not None) else None
+    return _ahf_tally([
+        _v(None if g("de") is None else g("de") < 50, "low leverage (robust)", "fragile: high leverage"),
+        _v(cash_robust, "cash > debt (antifragile)", "debt > cash (fragile to shocks)"),
+        _v(None if g("beta") is None else g("beta") < 1, f"low beta {g('beta'):.2f}" if g('beta') else "", f"high beta {g('beta'):.2f} (fragile)" if g('beta') else ""),
+        _v(None if g("fcf") is None else g("fcf") > 0, "positive free cash flow buffer", "burning cash (tail risk)"),
+    ])
+
+
+def _ag_pabrai(F):
+    g = F.get
+    cash_robust = (g("cash") > g("debt")) if (g("cash") is not None and g("debt") is not None) else None
+    return _ahf_tally([
+        _v(cash_robust, "net cash → low downside", "net debt → more risk"),
+        _v(None if g("pe") is None else g("pe") < 15, "low PE → heads-I-win", "PE too high for Dhandho"),
+        _v(None if g("fcf_yield") is None else g("fcf_yield") > 0.06, "fat FCF yield", "thin FCF yield"),
+        _v(None if g("upside") is None else g("upside") > 0.20, "asymmetric upside", "payoff not asymmetric enough"),
+    ])
+
+
+_AHF_AGENTS = [
+    ("Warren Buffett", _ag_buffett), ("Ben Graham", _ag_graham), ("Charlie Munger", _ag_munger),
+    ("Cathie Wood", _ag_wood), ("Peter Lynch", _ag_lynch), ("Michael Burry", _ag_burry),
+    ("Stan Druckenmiller", _ag_druck), ("Aswath Damodaran", _ag_damodaran),
+    ("Bill Ackman", _ag_ackman), ("Phil Fisher", _ag_fisher),
+    ("Nassim Taleb", _ag_taleb), ("Mohnish Pabrai", _ag_pabrai),
+]
+
+
+def _ahf_analyst_signals(F, ticker):
+    """Analyst-desk agents: Valuation, Fundamentals, Technicals, Sentiment."""
+    g = F.get
+    out = []
+    # Valuation
+    out.append(("📐 Valuation", _ahf_tally([
+        _v(None if g("upside") is None else g("upside") > 0.10, f"{(g('upside') or 0)*100:+.0f}% to mean target", f"{(g('upside') or 0)*100:+.0f}% to target"),
+        _v(None if g("fcf_yield") is None else g("fcf_yield") > 0.05, "attractive FCF yield", "low FCF yield"),
+        _v(None if g("graham_num") is None or g("price") is None else g("price") < g("graham_num"), "below Graham value", "above Graham value"),
+    ])))
+    # Fundamentals
+    out.append(("🏛 Fundamentals", _ahf_tally([
+        _v(None if g("roe") is None else g("roe") > 0.12, "profitable (ROE)", "low ROE"),
+        _v(None if g("rg") is None else g("rg") > 0.08, "growing", "stagnant"),
+        _v(None if g("de") is None else g("de") < 120, "healthy balance sheet", "leveraged"),
+        _v(None if g("om") is None else g("om") > 0.10, "good margins", "weak margins"),
+    ])))
+    # Technicals
+    out.append(("📈 Technicals", _ahf_tally([
+        _v(g("above200"), "above 200-DMA", "below 200-DMA"),
+        _v(None if g("mom6") is None else g("mom6") > 0, f"6-mo trend {(g('mom6') or 0)*100:+.0f}%", f"6-mo trend {(g('mom6') or 0)*100:+.0f}%"),
+    ])))
+    # Sentiment (reuse free sources)
+    sv = []
+    try:
+        nw = _ticker_news(ticker)
+        if nw:
+            sv.append(_v(nw["label"] == "BULLISH" if nw["label"] in ("BULLISH", "BEARISH") else None,
+                         "news tone bullish", "news tone bearish"))
+    except Exception:
+        pass
+    try:
+        stt = _stocktwits_sentiment(ticker)
+        if stt:
+            sv.append(_v(stt["label"] == "BULLISH" if stt["label"] in ("BULLISH", "BEARISH") else None,
+                         "crowd bullish", "crowd bearish"))
+    except Exception:
+        pass
+    out.append(("💬 Sentiment", _ahf_tally(sv)))
+    return out
+
+
+def _ahf_risk(F, ticker):
+    """Risk Manager: volatility/beta-based risk level + suggested max position size & stop."""
+    atrp = None
+    try:
+        h = _cached_history(ticker, "3mo")
+        c = h["Close"]; pc = c.shift(1)
+        tr = pd.concat([(h["High"] - h["Low"]), (h["High"] - pc).abs(), (h["Low"] - pc).abs()], axis=1).max(axis=1)
+        atrp = float(tr.rolling(14).mean().iloc[-1] / c.iloc[-1])
+    except Exception:
+        pass
+    beta = F.get("beta")
+    if (atrp and atrp > 0.04) or (beta and beta > 1.5):
+        level = "HIGH"
+    elif (atrp and atrp < 0.02) and (not beta or beta < 1.0):
+        level = "LOW"
+    else:
+        level = "MEDIUM"
+    max_pos = {"HIGH": 5, "MEDIUM": 10, "LOW": 15}[level]
+    return {"atrp": atrp, "beta": beta, "level": level, "max_pos": max_pos,
+            "stop": (atrp * 2) if atrp else None}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _ahf_run(ticker):
+    """Run the whole desk: investor personas + analyst agents + risk + portfolio manager."""
+    F = _ahf_fundamentals(ticker)
+    if not F:
+        return None
+    personas = [{"agent": nm, **fn(F)} for nm, fn in _AHF_AGENTS]
+    analysts = [{"agent": nm, **sig} for nm, sig in _ahf_analyst_signals(F, ticker)]
+    risk = _ahf_risk(F, ticker)
+    allsig = personas + analysts
+    bull = sum(a["signal"] == "BULLISH" for a in allsig)
+    bear = sum(a["signal"] == "BEARISH" for a in allsig)
+    neu = len(allsig) - bull - bear
+    net = bull - bear
+    if net >= 4:
+        action = "BUY"
+    elif net <= -4:
+        action = "AVOID / SELL"
+    else:
+        action = "HOLD / WATCH"
+    conf = min(95, 50 + abs(net) * 5)
+    size = risk["max_pos"] if action == "BUY" else (0 if action.startswith("AVOID") else round(risk["max_pos"] / 2))
+    return {"F": F, "personas": personas, "analysts": analysts, "risk": risk,
+            "bull": bull, "bear": bear, "neu": neu, "net": net,
+            "action": action, "conf": conf, "size": size}
 
 
 def _bs_price_vec(S, K, T, r, sigma, typ):
@@ -3456,6 +3746,7 @@ _PAGE_HELP = {
     "⚡ Trade Risk Calculator":  "Pre-trade risk sizing tool. Enter entry price, stop loss, and account size to compute the correct number of contracts so you risk no more than 2% of capital.",
     "🎯 Next-Day Exit Planner":  "Pre-market daily brief. Fetches live option mid-prices and tells you which positions to take profit, cut loss, or hold. Run every morning before market open.",
     "🚀 Live Momentum Scanner":  "Intraday momentum scanner. Screens for tickers with unusual volume, OI spikes, or RSI extremes in real time — find the next big mover.",
+    "🧑‍💼 AI Hedge Fund":        "A committee of 12 famous-investor agents (Buffett, Graham, Wood, Lynch, Burry, Druckenmiller, Damodaran, Ackman, Fisher, Munger, Taleb, Pabrai) plus a Valuation / Fundamentals / Technicals / Sentiment desk and a Risk Manager all vote on a ticker from free yfinance fundamentals. A Portfolio Manager aggregates into BUY / HOLD / AVOID with a suggested position size. Inspired by virattt/ai-hedge-fund — deterministic, no LLM keys, no paid data.",
     "🎯 Signal Accuracy":        "Validation lab: replays each signal (OI bias, PCR, momentum, RSI, SMA) across stored history and scores its hit-rate + directional edge vs the forward N-day move. Also surfaces the 24-model ensemble's forward-tracked accuracy. Answers: do my signals actually work?",
 }
 
@@ -3476,6 +3767,7 @@ with st.sidebar:
         "💡 Trade Ideas": [
             "🎯 Prop Trading Screen",
             "🧠 High-Prob Engine",
+            "🧑‍💼 AI Hedge Fund",
             "🎯 Gamma Wall Advisor",
             "🚀 Live Momentum Scanner",
         ],
@@ -13472,6 +13764,122 @@ historical one) — its numbers come from predictions logged live and resolved o
                     "Times seen": st.column_config.NumberColumn(format="%d")})
         st.caption("⚠️ Small, forward-only sample. A high score here is suggestive, not conclusive — "
                    "sentiment is often coincident/contrarian, so confirm against the OI and price signals above.")
+
+
+# ===================================================================
+# ──  PAGE: AI HEDGE FUND
+# ===================================================================
+if page == "🧑‍💼 AI Hedge Fund":
+    _hdr1, _hdr2 = st.columns([4, 1])
+    with _hdr1:
+        st.markdown("## 🧑‍💼 AI Hedge Fund")
+    with _hdr2:
+        if st.button("🔄 Refresh", key="refresh_ahf"):
+            st.cache_data.clear(); st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
+    st.markdown("*A committee of famous-investor agents + an analyst desk + a risk manager vote on a "
+                "ticker, and a portfolio manager turns the votes into a **BUY / HOLD / AVOID** call with "
+                "a suggested size. Free & deterministic — inspired by `virattt/ai-hedge-fund`.*")
+
+    with st.expander("📘 How it works", expanded=False):
+        st.markdown("""
+Each **investor agent** applies that investor's real philosophy as explicit rules to free yfinance
+fundamentals (e.g. *Buffett* wants high ROE + margins + low debt + fair PE; *Graham* wants a margin of
+safety below the Graham number; *Cathie Wood* wants 20%+ growth; *Burry* wants deep value; *Druckenmiller*
+wants momentum). The **analyst desk** (Valuation, Fundamentals, Technicals, Sentiment) and a **Risk
+Manager** add market context and position sizing. The **Portfolio Manager** tallies every vote.
+
+*No LLM and no paid data* — so it's fast, repeatable, and free, unlike the original which needs OpenAI +
+Financial-Datasets keys. Treat it as a structured second opinion, not gospel: it reads fundamentals, your
+OI/flow signals elsewhere read positioning. Strongest when both agree.
+""")
+
+    _ahf_opts = []
+    try:
+        with sqlite3.connect(DB_PATH) as _ac:
+            _ahf_opts = [r[0] for r in _ac.execute(
+                "SELECT DISTINCT ticker FROM trades WHERE status='OPEN' ORDER BY ticker").fetchall()]
+            if not _ahf_opts:
+                _ahf_opts = [r[0] for r in _ac.execute(
+                    "SELECT DISTINCT ticker FROM stock_daily ORDER BY ticker").fetchall()]
+    except Exception:
+        pass
+    _c1, _c2 = st.columns([2, 1])
+    with _c1:
+        _ahf_pick = st.selectbox("Ticker", _ahf_opts or ["AAPL"], key="ahf_pick") if _ahf_opts else None
+    with _c2:
+        _ahf_typed = st.text_input("…or type one", key="ahf_typed", placeholder="e.g. NVDA")
+    _ahf_tk = (_ahf_typed or _ahf_pick or "AAPL").strip().upper()
+
+    with st.spinner(f"Convening the desk on {_ahf_tk}…"):
+        _res = _ahf_run(_ahf_tk)
+    if not _res:
+        st.warning(f"No fundamentals available for {_ahf_tk} (yfinance may not cover it, or it's an ETF/index).")
+    else:
+        F = _res["F"]
+        _ac = {"BUY": "🟢", "HOLD / WATCH": "🟡", "AVOID / SELL": "🔴"}.get(_res["action"], "⚪")
+        st.markdown(f"### {_ac} Portfolio Manager: **{_res['action']}** · {_res['conf']:.0f}% confidence")
+        _m = st.columns(4)
+        _m[0].metric("Bullish agents", _res["bull"])
+        _m[1].metric("Bearish agents", _res["bear"])
+        _m[2].metric("Neutral", _res["neu"])
+        _m[3].metric("Suggested size", f"{_res['size']}% " + ("of book" if _res["size"] else "—"))
+        _rk = _res["risk"]
+        _rkc = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(_rk["level"], "⚪")
+        st.markdown(
+            (f"**🛡 Risk Manager:** {_rkc} **{_rk['level']}** risk · "
+             + (f"ATR {_rk['atrp']*100:.1f}%/day · " if _rk["atrp"] else "")
+             + (f"beta {_rk['beta']:.2f} · " if _rk["beta"] else "")
+             + f"cap position at **{_rk['max_pos']}%** of book"
+             + (f" · suggested stop ≈ {_rk['stop']*100:.0f}% below entry" if _rk["stop"] else "")).replace("$", "\\$"))
+
+        # vote distribution bar
+        try:
+            _vfig = go.Figure(go.Bar(
+                x=["Bullish", "Neutral", "Bearish"], y=[_res["bull"], _res["neu"], _res["bear"]],
+                marker_color=["#00e676", "#9aa0a6", "#ff5c6c"],
+                text=[_res["bull"], _res["neu"], _res["bear"]], textposition="outside"))
+            _vfig.update_layout(template="plotly_dark", height=240, margin=dict(t=30, b=10),
+                                title=f"{_ahf_tk} — committee vote", yaxis_title="agents")
+            st.plotly_chart(_vfig, use_container_width=True)
+        except Exception:
+            pass
+
+        st.markdown("#### 👤 Investor agents")
+        _pe = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
+        st.dataframe(pd.DataFrame([
+            {"Investor": p["agent"], "Call": f"{_pe[p['signal']]} {p['signal']}",
+             "Conf": p["conf"], "Reasoning": p["reason"]} for p in _res["personas"]]),
+            hide_index=True, use_container_width=True,
+            column_config={"Conf": st.column_config.NumberColumn(format="%d%%")})
+
+        st.markdown("#### 🏦 Analyst desk")
+        st.dataframe(pd.DataFrame([
+            {"Desk": a["agent"], "Call": f"{_pe[a['signal']]} {a['signal']}",
+             "Conf": a["conf"], "Reasoning": a["reason"]} for a in _res["analysts"]]),
+            hide_index=True, use_container_width=True,
+            column_config={"Conf": st.column_config.NumberColumn(format="%d%%")})
+
+        with st.expander("🔢 Fundamentals snapshot used", expanded=False):
+            _fr = [
+                ("Price", F.get("price")), ("Mean target", F.get("target")),
+                ("Upside %", (F.get("upside") or 0) * 100 if F.get("upside") is not None else None),
+                ("P/E", F.get("pe")), ("Fwd P/E", F.get("fpe")), ("P/B", F.get("pb")),
+                ("PEG", F.get("peg")), ("EV/EBITDA", F.get("ev_ebitda")),
+                ("ROE %", (F.get("roe") or 0) * 100 if F.get("roe") is not None else None),
+                ("Op margin %", (F.get("om") or 0) * 100 if F.get("om") is not None else None),
+                ("Rev growth %", (F.get("rg") or 0) * 100 if F.get("rg") is not None else None),
+                ("FCF yield %", (F.get("fcf_yield") or 0) * 100 if F.get("fcf_yield") is not None else None),
+                ("Debt/Equity", F.get("de")), ("Beta", F.get("beta")),
+                ("6-mo momentum %", (F.get("mom6") or 0) * 100 if F.get("mom6") is not None else None),
+                ("Street rating", F.get("reckey")),
+            ]
+            st.dataframe(pd.DataFrame([{"Metric": k, "Value": (round(v, 2) if isinstance(v, (int, float)) else v)}
+                                       for k, v in _fr if v is not None]),
+                         hide_index=True, use_container_width=True)
+        st.caption("Educational committee model from free fundamentals + technicals; not financial advice. "
+                   "Cross-check against your OI/flow signals — agreement across both is the real edge.")
 
 
 # ===================================================================
