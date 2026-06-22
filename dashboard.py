@@ -1299,6 +1299,143 @@ def _compute_oi_conviction(multi_df, dates_newest_first, live_px=0):
     return strike_agg.sort_values("conviction", ascending=False).reset_index(drop=True)
 
 
+def _sa_features(conn, ticker):
+    """Per-ticker daily feature frame for signal-accuracy backtest: close, pcr_oi,
+    OI net bias (sum CallΔOI - sum PutΔOI per snapshot), plus derived momentum / RSI /
+    SMA features. Returns a date-sorted DataFrame or None if too little history."""
+    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    sd = pd.read_sql(
+        f"SELECT trade_date, close, volume, pcr_oi FROM stock_daily WHERE ticker=? ORDER BY {sk}",
+        conn, params=(ticker.upper(),))
+    if len(sd) < 30:
+        return None
+    sd["close"] = pd.to_numeric(sd["close"], errors="coerce")
+    sd["pcr_oi"] = pd.to_numeric(sd["pcr_oi"], errors="coerce")
+    oi = pd.read_sql(
+        "SELECT trade_date_now AS trade_date,"
+        " SUM(COALESCE(change_OI_Call,0)) AS cb, SUM(COALESCE(change_OI_Put,0)) AS pb"
+        " FROM options_change WHERE ticker=? GROUP BY trade_date_now",
+        conn, params=(ticker.upper(),))
+    sd = sd.merge(oi, on="trade_date", how="left")
+    sd["oi_net"] = sd["cb"].fillna(0) - sd["pb"].fillna(0)
+    # rolling z of OI net bias (per-ticker scale) and PCR (contrarian)
+    sd["oi_z"] = (sd["oi_net"] - sd["oi_net"].rolling(20, min_periods=8).mean()) \
+        / (sd["oi_net"].rolling(20, min_periods=8).std() + 1e-9)
+    sd["pcr_z"] = (sd["pcr_oi"] - sd["pcr_oi"].rolling(20, min_periods=8).mean()) \
+        / (sd["pcr_oi"].rolling(20, min_periods=8).std() + 1e-9)
+    sd["mom10"] = sd["close"] / sd["close"].shift(10) - 1
+    sd["sma20"] = sd["close"].rolling(20).mean()
+    sd["pvs"] = sd["close"] / sd["sma20"] - 1
+    d = sd["close"].diff()
+    up = d.clip(lower=0).rolling(14).mean()
+    dn = (-d.clip(upper=0)).rolling(14).mean()
+    sd["rsi"] = 100 - 100 / (1 + up / dn.replace(0, np.nan))
+    return sd
+
+
+# DB-computable signals: (name, description, fn(row)->direction in {+1 bull,-1 bear,0 skip})
+_SA_SIGNALS = [
+    ("OI Net Bias", "Net call-vs-put ΔOI (z>0.5 bull / z<-0.5 bear)",
+     lambda r: 1 if r["oi_z"] > 0.5 else (-1 if r["oi_z"] < -0.5 else 0)),
+    ("PCR Contrarian", "Put/Call OI z-score, faded (z>1 bull / z<-1 bear)",
+     lambda r: 1 if r["pcr_z"] > 1.0 else (-1 if r["pcr_z"] < -1.0 else 0)),
+    ("Momentum 10d", "10-day price momentum, continuation",
+     lambda r: 1 if r["mom10"] > 0.01 else (-1 if r["mom10"] < -0.01 else 0)),
+    ("RSI(14) Reversion", "Oversold<35 bounce / overbought>65 fade",
+     lambda r: 1 if r["rsi"] < 35 else (-1 if r["rsi"] > 65 else 0)),
+    ("Price vs SMA20", "Trend filter, above/below 20-day mean",
+     lambda r: 1 if r["pvs"] > 0.005 else (-1 if r["pvs"] < -0.005 else 0)),
+]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _signal_accuracy_backtest(ticker, hold_days=5, move_thr=0.005):
+    """Backtest DB-computable signals for one ticker or the whole universe ('(All)').
+    For each historical day, derive each signal's directional call, then score it against
+    the forward `hold_days` stock return. Returns dict with per-signal hit-rate, mean
+    signed (directional) return = edge, sample sizes, and overall coverage."""
+    if not DB_PATH:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if ticker and ticker != "(All)":
+            tickers = [ticker.upper()]
+        else:
+            tickers = [r[0] for r in conn.execute(
+                "SELECT DISTINCT ticker FROM stock_daily").fetchall()]
+        frames = []
+        for tk in tickers:
+            f = _sa_features(conn, tk)
+            if f is None:
+                continue
+            f["fwd"] = f["close"].shift(-hold_days) / f["close"] - 1
+            frames.append(f)
+    finally:
+        conn.close()
+    if not frames:
+        return None
+    df = pd.concat(frames, ignore_index=True)
+    df = df[df["fwd"].notna()]
+    out = []
+    for name, desc, fn in _SA_SIGNALS:
+        try:
+            dirs = df.apply(fn, axis=1)
+        except Exception:
+            continue
+        m = dirs != 0
+        sub = df[m]
+        sd_ = dirs[m]
+        if len(sub) < 5:
+            out.append({"name": name, "desc": desc, "n": int(len(sub)),
+                        "hit": None, "edge": None, "n_bull": int((sd_ > 0).sum()),
+                        "n_bear": int((sd_ < 0).sum())})
+            continue
+        signed = sd_.values * sub["fwd"].values            # directional return per call
+        hit = float(((sd_.values > 0) & (sub["fwd"].values > move_thr)).sum()
+                    + ((sd_.values < 0) & (sub["fwd"].values < -move_thr)).sum()) / len(sub)
+        out.append({"name": name, "desc": desc, "n": int(len(sub)),
+                    "hit": round(hit * 100, 1), "edge": round(float(np.mean(signed)) * 100, 2),
+                    "n_bull": int((sd_ > 0).sum()), "n_bear": int((sd_ < 0).sum())})
+    # naive baseline: unconditional P(up) over same horizon
+    base_up = round(float((df["fwd"] > move_thr).mean()) * 100, 1)
+    base_ret = round(float(df["fwd"].mean()) * 100, 2)
+    return {"ticker": ticker, "hold_days": hold_days, "move_thr": move_thr,
+            "signals": out, "n_obs": int(len(df)), "n_tickers": len(frames),
+            "base_up": base_up, "base_ret": base_ret}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _signal_accuracy_24model(ticker):
+    """Forward-tracked accuracy of the 24-model ensemble from the signal_accuracy table
+    (populated live by telegram_bot's high_prob_signals_engine). Returns per-model and
+    overall hit-rate over resolved predictions, or None if nothing resolved yet."""
+    if not DB_PATH:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        q = ("SELECT model_name, signal, correct, actual_ret FROM signal_accuracy"
+             " WHERE correct>=0")
+        params = ()
+        if ticker and ticker != "(All)":
+            q += " AND ticker=?"
+            params = (ticker.upper(),)
+        df = pd.read_sql(q, conn, params=params)
+    except Exception:
+        return None
+    finally:
+        conn.close()
+    if df.empty:
+        return None
+    g = df.groupby("model_name").agg(
+        n=("correct", "size"), hit=("correct", "mean"),
+        avg_ret=("actual_ret", "mean")).reset_index()
+    g["hit"] = (g["hit"] * 100).round(1)
+    g["avg_ret"] = (g["avg_ret"] * 100).round(2)
+    g = g.sort_values("hit", ascending=False)
+    return {"per_model": g, "overall_hit": round(float(df["correct"].mean()) * 100, 1),
+            "n_total": int(len(df))}
+
+
 def _oi_idea_metrics(conn, ticker, strike, direction, spot, r=0.045):
     """Concrete economics for an OI-conviction idea: entry premium (from DB), expiry/DTE,
     IV (back-solved), POP (~|delta|), a 1-sigma expected-move target + the option's value
@@ -3010,6 +3147,7 @@ _PAGE_HELP = {
     "⚡ Trade Risk Calculator":  "Pre-trade risk sizing tool. Enter entry price, stop loss, and account size to compute the correct number of contracts so you risk no more than 2% of capital.",
     "🎯 Next-Day Exit Planner":  "Pre-market daily brief. Fetches live option mid-prices and tells you which positions to take profit, cut loss, or hold. Run every morning before market open.",
     "🚀 Live Momentum Scanner":  "Intraday momentum scanner. Screens for tickers with unusual volume, OI spikes, or RSI extremes in real time — find the next big mover.",
+    "🎯 Signal Accuracy":        "Validation lab: replays each signal (OI bias, PCR, momentum, RSI, SMA) across stored history and scores its hit-rate + directional edge vs the forward N-day move. Also surfaces the 24-model ensemble's forward-tracked accuracy. Answers: do my signals actually work?",
 }
 
 with st.sidebar:
@@ -3038,6 +3176,7 @@ with st.sidebar:
             "⚡ Trade Risk Calculator",
             "🎯 Next-Day Exit Planner",
             "📊 Backtest Lab",
+            "🎯 Signal Accuracy",
         ],
         "🏛 Smart Money & News": [
             "📈 Insider / Congress / Whales",
@@ -12682,6 +12821,143 @@ ${_mc_expected_val:.2f}
     )
     st.plotly_chart(_fig_ep)
 
+
+# ===================================================================
+# ──  PAGE: SIGNAL ACCURACY
+# ===================================================================
+if page == "🎯 Signal Accuracy":
+    _hdr1, _hdr2 = st.columns([4, 1])
+    with _hdr1:
+        st.markdown("## 🎯 Signal Accuracy")
+    with _hdr2:
+        if st.button("🔄 Refresh", key="refresh_sig_acc"):
+            st.cache_data.clear(); st.rerun()
+        with st.popover("ℹ️"):
+            st.markdown(_PAGE_HELP.get(page, ""))
+    st.markdown("*Do my signals actually predict the next move? Each signal is replayed across "
+                "stored history and scored against the **forward N-day stock return** — hit-rate "
+                "and average directional edge vs a do-nothing baseline.*")
+
+    with st.expander("📘 How to read this page", expanded=False):
+        st.markdown("""
+**What it does** — For every trading day in the database, each signal is asked *"bullish or
+bearish here?"*, then we check what the stock actually did over the next **N days**.
+
+- **Hit-rate** — % of the time the signal's direction was right (move ≥ threshold). Compare it
+  to the **baseline** P(up): beating the baseline = the signal adds information.
+- **Edge / call** — average *directional* return per signal (return × +1 if bull, −1 if bear).
+  **Positive = profitable edge**, negative = the signal is backwards on this data.
+- **N** — how many times the signal fired. Small N (this DB is ~6 months) = treat as
+  suggestive, not proven.
+
+**Honesty note:** OI bias, PCR, momentum, RSI and SMA are **fully backtestable** here.
+The **24-model ensemble** can only be scored *forward* (it reads the latest snapshot, not a
+historical one) — its numbers come from predictions logged live and resolved over time.
+**Sentiment** isn't stored historically yet, so it's forward-logged only.
+""")
+
+    _sa_tk_opts = ["(All)"]
+    try:
+        with sqlite3.connect(DB_PATH) as _sac:
+            _sa_tk_opts += [r[0] for r in _sac.execute(
+                "SELECT DISTINCT ticker FROM stock_daily ORDER BY ticker").fetchall()]
+    except Exception:
+        pass
+    _c1, _c2, _c3 = st.columns([2, 1, 1])
+    with _c1:
+        _sa_tk = st.selectbox("Ticker (or whole universe)", _sa_tk_opts, key="sa_tk")
+    with _c2:
+        _sa_hold = st.select_slider("Forward horizon (days)", options=[1, 3, 5, 10],
+                                    value=5, key="sa_hold")
+    with _c3:
+        _sa_thr = st.select_slider("Move threshold", options=[0.25, 0.5, 1.0, 2.0],
+                                   value=0.5, key="sa_thr",
+                                   format_func=lambda x: f"{x:.2f}%") / 100.0
+
+    st.markdown("### 📊 DB-backtestable signals")
+    _sa = _signal_accuracy_backtest(_sa_tk, int(_sa_hold), float(_sa_thr))
+    if not _sa or not _sa.get("signals"):
+        st.info("Not enough stored history for this selection.")
+    else:
+        st.caption(f"Sample: **{_sa['n_obs']:,}** signal-days across **{_sa['n_tickers']}** "
+                   f"ticker(s) · horizon **{_sa['hold_days']}d** · "
+                   f"baseline P(up≥{_sa['move_thr']*100:.2f}%) = **{_sa['base_up']}%**, "
+                   f"avg fwd return = **{_sa['base_ret']:+.2f}%**")
+        _rows = []
+        for s in _sa["signals"]:
+            if s["hit"] is None:
+                _rows.append({"Signal": s["name"], "Hit-rate": None, "vs base": None,
+                              "Edge/call": None, "Fires": s["n"],
+                              "Bull/Bear": f"{s['n_bull']}/{s['n_bear']}",
+                              "Verdict": "⚪ too few", "What it is": s["desc"]})
+                continue
+            _vsb = round(s["hit"] - _sa["base_up"], 1)
+            _verdict = ("🟢 edge" if s["edge"] > 0.1 and s["hit"] >= _sa["base_up"]
+                        else "🔴 backwards" if s["edge"] < -0.1
+                        else "🟡 weak")
+            _rows.append({"Signal": s["name"], "Hit-rate": s["hit"], "vs base": _vsb,
+                          "Edge/call": s["edge"], "Fires": s["n"],
+                          "Bull/Bear": f"{s['n_bull']}/{s['n_bear']}",
+                          "Verdict": _verdict, "What it is": s["desc"]})
+        _sadf = pd.DataFrame(_rows)
+        st.dataframe(
+            _sadf, hide_index=True, use_container_width=True,
+            column_config={
+                "Hit-rate": st.column_config.NumberColumn("Hit-rate", format="%.1f%%"),
+                "vs base": st.column_config.NumberColumn("vs base", format="%+.1f"),
+                "Edge/call": st.column_config.NumberColumn("Edge/call", format="%+.2f%%"),
+                "Fires": st.column_config.NumberColumn("Fires", format="%d"),
+            })
+        _best = max((s for s in _sa["signals"] if s["edge"] is not None),
+                    key=lambda s: s["edge"], default=None)
+        _worst = min((s for s in _sa["signals"] if s["edge"] is not None),
+                     key=lambda s: s["edge"], default=None)
+        if _best and _worst:
+            _m1, _m2 = st.columns(2)
+            _m1.metric("Best edge", _best["name"], f"{_best['edge']:+.2f}%/call")
+            _m2.metric("Weakest edge", _worst["name"], f"{_worst['edge']:+.2f}%/call")
+        try:
+            _bar = _sadf.dropna(subset=["Edge/call"])
+            if not _bar.empty:
+                _fig_sa = go.Figure(go.Bar(
+                    x=_bar["Signal"], y=_bar["Edge/call"],
+                    marker_color=["#2E7D32" if v > 0 else "#C62828" for v in _bar["Edge/call"]],
+                    text=[f"{v:+.2f}%" for v in _bar["Edge/call"]], textposition="outside"))
+                _fig_sa.update_layout(title="Average directional edge per signal",
+                                      yaxis_title="Edge per call (%)", margin=dict(t=50, b=30),
+                                      height=340)
+                st.plotly_chart(_fig_sa, use_container_width=True)
+        except Exception:
+            pass
+
+    st.markdown("---")
+    st.markdown("### 🤖 24-model ensemble — forward-tracked")
+    st.caption("Resolved live predictions from the high-prob engine (`signal_accuracy` table). "
+               "Grows as the bot runs day over day.")
+    _sa24 = _signal_accuracy_24model(_sa_tk)
+    if not _sa24:
+        st.info("No resolved 24-model predictions yet for this selection. "
+                "The Telegram bot logs predictions each run and resolves them the next day — "
+                "check back after a few sessions.")
+    else:
+        st.caption(f"Overall resolved accuracy: **{_sa24['overall_hit']}%** "
+                   f"over **{_sa24['n_total']:,}** resolved predictions.")
+        st.dataframe(
+            _sa24["per_model"].rename(columns={
+                "model_name": "Model", "n": "Resolved", "hit": "Hit-rate", "avg_ret": "Avg next-day"}),
+            hide_index=True, use_container_width=True,
+            column_config={
+                "Hit-rate": st.column_config.NumberColumn("Hit-rate", format="%.1f%%"),
+                "Avg next-day": st.column_config.NumberColumn("Avg next-day", format="%+.2f%%"),
+                "Resolved": st.column_config.NumberColumn("Resolved", format="%d"),
+            })
+
+    st.markdown("---")
+    st.markdown("### 💬 Sentiment signals")
+    st.info("Sentiment (news tone, StockTwits/Finnhub crowd) is **not stored historically**, so "
+            "it can't be backtested from the DB. It's evaluated live inside the Game Plan / "
+            "`/plan` flow. To score it, predictions would need to be forward-logged over time — "
+            "say the word and I'll add a sentiment forward-log table.")
 
 
 # ===================================================================
