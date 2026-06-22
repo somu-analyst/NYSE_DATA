@@ -19531,7 +19531,7 @@ def _next_earnings(tk):
     import time as _t
     now = _t.time()
     c = _EARN_CACHE.get(tk)
-    if c and now - c[0] < 7200:
+    if c and now - c[0] < 21600:
         return c[1]
     res = None
     try:
@@ -19539,15 +19539,23 @@ def _next_earnings(tk):
         t = yf.Ticker(tk)
         nowd = _pd.Timestamp.now().normalize()
         dts = []
-        try:
-            ed = t.get_earnings_dates(limit=12)
-            if ed is not None and len(ed):
-                for ix in ed.index:
-                    ts = _pd.Timestamp(ix)
-                    ts = ts.tz_localize(None) if ts.tzinfo else ts
-                    dts.append(ts.normalize())
+        try:                                    # fast path: .calendar
+            cal = t.calendar
+            e = cal.get("Earnings Date") if isinstance(cal, dict) else None
+            for x in (e if isinstance(e, (list, tuple)) else [e]) if e else []:
+                dts.append(_pd.Timestamp(x).normalize())
         except Exception:
             pass
+        if not dts:                             # slow fallback only if needed
+            try:
+                ed = t.get_earnings_dates(limit=12)
+                if ed is not None and len(ed):
+                    for ix in ed.index:
+                        ts = _pd.Timestamp(ix)
+                        ts = ts.tz_localize(None) if ts.tzinfo else ts
+                        dts.append(ts.normalize())
+            except Exception:
+                pass
         fut = sorted(d for d in dts if d >= nowd)
         if fut:
             res = {"date": fut[0].strftime("%b %d"), "days": int((fut[0] - nowd).days)}
