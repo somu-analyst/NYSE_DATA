@@ -11522,20 +11522,24 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         _ms_badge = {"OPEN": "🟢 Market OPEN (live)", "PRE": "🌅 Pre-market",
                      "AFTER": "🌙 After-hours", "CLOSED": "🔴 Market closed",
                      "UNKNOWN": "⏱ Session unknown"}.get(_ms, _ms)
-        _gp_ah_tog, _gp_ref_tog, _gp_ah_note = st.columns([1.3, 1.1, 2.6])
+        _gp_ah_tog, _gp_ref_tog, _gp_int_col, _gp_ah_note = st.columns([1.2, 1.0, 1.0, 2.2])
         _gp_use_ah = _gp_ah_tog.toggle(
             "🔴 Live prices", value=st.session_state.get("use_ah", True), key="use_ah",
             help="Use live / after-hours / pre-market prices: spot, moneyness, Greeks, scenarios and "
                  "P&L all re-price off the live quote. Turn off to freeze on the last EOD close.")
         _gp_autoref = _gp_ref_tog.toggle(
             "🔁 Auto-refresh", value=st.session_state.get("gp_autoref", True), key="gp_autoref",
-            help="Reload every 30s during market hours so quotes stay live.")
+            help="Reload at the chosen interval during market hours so quotes stay live.")
+        _gp_int = _gp_int_col.select_slider(
+            "every", options=[15, 30, 60, 120], value=st.session_state.get("gp_refresh_int", 60),
+            key="gp_refresh_int", format_func=lambda s: f"{s}s",
+            help="How often to reload while live. Longer = lighter on the page.")
         _gp_ah_note.caption(f"**{_ms_badge}** · "
                             + ("live quotes feed spot, Greeks & P&L." if _gp_use_ah
                                else "showing frozen EOD close (Live off)."))
         if _gp_use_ah and _gp_autoref and _ms in ("OPEN", "PRE", "AFTER"):
-            _auto_refresh(30)
-            st.caption(f"🔁 Auto-refreshing every 30s · last update "
+            _auto_refresh(_gp_int)
+            st.caption(f"🔁 Auto-refreshing every {_gp_int}s · last update "
                        f"{datetime.now().strftime('%H:%M:%S')}")
         _gp_conn = get_conn()
         try:
