@@ -12110,8 +12110,11 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 try:
                     _chain = pd.read_sql(
                         "SELECT strike, openInt_Call_now, openInt_Put_now, R1, S1 FROM options_change "
-                        "WHERE UPPER(ticker)=? AND expiry_date=?",
-                        _gp_conn, params=(_tk, _near["exp_mdy"]))
+                        "WHERE UPPER(ticker)=? AND expiry_date=? AND trade_date_now=("
+                        "SELECT trade_date_now FROM options_change WHERE UPPER(ticker)=? AND expiry_date=? "
+                        "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) "
+                        "DESC LIMIT 1)",
+                        _gp_conn, params=(_tk, _near["exp_mdy"], _tk, _near["exp_mdy"]))
                 except Exception:
                     _chain = pd.DataFrame()
                 _w = compute_walls(_chain, _spot) if not _chain.empty else {}
@@ -12129,10 +12132,27 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 if _r1: _lv.append(f"R1 ${_r1:.0f}")
                 if _lv:
                     st.markdown("**Key levels:** " + " · ".join(_lv))
-                try:
-                    st.plotly_chart(_gp_levels_fig(_tk, _spot, _w, _r1, _s1, _em), use_container_width=True)
-                except Exception:
-                    pass
+                # scenarios computed here so the chart + scenarios sit side by side
+                _sm = []
+                for s in (-0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03):
+                    tot = 0.0
+                    for l in _tl:
+                        ns = l["spot"] * (1 + s); t1 = max(l["dte"] - 1, 0) / 365.0
+                        ivs = max(l["iv"] * (1 - 2.0 * s), 0.05)
+                        npx = bs_greeks(ns, l["K"], t1, _R, ivs, l["typ"]).get("price", l["cur"]) if t1 > 0 \
+                            else (max(ns - l["K"], 0) if l["typ"] == "call" else max(l["K"] - ns, 0))
+                        tot += (npx - l["cur"]) * l["m"]
+                    _sm.append({f"If {_tk} moves": f"{s*100:+.0f}%", "P&L $": round(tot)})
+                _kc1, _kc2 = st.columns([3, 2])
+                with _kc1:
+                    try:
+                        st.plotly_chart(_gp_levels_fig(_tk, _spot, _w, _r1, _s1, _em), use_container_width=True)
+                    except Exception:
+                        pass
+                with _kc2:
+                    st.markdown("**📉 Tomorrow's scenarios**")
+                    st.dataframe(pd.DataFrame(_sm), hide_index=True, use_container_width=True,
+                                 column_config={"P&L $": st.column_config.NumberColumn(format="$%d")})
 
                 # ── 🎯 Which signal to trust (inline accuracy → priority) ──
                 _sa_gp = _signal_accuracy_backtest(_tk, 5)
@@ -12150,19 +12170,9 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 if _slog_gp and _slog_gp.get("overall_hit") is not None:
                     _tr_rows.append({"Signal": "Sentiment (crowd/news)", "Hit-rate": _slog_gp["overall_hit"],
                                      "Edge/call": None, "Fires": _slog_gp["n_resolved"]})
-                if _tr_rows:
-                    st.markdown("**🎯 Which signal to trust here** — track record on this ticker "
-                                "(5-day forward); prioritize the top row")
-                    _trdf = pd.DataFrame(_tr_rows).sort_values(
-                        "Edge/call", ascending=False, na_position="last").reset_index(drop=True)
-                    _best_row = _trdf.iloc[0]
-                    st.dataframe(_trdf, hide_index=True, use_container_width=True,
-                                 column_config={
-                                     "Hit-rate": st.column_config.NumberColumn(format="%.1f%%"),
-                                     "Edge/call": st.column_config.NumberColumn(format="%+.2f%%"),
-                                     "Fires": st.column_config.NumberColumn(format="%d")})
-                    st.caption(f"➡️ **Prioritize _{_best_row['Signal']}_** for {_tk} — best historical "
-                               "edge here. Full breakdown on the 🎯 Signal Accuracy page.")
+                _trdf = (pd.DataFrame(_tr_rows).sort_values(
+                    "Edge/call", ascending=False, na_position="last").reset_index(drop=True)
+                    if _tr_rows else None)
 
                 # ── compact one-line sentiment / IV / earnings strip ──
                 _sb = []
@@ -12190,8 +12200,19 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     st.warning(f"📅 {_tk} earnings in {_earn['days']}d — binary gap risk; size down / "
                                "close before the print.")
 
-                # ── Plain-English read + Hold/Close debate (collapsed to save space) ──
-                with st.expander("📋 Plain-English read & ⚖️ Hold-vs-Close debate", expanded=False):
+                # ── Signals + Plain-English read + Hold/Close debate (collapsed to save space) ──
+                with st.expander("📋 Read · ⚖️ Hold-vs-Close · 🎯 Which signal to trust", expanded=False):
+                    if _trdf is not None:
+                        st.markdown("**🎯 Which signal to trust here** — track record on this ticker "
+                                    "(5-day forward); prioritize the top row")
+                        st.dataframe(_trdf, hide_index=True, use_container_width=True,
+                                     column_config={
+                                         "Hit-rate": st.column_config.NumberColumn(format="%.1f%%"),
+                                         "Edge/call": st.column_config.NumberColumn(format="%+.2f%%"),
+                                         "Fires": st.column_config.NumberColumn(format="%d")})
+                        st.caption(f"➡️ **Prioritize _{_trdf.iloc[0]['Signal']}_** for {_tk} — best historical "
+                                   "edge here. Full breakdown on the 🎯 Signal Accuracy page.")
+                        st.markdown("---")
                     st.info(_gp_writeup(_tk, _spot, _em, _w, _r1, _s1, _tk_dd, _tk_th, _nw, _tl, _stt).replace("$", "\\$"))
                     _holds, _closes, _verdict = _gp_debate(_tk, _tl, _spot, _em, _tk_dd, _tk_th, _w, _nw, _stt, _ivr, _earn)
                     _dbc1, _dbc2 = st.columns(2)
@@ -12355,20 +12376,6 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                                                "🎯 Signal Accuracy page for each model's forward-tracked hit-rate.")
                     except Exception as _ee:
                         st.caption(f"(24-model engine unavailable: {_ee})")
-
-                st.markdown("**📉 Tomorrow's scenarios — this stock's P&L vs its move**")
-                _sm = []
-                for s in (-0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03):
-                    tot = 0.0
-                    for l in _tl:
-                        ns = l["spot"] * (1 + s); t1 = max(l["dte"] - 1, 0) / 365.0
-                        ivs = max(l["iv"] * (1 - 2.0 * s), 0.05)
-                        npx = bs_greeks(ns, l["K"], t1, _R, ivs, l["typ"]).get("price", l["cur"]) if t1 > 0 \
-                            else (max(ns - l["K"], 0) if l["typ"] == "call" else max(l["K"] - ns, 0))
-                        tot += (npx - l["cur"]) * l["m"]
-                    _sm.append({f"If {_tk} moves": f"{s*100:+.0f}%", "P&L $": round(tot)})
-                st.dataframe(pd.DataFrame(_sm), hide_index=True, use_container_width=True,
-                             column_config={"P&L $": st.column_config.NumberColumn(format="$%d")})
 
                 with st.expander(f"📰 Latest headlines & tone ({len(_nw['items'])})", expanded=False):
                     if _nw["items"]:
