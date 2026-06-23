@@ -12132,6 +12132,15 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 if _r1: _lv.append(f"R1 ${_r1:.0f}")
                 if _lv:
                     st.markdown("**Key levels:** " + " · ".join(_lv))
+                # dual-class siblings trade separate option chains — keep them distinct, never merge
+                _sib = {"GOOG": "GOOGL", "GOOGL": "GOOG", "FOX": "FOXA", "FOXA": "FOX",
+                        "NWS": "NWSA", "NWSA": "NWS", "UA": "UAA", "UAA": "UA",
+                        "BRK.A": "BRK.B", "BRK.B": "BRK.A", "BRK-A": "BRK-B", "BRK-B": "BRK-A",
+                        "LBRDA": "LBRDK", "LBRDK": "LBRDA"}.get(_tk.upper())
+                if _sib:
+                    st.caption(f"ℹ️ **{_tk}** and **{_sib}** are separate share classes with **separate "
+                               f"option chains** — these walls/levels come from {_tk}'s own chain, not "
+                               f"{_sib}'s, so they can differ.")
                 # scenarios computed here so the chart + scenarios sit side by side
                 _sm = []
                 for s in (-0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03):
