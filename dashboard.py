@@ -12062,11 +12062,14 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                        f"P&L **${_ftot:,.0f}**.  **Est Open** = value after 1 day decay (*expired*=0DTE, "
                        "*~\\$0.00*=deep-OTM) · **Day L–H** = 1σ daily range · **Close @** = marketable limit "
                        "to close. Switch to *By stock* for levels, signals, scenarios & deep analysis.")
+            st.markdown("---")
+            st.caption("📖 Full per-stock analysis (levels · signals · sentiment · scenarios · deep "
+                       "analysis) for **every** position follows below.")
         else:
             st.caption("Each stock is a card — flip its toggle to load that stock's full ticker-level "
                        "analysis and legs. **Opened stocks stay open through live refresh** (the page "
                        "only re-renders when prices actually move).")
-        for _tk, _tl in (_by_tk.items() if _gp_layout.startswith("📊") else []):
+        for _tk, _tl in _by_tk.items():
             _spot = _tl[0]["spot"]
             _ivs = sorted(x["iv"] for x in _tl); _ivm = _ivs[len(_ivs) // 2]
             _em = _spot * _ivm * (1 / 252.0) ** 0.5
@@ -12097,12 +12100,14 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 _mc[2].metric("Δ per +1%", f"${_tk_dd:,.0f}", _daylbl)
                 _mc[3].metric("Theta / day", f"${_tk_th:,.0f}")
 
-                # ── lazy gate: heavy detail only computes/renders when this stock is opened ──
-                if not st.toggle("🔬 Load full analysis (chart · signals · scenarios · legs)",
-                                 key=f"gp_open_{_tk}"):
-                    st.caption("Toggle on for this stock's full plan — kept off by default so the "
-                               "page loads in <1–2s. The metrics above are always live.")
-                    continue
+                # ── lazy gate: in 'By stock' mode load heavy detail on demand; in 'All positions'
+                #    mode every section auto-renders for every stock ──
+                if _gp_layout.startswith("📊"):
+                    if not st.toggle("🔬 Load full analysis (chart · signals · scenarios · legs)",
+                                     key=f"gp_open_{_tk}"):
+                        st.caption("Toggle on for this stock's full plan — kept off by default so the "
+                                   "page loads in <1–2s. The metrics above are always live.")
+                        continue
                 _near = min(_tl, key=lambda x: x["dte"])
                 try:
                     _chain = pd.read_sql(
