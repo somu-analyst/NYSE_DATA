@@ -12321,6 +12321,13 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _vd = bs_greeks(max(l["spot"] - _sig, 0.01), l["K"], _Tn, _R, l["iv"], l["typ"])["price"]
                     _olo, _ohi = min(_vu, _vd), max(_vu, _vd)
                     _topen = bs_greeks(l["spot"], l["K"], max(l["dte"] - 1, 0) / 365.0, _R, l["iv"], l["typ"])["price"]
+                    # label clearly: a 0DTE option has expired by the next session; sub-penny reads "~0"
+                    if l["dte"] <= 0:
+                        _topen_disp = "expired"
+                    elif _topen < 0.005:
+                        _topen_disp = "~$0.00"
+                    else:
+                        _topen_disp = f"${_topen:.2f}"
                     _buf = max(0.05, round(l["cur"] * 0.03, 2))     # ~3% / min 5c marketable buffer
                     _climit = (f"SELL ≤ ${max(l['cur'] - _buf, 0.01):.2f}" if l["side"] == "long"
                                else f"BUY ≥ ${l['cur'] + _buf:.2f}")
@@ -12328,14 +12335,15 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${l['K']:.0f}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": money,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
-                        "Est Open": round(_topen, 2), "Day L–H": f"${_olo:.2f}–${_ohi:.2f}",
+                        "Est Open": _topen_disp, "Day L–H": f"${_olo:.2f}–${_ohi:.2f}",
                         "Close @": _climit,
                         "P&L %": round(pnl_pct), "P&L $": round(l["pnl"]), "Action": action,
                     })
                 st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True,
                              column_config={"P&L %": st.column_config.NumberColumn(format="%d%%")})
-                st.caption("**Est Open** = value if flat into next open (1 day decay; AH-adjusted when 🌙 on). "
-                           "**Day L–H** = expected option range on a 1σ daily move. "
+                st.caption("**Est Open** = modeled value at the next session if price is flat (one day of "
+                           "decay). *expired* = 0DTE (gone by next open); *~\\$0.00* = deep-OTM, decaying to "
+                           "worthless. **Day L–H** = expected option range on a 1σ daily move. "
                            "**Close @** = suggested marketable limit to get filled (sell-to-close longs / buy-to-close shorts).")
 
         # ── Morning checklist ──
