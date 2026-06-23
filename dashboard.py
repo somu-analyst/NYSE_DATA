@@ -417,10 +417,30 @@ def _gp_live_tick():
     a full SCRIPT rerun (st.rerun) — NOT a browser reload — so charts/tables/values update in place,
     the old values stay on screen until the new ones render, and there's no flash or scroll reset."""
     import time as _t
+    if not st.session_state.get("use_ah", True):
+        return  # EOD / frozen mode — nothing live to refresh
     interval = int(st.session_state.get("global_refresh_int",
                                         st.session_state.get("gp_refresh_int", 60)))
-    if _t.time() - st.session_state.get("_app_run_ts", 0.0) >= max(interval, 5):
-        st.rerun(scope="app")
+    if _t.time() - st.session_state.get("_app_run_ts", 0.0) < max(interval, 5):
+        return
+    # interval elapsed — only rerun if live prices actually MOVED, so an open analysis isn't
+    # disrupted when nothing has changed.
+    _tks = st.session_state.get("_live_tickers") or []
+    if _tks:
+        try:
+            _cur = []
+            for _t2 in _tks:
+                _d = _get_ah_price(_t2)
+                _cur.append((_t2, round((_d.get("spot_ah") or _d.get("spot_reg") or 0.0), 2)))
+            _sig = tuple(_cur)
+        except Exception:
+            _sig = None
+        if _sig is not None:
+            if _sig == st.session_state.get("_live_sig_live"):
+                st.session_state["_app_run_ts"] = _t.time()   # unchanged → reset timer, skip rerun
+                return
+            st.session_state["_live_sig_live"] = _sig
+    st.rerun(scope="app")
 
 
 def _auto_refresh(seconds: int):
@@ -11983,10 +12003,44 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             for p in _gp_patterns(_tk, _ps, None, None):
                 if p["sig"] in ("BULL", "BEAR") and any(k in p["name"] for k in ("flag", "cross")):
                     _checklist.append(f"**{_tk}** {p['name']}: {p['why']}")
-        st.caption("Every position below is its own dropdown — the one-line header is the summary; "
-                   "open any to see that stock's full ticker-level analysis and individual legs. "
-                   "Portfolio totals are above. (Cached, so opening several stays fast.)")
-        for _tk, _tl in _by_tk.items():
+        # register tickers so the live heartbeat only reruns when these prices actually move
+        st.session_state["_live_tickers"] = list(_by_tk)
+
+        _gp_layout = st.radio(
+            "Layout", ["📊 By stock", "📋 All positions (one table)"],
+            horizontal=True, key="gp_layout", label_visibility="collapsed")
+
+        if _gp_layout.startswith("📋"):
+            # ── flat view: every leg across all tickers in a single table ──
+            _flat = []
+            for _ftk, _ftl in _by_tk.items():
+                for l in _ftl:
+                    _fm = "ITM" if ((l["spot"] > l["K"]) if l["typ"] == "call" else (l["spot"] < l["K"])) else "OTM"
+                    _fpp = ((l["cur"] - l["entry"]) / l["entry"] * 100 * (1 if l["qty"] > 0 else -1)) if l["entry"] else 0
+                    _flat.append({
+                        "Ticker": _ftk, "Spot": round(l["spot"], 2),
+                        "Leg": f"{l['side']} {abs(l['qty'])}× ${l['K']:.0f}{l['typ'][0].upper()}",
+                        "Exp": l["exp"][:10], "DTE": l["dte"], "Money": _fm,
+                        "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
+                        "P&L %": round(_fpp), "P&L $": round(l["pnl"]),
+                    })
+            _fdf = pd.DataFrame(_flat).sort_values(["Ticker", "DTE"])
+            st.dataframe(_fdf, hide_index=True, use_container_width=True,
+                         column_config={
+                             "Spot": st.column_config.NumberColumn(format="$%.2f"),
+                             "Entry": st.column_config.NumberColumn(format="$%.2f"),
+                             "Now": st.column_config.NumberColumn(format="$%.2f"),
+                             "P&L %": st.column_config.NumberColumn(format="%d%%"),
+                             "P&L $": st.column_config.NumberColumn(format="$%d")})
+            _ftot = sum(r["P&L $"] for r in _flat)
+            st.caption(f"All **{len(_flat)}** legs across **{len(_by_tk)}** tickers · total open "
+                       f"P&L **${_ftot:,.0f}**. Switch to *By stock* for full per-ticker analysis "
+                       "(levels, signals, scenarios, deep analysis).")
+        else:
+            st.caption("Each stock is a card — flip its toggle to load that stock's full ticker-level "
+                       "analysis and legs. **Opened stocks stay open through live refresh** (the page "
+                       "only re-renders when prices actually move).")
+        for _tk, _tl in (_by_tk.items() if _gp_layout.startswith("📊") else []):
             _spot = _tl[0]["spot"]
             _ivs = sorted(x["iv"] for x in _tl); _ivm = _ivs[len(_ivs) // 2]
             _em = _spot * _ivm * (1 / 252.0) ** 0.5
@@ -12004,9 +12058,12 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _chg = (_spot / _prev_close - 1) * 100 if _prev_close else 0.0
             _daylbl = "🟢 up day" if _chg > 0.2 else "🔴 down day" if _chg < -0.2 else "⚪ flat"
             _pnllbl = "🟢 winning" if _tk_pnl > 0 else "🔴 losing" if _tk_pnl < 0 else "⚪ flat"
-            with st.expander(f"{_te} {_tk} · ${_spot:.2f} {_src_tag} ({_chg:+.1f}% vs prev ${_prev_close:.2f}) · "
-                             f"{len(_tl)} legs · P&L ${_tk_pnl:,.0f} {_pnllbl} · news {_nw['label']}",
-                             expanded=False):
+            # container (NOT expander) so live-refresh never collapses an opened stock; the keyed
+            # toggle below remembers open/closed state across reruns.
+            with st.container(border=True):
+                st.markdown(
+                    f"{_te} **{_tk}** · \\${_spot:.2f} {_src_tag} ({_chg:+.1f}% vs prev \\${_prev_close:.2f}) · "
+                    f"{len(_tl)} legs · P&L \\${_tk_pnl:,.0f} {_pnllbl} · news {_nw['label']}")
                 _mc = st.columns(4)
                 _mc[0].metric(f"Spot · {_src_tag}", f"${_spot:.2f}", f"{_chg:+.2f}% vs prev close",
                               delta_color="normal" if _chg >= 0 else "inverse")
