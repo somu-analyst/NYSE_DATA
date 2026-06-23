@@ -12103,10 +12103,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 # ── lazy gate: in 'By stock' mode load heavy detail on demand; in 'All positions'
                 #    mode every section auto-renders for every stock ──
                 if _gp_layout.startswith("📊"):
-                    if not st.toggle("🔬 Load full analysis (chart · signals · scenarios · legs)",
-                                     key=f"gp_open_{_tk}"):
-                        st.caption("Toggle on for this stock's full plan — kept off by default so the "
-                                   "page loads in <1–2s. The metrics above are always live.")
+                    if not st.toggle("🔬 Full analysis", value=True, key=f"gp_open_{_tk}"):
+                        st.caption("Collapsed — flip on for this stock's full plan. Metrics above are live.")
                         continue
                 _near = min(_tl, key=lambda x: x["dte"])
                 try:
@@ -12166,48 +12164,46 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     st.caption(f"➡️ **Prioritize _{_best_row['Signal']}_** for {_tk} — best historical "
                                "edge here. Full breakdown on the 🎯 Signal Accuracy page.")
 
+                # ── compact one-line sentiment / IV / earnings strip ──
+                _sb = []
                 if _stt:
                     _ste = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}.get(_stt["label"], "⚪")
-                    st.markdown(f"**💬 StockTwits crowd:** {_ste} {_stt['label']} "
-                                f"({_stt['bull']} bullish / {_stt['bear']} bearish)")
+                    _sb.append(f"💬 {_ste}{_stt['label']} ({_stt['bull']}/{_stt['bear']})")
                     _log_sentiment(_tk, "stocktwits", _stt["label"])
                 _fh = _finnhub_sentiment(_tk)
                 if _fh:
                     _fhe = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡"}.get(_fh["label"], "⚪")
-                    _buzz = f" · buzz {_fh['buzz']:.1f}×" if _fh.get("buzz") else ""
-                    st.markdown(f"**🛰 Finnhub news-sentiment:** {_fhe} {_fh['label']} "
-                                f"({_fh['bull_pct']:.0f}% bullish){_buzz}")
+                    _sb.append(f"🛰 {_fhe}{_fh['label']} ({_fh['bull_pct']:.0f}%)"
+                               + (f" buzz {_fh['buzz']:.1f}×" if _fh.get("buzz") else ""))
                     _log_sentiment(_tk, "finnhub", _fh["label"], _fh.get("bull_pct"))
                 _log_sentiment(_tk, "news_tone", _nw["label"])
                 _ivr = _iv_rank(_tk)
                 if _ivr:
-                    _hint = ("🟢 cheap — favor buying premium / long options" if _ivr["rank"] < 30
-                             else "🔴 rich — favor selling premium / spreads" if _ivr["rank"] > 70
-                             else "🟡 mid-range")
-                    st.markdown(f"**🌡️ IV Rank {_ivr['rank']:.0f}** (IV {_ivr['iv']*100:.0f}% vs "
-                                f"{_ivr['lo']*100:.0f}–{_ivr['hi']*100:.0f}% over 6mo) — {_hint}")
+                    _ivh = "🟢cheap" if _ivr["rank"] < 30 else "🔴rich" if _ivr["rank"] > 70 else "🟡mid"
+                    _sb.append(f"🌡️IVR {_ivr['rank']:.0f} {_ivh}")
                 _earn = _next_earnings(_tk)
+                if _earn:
+                    _sb.append(f"📅ER {_earn['date']} ({_earn['days']}d)")
+                if _sb:
+                    st.markdown("  ·  ".join(_sb))
                 if _earn and _earn["days"] <= 14:
-                    st.warning(f"📅 **{_tk} earnings in {_earn['days']}d ({_earn['date']})** — binary gap "
-                               "risk; consider sizing down or closing options before the print.")
-                elif _earn:
-                    st.caption(f"📅 Next {_tk} earnings: {_earn['date']} ({_earn['days']}d out).")
-                st.markdown("**📋 Plain-English read**")
-                st.info(_gp_writeup(_tk, _spot, _em, _w, _r1, _s1, _tk_dd, _tk_th, _nw, _tl, _stt).replace("$", "\\$"))
+                    st.warning(f"📅 {_tk} earnings in {_earn['days']}d — binary gap risk; size down / "
+                               "close before the print.")
 
-                # ── Hold vs Close debate (both sides + verdict) ──
-                _holds, _closes, _verdict = _gp_debate(_tk, _tl, _spot, _em, _tk_dd, _tk_th, _w, _nw, _stt, _ivr, _earn)
-                st.markdown("**⚖️ Hold vs Close — the debate**")
-                _dbc1, _dbc2 = st.columns(2)
-                with _dbc1:
-                    st.markdown("✅ **Reasons to HOLD**")
-                    for _h in (_holds or ["— no strong hold case right now."]):
-                        st.markdown(("- " + _h).replace("$", "\\$"))
-                with _dbc2:
-                    st.markdown("⚠️ **Reasons to CLOSE / adjust**")
-                    for _cl in (_closes or ["— no urgent close case right now."]):
-                        st.markdown(("- " + _cl).replace("$", "\\$"))
-                st.markdown("**Assessment:** " + _verdict.replace("$", "\\$"))
+                # ── Plain-English read + Hold/Close debate (collapsed to save space) ──
+                with st.expander("📋 Plain-English read & ⚖️ Hold-vs-Close debate", expanded=False):
+                    st.info(_gp_writeup(_tk, _spot, _em, _w, _r1, _s1, _tk_dd, _tk_th, _nw, _tl, _stt).replace("$", "\\$"))
+                    _holds, _closes, _verdict = _gp_debate(_tk, _tl, _spot, _em, _tk_dd, _tk_th, _w, _nw, _stt, _ivr, _earn)
+                    _dbc1, _dbc2 = st.columns(2)
+                    with _dbc1:
+                        st.markdown("✅ **HOLD**")
+                        for _h in (_holds or ["— no strong hold case."]):
+                            st.markdown(("- " + _h).replace("$", "\\$"))
+                    with _dbc2:
+                        st.markdown("⚠️ **CLOSE / adjust**")
+                        for _cl in (_closes or ["— no urgent close case."]):
+                            st.markdown(("- " + _cl).replace("$", "\\$"))
+                    st.markdown("**Assessment:** " + _verdict.replace("$", "\\$"))
 
                 # ── Execution & timing (close at open vs wait; time-of-day windows) ──
                 _eh, _eb = _gp_exec_timing(_tk, _tl, _spot, _chg)
