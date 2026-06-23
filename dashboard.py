@@ -417,7 +417,8 @@ def _gp_live_tick():
     a full SCRIPT rerun (st.rerun) — NOT a browser reload — so charts/tables/values update in place,
     the old values stay on screen until the new ones render, and there's no flash or scroll reset."""
     import time as _t
-    interval = int(st.session_state.get("gp_refresh_int", 60))
+    interval = int(st.session_state.get("global_refresh_int",
+                                        st.session_state.get("gp_refresh_int", 60)))
     if _t.time() - st.session_state.get("_app_run_ts", 0.0) >= max(interval, 5):
         st.rerun(scope="app")
 
@@ -3886,11 +3887,28 @@ with st.sidebar:
     page = st.radio("Navigate", _NAV_GROUPS[_cat], label_visibility="collapsed")
 
     st.markdown("---")
+    # ── Global live auto-refresh (in-place, no page reload) — applies to every page ──
+    _gms = _market_state()
+    _gms_badge = {"OPEN": "🟢 Market OPEN", "PRE": "🌅 Pre-market", "AFTER": "🌙 After-hours",
+                  "CLOSED": "🔴 Market closed", "UNKNOWN": "⏱ —"}.get(_gms, _gms)
+    _gar1, _gar2 = st.columns([1, 1])
+    _global_autoref = _gar1.toggle("🔁 Live refresh", value=st.session_state.get("global_autoref", True),
+                                   key="global_autoref",
+                                   help="Auto-update every page in place (no reload) while the market is "
+                                        "open or in extended hours.")
+    st.select_slider("Interval", options=[15, 30, 60, 120],
+                     value=st.session_state.get("global_refresh_int", 60), key="global_refresh_int",
+                     format_func=lambda s: f"{s}s")
+    if _global_autoref and _gms in ("OPEN", "PRE", "AFTER"):
+        _gar2.caption(f"{_gms_badge}\n\n🔁 live")
+        _auto_refresh(int(st.session_state.get("global_refresh_int", 60)))
+    else:
+        _gar2.caption(f"{_gms_badge}\n\n⏸ paused")
+
+    st.markdown("---")
     # Mini help for current page
     if page in _PAGE_HELP:
         st.info(f"**{page}**\n\n{_PAGE_HELP[page]}")
-    st.markdown("---")
-
     st.markdown("---")
     st.caption(f"Data: Yahoo Finance + Local DB")
     st.caption(f"DB: US_data.db")
@@ -5094,11 +5112,11 @@ if page == "🌍 Market Overview":
     except Exception:
         st.info("No OI data loaded in DB yet.")
 
-    # ── Auto-refresh via rerun ──
+    # Auto-refresh is now handled globally + in-place by the sidebar "🔁 Live refresh"
+    # (no blocking sleep / page reload). This page updates with it automatically.
     if auto_ref:
-        import time as _time
-        _time.sleep(60)
-        st.rerun()
+        st.caption("ℹ️ Use the sidebar **🔁 Live refresh** for smooth in-place auto-updates "
+                   "(this local toggle is deprecated).")
 
 
 # ===================================================================
@@ -11536,7 +11554,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                      "UNKNOWN": "⏱ Session unknown"}.get(_ms, _ms)
         # Price source is AUTOMATIC: live during RTH, AH/PM when extended hours, EOD when closed.
         # The only control is an EOD override.
-        _gp_eod_col, _gp_ref_tog, _gp_int_col, _gp_ah_note = st.columns([1.2, 1.0, 1.0, 2.2])
+        _gp_eod_col, _gp_ah_note = st.columns([1.2, 3.0])
         _gp_force_eod = _gp_eod_col.toggle(
             "🕘 EOD close", value=st.session_state.get("gp_force_eod", False), key="gp_force_eod",
             help="Default: live prices during market hours, after-hours/pre-market (AH/PM) when "
@@ -11547,19 +11565,9 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         _src_tag = "EOD" if _gp_force_eod else {"OPEN": "LIVE", "PRE": "PM", "AFTER": "AH",
                                                 "CLOSED": "EOD", "UNKNOWN": "EOD"}.get(_ms, "LIVE")
         _src_emoji = {"LIVE": "🔴", "PM": "🌅", "AH": "🌙", "EOD": "🕘"}.get(_src_tag, "🔴")
-        _gp_autoref = _gp_ref_tog.toggle(
-            "🔁 Auto-refresh", value=st.session_state.get("gp_autoref", True), key="gp_autoref",
-            help="Reload at the chosen interval during market/extended hours so quotes stay live.")
-        _gp_int = _gp_int_col.select_slider(
-            "every", options=[15, 30, 60, 120], value=st.session_state.get("gp_refresh_int", 60),
-            key="gp_refresh_int", format_func=lambda s: f"{s}s",
-            help="How often to reload while live. Longer = lighter on the page.")
         _gp_ah_note.caption(f"**{_ms_badge}** · price source: {_src_emoji} **{_src_tag}**"
-                            + (" (forced)" if _gp_force_eod else " (auto)"))
-        if _gp_use_ah and _gp_autoref and _ms in ("OPEN", "PRE", "AFTER"):
-            _auto_refresh(_gp_int)
-            st.caption(f"🔁 Live — updating in place every {_gp_int}s (no page reload) · "
-                       f"last update {datetime.now().strftime('%H:%M:%S')}")
+                            + (" (forced)" if _gp_force_eod else " (auto)")
+                            + "  ·  live refresh is in the sidebar (🔁 Live refresh), applies to every page.")
         _gp_conn = get_conn()
         try:
             _gp_tr = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", _gp_conn)
