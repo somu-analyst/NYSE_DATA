@@ -12011,18 +12011,43 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             horizontal=True, key="gp_layout", label_visibility="collapsed")
 
         if _gp_layout.startswith("📋"):
-            # ── flat view: every leg across all tickers in a single table ──
+            # ── flat view: every leg across all tickers in one table (same detail as per-stock) ──
             _flat = []
             for _ftk, _ftl in _by_tk.items():
                 for l in _ftl:
                     _fm = "ITM" if ((l["spot"] > l["K"]) if l["typ"] == "call" else (l["spot"] < l["K"])) else "OTM"
                     _fpp = ((l["cur"] - l["entry"]) / l["entry"] * 100 * (1 if l["qty"] > 0 else -1)) if l["entry"] else 0
+                    # action (with roll suggestion), matching the per-stock leg table
+                    _fac = []
+                    if l["dte"] <= 7: _fac.append(f"{l['dte']}DTE — decide now")
+                    elif l["dte"] <= 21: _fac.append(f"{l['dte']}DTE — plan exit/roll")
+                    if l["side"] == "short" and _fm == "ITM": _fac.append("ITM short — assignment risk")
+                    if _fpp >= 50: _fac.append("up ≥50% — take profit")
+                    elif _fpp <= -50: _fac.append("down ≥50% — cut/roll")
+                    _faction = "; ".join(_fac) if _fac else "hold & monitor"
+                    if _fac and (l["dte"] <= 21 or (l["side"] == "short" and _fm == "ITM")):
+                        _frs = _roll_suggestion(_gp_conn, l)
+                        if _frs: _faction += f" · {_frs}"
+                    # next-session economics (est open, 1σ day range, fill-limit to close)
+                    _fTn = max(l["dte"], 0) / 365.0
+                    _fsig = l["spot"] * l["iv"] * (1 / 252.0) ** 0.5
+                    _fvu = bs_greeks(l["spot"] + _fsig, l["K"], _fTn, _R, l["iv"], l["typ"])["price"]
+                    _fvd = bs_greeks(max(l["spot"] - _fsig, 0.01), l["K"], _fTn, _R, l["iv"], l["typ"])["price"]
+                    _folo, _fohi = min(_fvu, _fvd), max(_fvu, _fvd)
+                    _ftopen = bs_greeks(l["spot"], l["K"], max(l["dte"] - 1, 0) / 365.0, _R, l["iv"], l["typ"])["price"]
+                    _ftopen_disp = ("expired" if l["dte"] <= 0 else
+                                    "~$0.00" if _ftopen < 0.005 else f"${_ftopen:.2f}")
+                    _fbuf = max(0.05, round(l["cur"] * 0.03, 2))
+                    _fclimit = (f"SELL ≤ ${max(l['cur'] - _fbuf, 0.01):.2f}" if l["side"] == "long"
+                                else f"BUY ≥ ${l['cur'] + _fbuf:.2f}")
                     _flat.append({
                         "Ticker": _ftk, "Spot": round(l["spot"], 2),
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${l['K']:.0f}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": _fm,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
-                        "P&L %": round(_fpp), "P&L $": round(l["pnl"]),
+                        "Est Open": _ftopen_disp, "Day L–H": f"${_folo:.2f}–${_fohi:.2f}",
+                        "Close @": _fclimit,
+                        "P&L %": round(_fpp), "P&L $": round(l["pnl"]), "Action": _faction,
                     })
             _fdf = pd.DataFrame(_flat).sort_values(["Ticker", "DTE"])
             st.dataframe(_fdf, hide_index=True, use_container_width=True,
@@ -12034,8 +12059,9 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                              "P&L $": st.column_config.NumberColumn(format="$%d")})
             _ftot = sum(r["P&L $"] for r in _flat)
             st.caption(f"All **{len(_flat)}** legs across **{len(_by_tk)}** tickers · total open "
-                       f"P&L **${_ftot:,.0f}**. Switch to *By stock* for full per-ticker analysis "
-                       "(levels, signals, scenarios, deep analysis).")
+                       f"P&L **${_ftot:,.0f}**.  **Est Open** = value after 1 day decay (*expired*=0DTE, "
+                       "*~\\$0.00*=deep-OTM) · **Day L–H** = 1σ daily range · **Close @** = marketable limit "
+                       "to close. Switch to *By stock* for levels, signals, scenarios & deep analysis.")
         else:
             st.caption("Each stock is a card — flip its toggle to load that stock's full ticker-level "
                        "analysis and legs. **Opened stocks stay open through live refresh** (the page "
