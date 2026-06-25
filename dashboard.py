@@ -2897,6 +2897,164 @@ def _exit_sequence(legs, spot):
     return rows
 
 
+def _pos_analytics(legs, spot, r=0.045):
+    """Breakeven(s), probability-of-profit (POP) and expected value (EV) for a set of legs,
+    evaluated at the NEAREST expiry horizon using an IV-implied lognormal terminal distribution.
+    Also returns the P&L-vs-price curve for the payoff chart. P&L is measured from ENTRY."""
+    if not legs or not spot or spot <= 0:
+        return None
+    iv = float(np.median([max(l["iv"], 0.01) for l in legs]))
+    h_dte = max(min(l["dte"] for l in legs), 0)
+    T = max(h_dte, 0.5) / 365.0
+    sig = max(iv * np.sqrt(T), 1e-4)
+    grid = np.linspace(max(spot * np.exp(-4 * sig), 0.01), spot * np.exp(4 * sig), 501)
+    pnl = np.zeros_like(grid)
+    for l in legs:
+        rem = max(l["dte"] - h_dte, 0) / 365.0
+        if rem <= 0:
+            val = np.maximum(grid - l["K"], 0.0) if l["typ"] == "call" else np.maximum(l["K"] - grid, 0.0)
+        else:
+            val = _bs_price_vec(grid, l["K"], rem, r, l["iv"], l["typ"])
+        pnl += (val - l["entry"]) * l["m"]
+    mu = np.log(spot) + (r - 0.5 * iv * iv) * T
+    pdf = np.exp(-(np.log(grid) - mu) ** 2 / (2 * sig * sig)) / (grid * sig * np.sqrt(2 * np.pi))
+    w = pdf / pdf.sum()
+    pop = float(w[pnl > 0].sum()) * 100.0
+    ev = float((w * pnl).sum())
+    bes = []
+    for i in range(1, len(grid)):
+        if pnl[i - 1] == 0 or pnl[i] == 0 or (pnl[i - 1] < 0) == (pnl[i] < 0):
+            continue
+        x0, x1, y0, y1 = grid[i - 1], grid[i], pnl[i - 1], pnl[i]
+        bes.append(float(x0 - y0 * (x1 - x0) / (y1 - y0)))
+    return {"pop": pop, "ev": ev, "breakevens": bes, "grid": grid, "pnl": pnl,
+            "horizon_dte": h_dte, "iv": iv, "spot": spot}
+
+
+def _pos_payoff_fig(tk, a):
+    """Interactive payoff diagram: P&L vs underlying price with profit (green) / loss (red)
+    zones, the spot marker and breakeven lines — an at-a-glance read on the position."""
+    grid, pnl = a["grid"], a["pnl"]
+    pos = np.where(pnl >= 0, pnl, np.nan)
+    neg = np.where(pnl < 0, pnl, np.nan)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=grid, y=pos, fill="tozeroy", line=dict(color="#00e676", width=2),
+                             name="profit", hovertemplate="$%{x:.0f} → $%{y:,.0f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=grid, y=neg, fill="tozeroy", line=dict(color="#ff5c6c", width=2),
+                             name="loss", hovertemplate="$%{x:.0f} → $%{y:,.0f}<extra></extra>"))
+    fig.add_hline(y=0, line_color="#888")
+    fig.add_vline(x=a["spot"], line_color="#ffffff", line_dash="dot",
+                  annotation_text=f"now ${a['spot']:.0f}", annotation_position="top")
+    for be in a["breakevens"]:
+        fig.add_vline(x=be, line_color="#ffd54f", line_dash="dash",
+                      annotation_text=f"B/E ${be:.0f}", annotation_position="bottom")
+    fig.update_layout(template="plotly_dark", height=300, showlegend=False,
+                      title=f"{tk} payoff by {a['horizon_dte']}DTE · POP {a['pop']:.0f}% · EV ${a['ev']:,.0f}",
+                      xaxis_title="Underlying price", yaxis_title="Position P&L ($)",
+                      margin=dict(t=46, b=10))
+    return fig
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _beta_to_spy(ticker, lookback=60):
+    """Beta of a ticker's daily returns vs SPY from stored stock_daily history (or None)."""
+    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    conn = get_conn()
+    try:
+        a = pd.read_sql(f"SELECT trade_date, close FROM stock_daily WHERE ticker=? ORDER BY {sk}",
+                        conn, params=(ticker.upper(),))
+        s = pd.read_sql(f"SELECT trade_date, close FROM stock_daily WHERE ticker='SPY' ORDER BY {sk}", conn)
+    except Exception:
+        return None
+    finally:
+        conn.close()
+    if len(a) < 20 or len(s) < 20:
+        return None
+    m = a.merge(s, on="trade_date", suffixes=("", "_spy")).tail(lookback + 1)
+    if len(m) < 20:
+        return None
+    ra = pd.to_numeric(m["close"], errors="coerce").pct_change().dropna().values
+    rs = pd.to_numeric(m["close_spy"], errors="coerce").pct_change().dropna().values
+    n = min(len(ra), len(rs))
+    if n < 15 or np.var(rs[-n:]) <= 0:
+        return None
+    return float(np.cov(ra[-n:], rs[-n:])[0, 1] / np.var(rs[-n:]))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _corr_matrix(tickers):
+    """Pairwise return-correlation matrix of the given tickers from stock_daily; also the
+    average off-diagonal correlation (a concentration/diversification gauge)."""
+    import itertools
+    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    conn = get_conn()
+    try:
+        frames = {}
+        for t in tickers:
+            d = pd.read_sql(f"SELECT trade_date, close FROM stock_daily WHERE ticker=? ORDER BY {sk}",
+                            conn, params=(t.upper(),))
+            if len(d) > 20:
+                frames[t] = pd.to_numeric(d["close"], errors="coerce").pct_change().values[-60:]
+    except Exception:
+        return None
+    finally:
+        conn.close()
+    if len(frames) < 2:
+        return None
+    n = min(len(v) for v in frames.values())
+    df = pd.DataFrame({t: v[-n:] for t, v in frames.items()}).dropna()
+    if len(df) < 10:
+        return None
+    c = df.corr()
+    vals = [c.loc[x, y] for x, y in itertools.combinations(c.columns, 2)]
+    return {"matrix": c, "avg": float(np.mean(vals)) if vals else 0.0}
+
+
+def _gp_order_tickets(tl, spot, w, r=0.045):
+    """Concrete, ready-to-place order ideas per leg:
+    • longs → a 'sell to reduce cost' overlay (sell the call/put wall = GEX resistance → turns it
+      into a spread, lowering net cost) plus the modeled MAX value if price reaches its wall / 1σ.
+    • shorts → a buy-to-close ticket. Premiums are per-share BS estimates at current IV."""
+    if not tl or not spot:
+        return []
+    tips = []
+    iv_med = float(np.median([max(l["iv"], 0.01) for l in tl]))
+    h = min(max(min(l["dte"] for l in tl), 1), 10)          # ~1–2 week working horizon
+    em = spot * iv_med * np.sqrt(h / 365.0)
+    for l in tl:
+        K, typ, iv, dte, q, exp = l["K"], l["typ"], max(l["iv"], 0.01), l["dte"], abs(l["qty"]), l["exp"][:10]
+        T, Trem = max(dte, 0) / 365.0, max(dte - h, 0) / 365.0
+        if l["side"] == "long":
+            if typ == "call":
+                k2 = w.get("call_wall") or round(spot + em)
+                tgt = max(w.get("call_wall") or spot * 1.06, spot + em)
+                if k2 and k2 > K:
+                    credit = bs_greeks(spot, k2, T, r, iv, "call").get("price", 0.0)
+                    if credit > 0.02:
+                        tips.append(f"💡 **SELL {q}× {_kf(k2)}C {exp}** ≈ \\${credit:.2f} → makes a "
+                                    f"\\${_kf(K)}/{_kf(k2)} call spread: net cost \\${max(l['entry']-credit,0):.2f} "
+                                    f"(was \\${l['entry']:.2f}), max value \\${k2-K:.2f}/sh.")
+                mv = bs_greeks(tgt, K, Trem, r, iv, "call").get("price", max(tgt - K, 0)) if Trem > 0 else max(tgt - K, 0)
+                tips.append(f"🎯 **{_kf(K)}C** could be worth ≈ **\\${mv:.2f}** if {l['ticker']} reaches "
+                            f"\\${tgt:.0f} (call wall / +1σ) by ~{h}DTE — now \\${l['cur']:.2f}.")
+            else:
+                k2 = w.get("put_wall") or round(spot - em)
+                tgt = min(w.get("put_wall") or spot * 0.94, spot - em)
+                if k2 and k2 < K:
+                    credit = bs_greeks(spot, k2, T, r, iv, "put").get("price", 0.0)
+                    if credit > 0.02:
+                        tips.append(f"💡 **SELL {q}× {_kf(k2)}P {exp}** ≈ \\${credit:.2f} → makes a "
+                                    f"\\${_kf(K)}/{_kf(k2)} put spread: net cost \\${max(l['entry']-credit,0):.2f} "
+                                    f"(was \\${l['entry']:.2f}), max value \\${K-k2:.2f}/sh.")
+                mv = bs_greeks(tgt, K, Trem, r, iv, "put").get("price", max(K - tgt, 0)) if Trem > 0 else max(K - tgt, 0)
+                tips.append(f"🎯 **{_kf(K)}P** could be worth ≈ **\\${mv:.2f}** if {l['ticker']} reaches "
+                            f"\\${tgt:.0f} (put wall / −1σ) by ~{h}DTE — now \\${l['cur']:.2f}.")
+        else:
+            tips.append(f"🛡 **BUY {q}× {_kf(K)}{typ[0].upper()} {exp}** ≈ \\${l['cur']:.2f} to close "
+                        f"(locks \\${l['pnl']:,.0f}).")
+    return tips
+
+
 def _gp_exec_timing(tk, tl, spot, chg):
     """Scenario-based execution timing: close at open vs wait, order type, and the time-of-day
     windows where liquidity/institutions concentrate. Uses volatility, swings and volume."""
@@ -11981,6 +12139,33 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                    "each underlying at its own best/worst). *Unlimited* = a naked long call (uncapped "
                    "upside) or short call (uncapped loss).")
 
+        # ── Beta-weighted (SPY-equivalent) exposure + concentration / correlation + portfolio EV ──
+        _betas = {t: (_beta_to_spy(t) or 1.0) for t in _pbt}
+        _spy_delta = sum(l["ddelta_1pct"] * _betas.get(l["ticker"], 1.0) for l in _legs)
+        _gross_by_t = {}
+        for l in _legs:
+            _g = abs(l["cur"] * l["m"]) if l["side"] == "long" else l["entry"] * abs(l["m"])
+            _gross_by_t[l["ticker"]] = _gross_by_t.get(l["ticker"], 0.0) + _g
+        _gt = sum(_gross_by_t.values()) or 1.0
+        _topt = max(_gross_by_t, key=_gross_by_t.get)
+        _port_ev = sum((_pos_analytics(_ptl, _ptl[0]["spot"]) or {"ev": 0})["ev"] for _ptl in _pbt.values())
+        _bw = st.columns(3)
+        _bw[0].metric("SPY-equiv Δ / +1% SPY", f"${_spy_delta:,.0f}",
+                      "net long market" if _spy_delta >= 0 else "net short market",
+                      delta_color="normal" if _spy_delta >= 0 else "inverse")
+        _bw[1].metric("Top concentration", f"{_topt} {_gross_by_t[_topt]/_gt*100:.0f}%")
+        _bw[2].metric("Portfolio EV (to expiry)", f"${_port_ev:,.0f}",
+                      delta_color="normal" if _port_ev >= 0 else "inverse")
+        _cm = _corr_matrix(list(_pbt))
+        _corr_note = (f" Positions move together (avg correlation **{_cm['avg']:.2f}**) — "
+                      "diversification is thin." if _cm and _cm["avg"] > 0.5 else
+                      (f" Avg position correlation **{_cm['avg']:.2f}**." if _cm else ""))
+        st.caption(f"Beta-weighted Δ: your whole book ≈ **${_spy_delta:,.0f}** P&L per **+1% in SPY**. "
+                   f"Largest name **{_topt}** = {_gross_by_t[_topt]/_gt*100:.0f}% of gross risk.{_corr_note}")
+        if _gross_by_t[_topt] / _gt > 0.6:
+            st.warning(f"🔶 Concentrated: **{_gross_by_t[_topt]/_gt*100:.0f}%** of risk is in **{_topt}**. "
+                       "One gap there drives the whole book — consider trimming or hedging.")
+
         # ── Portfolio risk: 1-day historical VaR + concentration ──
         st.markdown("#### 🛡️ Portfolio risk")
         _var = _portfolio_var(_legs)
@@ -12144,6 +12329,35 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         "Close @": _fclimit, "Max P": _fmt_maxp(_flb), "Max L": _fmt_maxl(_flb),
                         "P&L %": round(_fpp), "P&L $": round(l["pnl"]), "Action": _faction,
                     })
+            # ── ticker + portfolio summary (max P/L, P&L, POP, EV) ──
+            _sumrows = []
+            _spmaxp = _spmaxl = _spev = _sppnl = 0.0; _spup = _spdn = False
+            for _stk, _stl in _by_tk.items():
+                _sb2 = _combo_bounds(_stl, _stl[0]["spot"])
+                _sa2 = _pos_analytics(_stl, _stl[0]["spot"])
+                _spnl2 = sum(x["pnl"] for x in _stl); _sppnl += _spnl2
+                if _sb2:
+                    _spmaxp += _sb2["max_profit"]; _spmaxl += _sb2["max_loss"]
+                    _spup = _spup or _sb2["up_profit_unlimited"]; _spdn = _spdn or _sb2["up_loss_unlimited"]
+                if _sa2:
+                    _spev += _sa2["ev"]
+                _sumrows.append({
+                    "Ticker": _stk, "Legs": len(_stl), "Open P&L": round(_spnl2),
+                    "Max P": _fmt_maxp(_sb2), "Max L": _fmt_maxl(_sb2),
+                    "POP": f"{_sa2['pop']:.0f}%" if _sa2 else "—",
+                    "EV": round(_sa2["ev"]) if _sa2 else None,
+                    "Breakeven": ", ".join(f"${b:.0f}" for b in _sa2["breakevens"]) if (_sa2 and _sa2["breakevens"]) else "—"})
+            _sumrows.append({
+                "Ticker": "▣ PORTFOLIO", "Legs": sum(len(t) for t in _by_tk.values()),
+                "Open P&L": round(_sppnl), "Max P": "Unlimited" if _spup else f"${_spmaxp:,.0f}",
+                "Max L": "Unlimited" if _spdn else f"${_spmaxl:,.0f}", "POP": "—",
+                "EV": round(_spev), "Breakeven": "—"})
+            st.markdown("**📊 Summary — ticker & portfolio level** (max profit/loss to expiry, POP, EV)")
+            st.dataframe(pd.DataFrame(_sumrows), hide_index=True, use_container_width=True,
+                         column_config={"Open P&L": st.column_config.NumberColumn(format="$%d"),
+                                        "EV": st.column_config.NumberColumn(format="$%d")})
+
+            st.markdown("**🧾 Per-leg detail**")
             _fdf = pd.DataFrame(_flat).sort_values(["Ticker", "DTE"])
             st.dataframe(_fdf, hide_index=True, use_container_width=True,
                          column_config={
@@ -12262,6 +12476,30 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     st.dataframe(pd.DataFrame(_sm), hide_index=True, use_container_width=True,
                                  column_config={"P&L $": st.column_config.NumberColumn(format="$%d")})
 
+                # ── Breakeven · POP · EV + interactive payoff diagram ──
+                _pa = _pos_analytics(_tl, _spot)
+                if _pa:
+                    _be_s = ", ".join(f"${b:.0f}" for b in _pa["breakevens"]) or "—"
+                    _evc = "🟢" if _pa["ev"] > 0 else "🔴"
+                    st.markdown((f"📈 **POP {_pa['pop']:.0f}%** · {_evc} **EV ${_pa['ev']:,.0f}** · "
+                                 f"breakeven {_be_s} · max profit {_fmt_maxp(_pb)} · max loss {_fmt_maxl(_pb)} "
+                                 f"(by {_pa['horizon_dte']}DTE)").replace("$", "\\$"))
+                    try:
+                        st.plotly_chart(_pos_payoff_fig(_tk, _pa), use_container_width=True)
+                    except Exception:
+                        pass
+
+                # ── Ready-to-place order ideas (cost-reduction sells · max value · close) ──
+                _tix = _gp_order_tickets(_tl, _spot, _w)
+                if _tix:
+                    with st.expander("🧾 Ready-to-place order ideas — sell to cut cost · max value · close",
+                                     expanded=False):
+                        for _t in _tix:
+                            st.markdown(_t)
+                        st.caption("Premiums are Black-Scholes estimates at current IV — confirm live bid/ask "
+                                   "before sending. Selling the wall caps upside but cuts cost; price often "
+                                   "gravitates to the call/put wall (GEX magnet).")
+
                 # ── 🎯 Which signal to trust (inline accuracy → priority) ──
                 _sa_gp = _signal_accuracy_backtest(_tk, 5)
                 _tr_rows = []
@@ -12304,9 +12542,16 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _sb.append(f"📅ER {_earn['date']} ({_earn['days']}d)")
                 if _sb:
                     st.markdown("  ·  ".join(_sb))
-                if _earn and _earn["days"] <= 14:
-                    st.warning(f"📅 {_tk} earnings in {_earn['days']}d — binary gap risk; size down / "
-                               "close before the print.")
+                if _earn:
+                    _spanning = [l for l in _tl if _earn["days"] <= l["dte"]]
+                    if _spanning:
+                        _legtxt = ", ".join(f"${_kf(l['K'])}{l['typ'][0].upper()}" for l in _spanning)
+                        st.warning(f"📅 {_tk} earnings {_earn['date']} ({_earn['days']}d) lands **before "
+                                   f"expiry** for: {_legtxt} — binary gap + IV-crush risk on "
+                                   f"{'these legs' if len(_spanning) > 1 else 'this leg'}.")
+                    elif _earn["days"] <= 14:
+                        st.warning(f"📅 {_tk} earnings in {_earn['days']}d — binary gap risk; size down / "
+                                   "close before the print.")
 
                 # ── Signals + Plain-English read + Hold/Close debate (collapsed to save space) ──
                 with st.expander("📋 Read · ⚖️ Hold-vs-Close · 🎯 Which signal to trust", expanded=False):
