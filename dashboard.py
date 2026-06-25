@@ -2833,6 +2833,70 @@ def _gp_montecarlo(legs, horizon_days=1, n=10000, rho=0.6, r=0.045):
             "best": float(tot.max()), "samples": tot, "n": n, "horizon": horizon_days}
 
 
+def _combo_bounds(legs, spot, n=600):
+    """Theoretical max profit / max loss of a set of legs held to EXPIRY, scanned over an
+    underlying-price grid. Flags unbounded upside profit (naked long call) or unbounded loss
+    (naked short call). Works for one leg (strike level) or many (position/portfolio level)."""
+    if not legs or not spot or spot <= 0:
+        return None
+    ks = [float(l["K"]) for l in legs]
+    hi = max(3.0 * spot, max(ks) * 1.5, spot + 1.0)
+    grid = np.linspace(0.01, hi, n)
+    pnl = np.zeros(n)
+    for l in legs:
+        intr = (np.maximum(grid - l["K"], 0.0) if l["typ"] == "call"
+                else np.maximum(l["K"] - grid, 0.0))
+        pnl += (intr - l["entry"]) * l["m"]
+    slope_top = float(pnl[-1] - pnl[-2])
+    return {"max_profit": float(pnl.max()), "max_loss": float(pnl.min()),
+            "up_profit_unlimited": slope_top > 1e-6,    # rising at top = unlimited upside (long call)
+            "up_loss_unlimited": slope_top < -1e-6}     # falling at top = unlimited loss (short call)
+
+
+def _fmt_maxp(b):
+    """'Unlimited' for uncapped upside, else $max_profit."""
+    if not b:
+        return "—"
+    return "Unlimited" if b["up_profit_unlimited"] else f"${b['max_profit']:,.0f}"
+
+
+def _fmt_maxl(b):
+    """'Unlimited' for uncapped downside loss, else $max_loss."""
+    if not b:
+        return "—"
+    return "Unlimited" if b["up_loss_unlimited"] else f"${b['max_loss']:,.0f}"
+
+
+def _exit_sequence(legs, spot):
+    """Rank legs by how urgently to CLOSE them (capture profit / cut risk first). Returns a
+    score-sorted list of dicts with the leg, an urgency score, the reason, and its bounds."""
+    rows = []
+    for l in legs:
+        b = _combo_bounds([l], spot) or {"max_profit": 0.0, "max_loss": 0.0,
+                                         "up_profit_unlimited": False, "up_loss_unlimited": False}
+        maxp = b["max_profit"]
+        cap = (l["pnl"] / maxp) if maxp > 1e-6 else (1.0 if l["pnl"] > 0 else 0.0)
+        itm = (spot > l["K"]) if l["typ"] == "call" else (spot < l["K"])
+        pnl_pct = ((l["cur"] - l["entry"]) / l["entry"] * 100 * (1 if l["qty"] > 0 else -1)) if l["entry"] else 0.0
+        score = 0.0; why = []
+        if l["side"] == "short" and itm and l["dte"] <= 10:
+            score += 4.0; why.append("short ITM near expiry — assignment risk")
+        if l["dte"] <= 5:
+            score += 2.5; why.append(f"{l['dte']}DTE — expiry risk")
+        if l["pnl"] > 0 and cap >= 0.6:
+            score += 2.5; why.append(f"{cap*100:.0f}% of max profit captured — little left to gain")
+        elif l["pnl"] > 0 and l["dte"] <= 10:
+            score += 1.5; why.append("in profit into expiry — lock it")
+        if pnl_pct <= -50 and l["dte"] <= 21:
+            score += 1.5; why.append("down ≥50% with limited time — cut / roll")
+        if l.get("pos_theta", 0) < 0 and l["pnl"] < 0 and l["dte"] <= 30:
+            score += 0.5; why.append("paying theta while losing")
+        rows.append({"leg": l, "score": score, "cap": cap, "bounds": b,
+                     "why": "; ".join(why) if why else "no urgency — hold / let it work"})
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows
+
+
 def _gp_exec_timing(tk, tl, spot, chg):
     """Scenario-based execution timing: close at open vs wait, order type, and the time-of-day
     windows where liquidity/institutions concentrate. Uses volatility, swings and volume."""
@@ -11898,6 +11962,25 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                    f"Time decay runs **${_net_theta:,.0f}/day**. "
                    f"A +1 vol-point IV change ≈ **${_net_vega:,.0f}**.")
 
+        # ── Portfolio theoretical max profit / max loss (held to expiry) ──
+        _pbt = {}
+        for l in _legs:
+            _pbt.setdefault(l["ticker"], []).append(l)
+        _pmaxp = _pmaxl = 0.0; _p_up_unl = _p_dn_unl = False
+        for _ptk, _ptl in _pbt.items():
+            _bb = _combo_bounds(_ptl, _ptl[0]["spot"])
+            if _bb:
+                _pmaxp += _bb["max_profit"]; _pmaxl += _bb["max_loss"]
+                _p_up_unl = _p_up_unl or _bb["up_profit_unlimited"]
+                _p_dn_unl = _p_dn_unl or _bb["up_loss_unlimited"]
+        _mm = st.columns(2)
+        _mm[0].metric("Portfolio max profit (to expiry)", "Unlimited" if _p_up_unl else f"${_pmaxp:,.0f}")
+        _mm[1].metric("Portfolio max loss (to expiry)", "Unlimited" if _p_dn_unl else f"${_pmaxl:,.0f}",
+                      delta_color="inverse")
+        st.caption("Theoretical bound if every position is held to expiration (summed across tickers, "
+                   "each underlying at its own best/worst). *Unlimited* = a naked long call (uncapped "
+                   "upside) or short call (uncapped loss).")
+
         # ── Portfolio risk: 1-day historical VaR + concentration ──
         st.markdown("#### 🛡️ Portfolio risk")
         _var = _portfolio_var(_legs)
@@ -12051,13 +12134,14 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _fbuf = max(0.05, round(l["cur"] * 0.03, 2))
                     _fclimit = (f"SELL ≤ ${max(l['cur'] - _fbuf, 0.01):.2f}" if l["side"] == "long"
                                 else f"BUY ≥ ${l['cur'] + _fbuf:.2f}")
+                    _flb = _combo_bounds([l], l["spot"])
                     _flat.append({
                         "Ticker": _ftk, "Spot": round(l["spot"], 2),
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${_kf(l['K'])}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": _fm,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
                         "Est Open": _ftopen_disp, "Day L–H": f"${_folo:.2f}–${_fohi:.2f}",
-                        "Close @": _fclimit,
+                        "Close @": _fclimit, "Max P": _fmt_maxp(_flb), "Max L": _fmt_maxl(_flb),
                         "P&L %": round(_fpp), "P&L $": round(l["pnl"]), "Action": _faction,
                     })
             _fdf = pd.DataFrame(_flat).sort_values(["Ticker", "DTE"])
@@ -12110,6 +12194,10 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 _mc[1].metric("1-day exp. move", f"±${_em:.2f}", f"±{_em/_spot*100:.1f}%")
                 _mc[2].metric("Δ per +1%", f"${_tk_dd:,.0f}", _daylbl)
                 _mc[3].metric("Theta / day", f"${_tk_th:,.0f}")
+                _pb = _combo_bounds(_tl, _spot)
+                if _pb:
+                    st.caption(f"💰 **{_tk} position** (to expiry): max profit **{_fmt_maxp(_pb)}** · "
+                               f"max loss **{_fmt_maxl(_pb)}** · open P&L ${_tk_pnl:,.0f}".replace("$", "\\$"))
 
                 # ── lazy gate: in 'By stock' mode load heavy detail on demand; in 'All positions'
                 #    mode every section auto-renders for every stock ──
@@ -12442,20 +12530,38 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _buf = max(0.05, round(l["cur"] * 0.03, 2))     # ~3% / min 5c marketable buffer
                     _climit = (f"SELL ≤ ${max(l['cur'] - _buf, 0.01):.2f}" if l["side"] == "long"
                                else f"BUY ≥ ${l['cur'] + _buf:.2f}")
+                    _lb = _combo_bounds([l], l["spot"])
                     _rows.append({
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${_kf(l['K'])}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": money,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
                         "Est Open": _topen_disp, "Day L–H": f"${_olo:.2f}–${_ohi:.2f}",
-                        "Close @": _climit,
+                        "Close @": _climit, "Max P": _fmt_maxp(_lb), "Max L": _fmt_maxl(_lb),
                         "P&L %": round(pnl_pct), "P&L $": round(l["pnl"]), "Action": action,
                     })
                 st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True,
                              column_config={"P&L %": st.column_config.NumberColumn(format="%d%%")})
                 st.caption("**Est Open** = modeled value at the next session if price is flat (one day of "
-                           "decay). *expired* = 0DTE (gone by next open); *~\\$0.00* = deep-OTM, decaying to "
-                           "worthless. **Day L–H** = expected option range on a 1σ daily move. "
-                           "**Close @** = suggested marketable limit to get filled (sell-to-close longs / buy-to-close shorts).")
+                           "decay). *expired* = 0DTE; *~\\$0.00* = deep-OTM. **Day L–H** = 1σ daily range. "
+                           "**Close @** = marketable limit to close. **Max P / Max L** = theoretical "
+                           "max profit / loss for that leg held to expiry (*Unlimited* = uncapped).")
+
+                # ── Best exit order: what to close first to lock profit / cut risk ──
+                _xseq = _exit_sequence(_tl, _spot)
+                _xact = [r for r in _xseq if r["score"] > 0]
+                st.markdown("**🎯 Best exit order — what to close first**")
+                if _xact:
+                    for _i, _r in enumerate(_xact, 1):
+                        _xl = _r["leg"]
+                        st.markdown(
+                            (f"{_i}. **{_xl['side']} {abs(_xl['qty'])}× ${_kf(_xl['K'])}"
+                             f"{_xl['typ'][0].upper()}** ({_xl['dte']}DTE) — {_r['why']}").replace("$", "\\$"))
+                    _xhold = [r for r in _xseq if r["score"] == 0]
+                    if _xhold:
+                        st.caption("Hold / let work: " + ", ".join(
+                            f"${_kf(r['leg']['K'])}{r['leg']['typ'][0].upper()}" for r in _xhold).replace("$", "\\$"))
+                else:
+                    st.caption("No urgent exits — all legs can be held / left to work for now.")
 
         # ── Morning checklist ──
         st.markdown("#### ✅ Tomorrow's open — action checklist")
