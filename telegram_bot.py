@@ -15829,6 +15829,141 @@ def _plan_trust(conn, tk, hold=5, thr=0.005):
     return f"  🎯 Track record: {body} → trust {best[0]}"
 
 
+def _kfb(k):
+    """Strike formatter that keeps half-dollar strikes (385→'385', 617.5→'617.5')."""
+    try:
+        k = float(k)
+    except Exception:
+        return str(k)
+    return f"{k:.0f}" if k == int(k) else f"{k:.2f}".rstrip("0").rstrip(".")
+
+
+def _bar(pct, n=10):
+    """Tiny emoji gauge for Telegram, e.g. 60% → 🟩🟩🟩🟩🟩🟩⬜⬜⬜⬜."""
+    f = int(round(max(0.0, min(100.0, pct)) / 100 * n))
+    return "🟩" * f + "⬜" * (n - f)
+
+
+def _bs_vec(S, K, T, r, sig, typ):
+    S = np.maximum(S, 1e-9)
+    if T <= 0:
+        return np.maximum(S - K, 0.0) if typ == "call" else np.maximum(K - S, 0.0)
+    d1 = (np.log(S / K) + (r + 0.5 * sig * sig) * T) / (sig * np.sqrt(T)); d2 = d1 - sig * np.sqrt(T)
+    if typ == "call":
+        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+
+def _pl_bounds(legs, spot, n=400):
+    """Max profit / max loss to expiry over a price grid; flags unbounded up-profit / up-loss."""
+    if not legs or not spot or spot <= 0:
+        return None
+    ks = [float(l["K"]) for l in legs]; hi = max(3 * spot, max(ks) * 1.5, spot + 1)
+    grid = np.linspace(0.01, hi, n); pnl = np.zeros(n)
+    for l in legs:
+        intr = np.maximum(grid - l["K"], 0.0) if l["typ"] == "call" else np.maximum(l["K"] - grid, 0.0)
+        pnl += (intr - l["entry"]) * l["m"]
+    s = float(pnl[-1] - pnl[-2])
+    return {"maxp": float(pnl.max()), "maxl": float(pnl.min()), "up": s > 1e-6, "dn": s < -1e-6}
+
+
+def _pl_mp(b):
+    return "∞" if (b and b["up"]) else (f"${b['maxp']:,.0f}" if b else "—")
+
+
+def _pl_ml(b):
+    return "∞" if (b and b["dn"]) else (f"${b['maxl']:,.0f}" if b else "—")
+
+
+def _pl_analytics(legs, spot, r=0.045):
+    """Breakeven(s), POP and EV at the nearest expiry via an IV-implied lognormal."""
+    if not legs or not spot or spot <= 0:
+        return None
+    iv = float(np.median([max(l["iv"], .01) for l in legs])); h = max(min(l["dte"] for l in legs), 0)
+    T = max(h, .5) / 365.0; sig = max(iv * np.sqrt(T), 1e-4)
+    grid = np.linspace(max(spot * np.exp(-4 * sig), .01), spot * np.exp(4 * sig), 401); pnl = np.zeros_like(grid)
+    for l in legs:
+        rem = max(l["dte"] - h, 0) / 365.0
+        val = (np.maximum(grid - l["K"], 0.0) if l["typ"] == "call" else np.maximum(l["K"] - grid, 0.0)) \
+            if rem <= 0 else _bs_vec(grid, l["K"], rem, r, l["iv"], l["typ"])
+        pnl += (val - l["entry"]) * l["m"]
+    mu = np.log(spot) + (r - .5 * iv * iv) * T
+    pdf = np.exp(-(np.log(grid) - mu) ** 2 / (2 * sig * sig)) / (grid * sig * np.sqrt(2 * np.pi)); w = pdf / pdf.sum()
+    bes = [float(grid[i - 1] - pnl[i - 1] * (grid[i] - grid[i - 1]) / (pnl[i] - pnl[i - 1]))
+           for i in range(1, len(grid)) if (pnl[i - 1] < 0) != (pnl[i] < 0)]
+    return {"pop": float(w[pnl > 0].sum()) * 100, "ev": float((w * pnl).sum()), "be": bes, "h": h}
+
+
+def _pl_exit(legs, spot):
+    """Rank legs by urgency to close first (assignment / expiry / profit captured / cut-loss)."""
+    rows = []
+    for l in legs:
+        b = _pl_bounds([l], spot) or {"maxp": 0.0}
+        cap = (l["pnl"] / b["maxp"]) if b["maxp"] > 1e-6 else (1.0 if l["pnl"] > 0 else 0.0)
+        itm = (spot > l["K"]) if l["typ"] == "call" else (spot < l["K"])
+        pnlp = ((l["cur"] - l["entry"]) / l["entry"] * 100 * (1 if l["qty"] > 0 else -1)) if l["entry"] else 0
+        sc = 0.0; why = []
+        if l["side"] == "short" and itm and l["dte"] <= 10: sc += 4; why.append("short ITM assign-risk")
+        if l["dte"] <= 5: sc += 2.5; why.append(f"{l['dte']}DTE expiry")
+        if l["pnl"] > 0 and cap >= 0.6: sc += 2.5; why.append(f"{cap*100:.0f}% captured")
+        elif l["pnl"] > 0 and l["dte"] <= 10: sc += 1.5; why.append("profit into expiry")
+        if pnlp <= -50 and l["dte"] <= 21: sc += 1.5; why.append("down≥50% cut/roll")
+        rows.append({"l": l, "sc": sc, "why": "; ".join(why) or "hold"})
+    rows.sort(key=lambda r: r["sc"], reverse=True)
+    return rows
+
+
+def _pl_tickets(legs, spot, cw, pw, r=0.045):
+    """Ready-to-place order ideas: sell-to-cut-cost overlays at the wall, max value, buy-to-close."""
+    tips = []
+    iv = float(np.median([max(l["iv"], .01) for l in legs])); h = min(max(min(l["dte"] for l in legs), 1), 10)
+    em = spot * iv * np.sqrt(h / 365.0)
+    for l in legs:
+        K, typ, ivl, dte, q = l["K"], l["typ"], max(l["iv"], .01), l["dte"], abs(l["qty"])
+        T, Trem = max(dte, 0) / 365.0, max(dte - h, 0) / 365.0
+        if l["side"] == "long":
+            if typ == "call":
+                k2 = cw or round(spot + em); tgt = max(cw or spot * 1.06, spot + em)
+                if k2 and k2 > K:
+                    c = bs_greeks(spot, k2, T, r, ivl, "call").get("price", 0)
+                    if c > 0.02:
+                        tips.append(f"SELL {q}× {_kfb(k2)}C ≈${c:.2f} → spread, cost ${max(l['entry']-c,0):.2f}")
+                mv = bs_greeks(tgt, K, Trem, r, ivl, "call").get("price", max(tgt - K, 0)) if Trem > 0 else max(tgt - K, 0)
+                tips.append(f"{_kfb(K)}C max ≈${mv:.2f} @ ${tgt:.0f} (now ${l['cur']:.2f})")
+            else:
+                k2 = pw or round(spot - em); tgt = min(pw or spot * 0.94, spot - em)
+                if k2 and k2 < K:
+                    c = bs_greeks(spot, k2, T, r, ivl, "put").get("price", 0)
+                    if c > 0.02:
+                        tips.append(f"SELL {q}× {_kfb(k2)}P ≈${c:.2f} → spread, cost ${max(l['entry']-c,0):.2f}")
+                mv = bs_greeks(tgt, K, Trem, r, ivl, "put").get("price", max(K - tgt, 0)) if Trem > 0 else max(K - tgt, 0)
+                tips.append(f"{_kfb(K)}P max ≈${mv:.2f} @ ${tgt:.0f} (now ${l['cur']:.2f})")
+        else:
+            tips.append(f"BUY {q}× {_kfb(K)}{typ[0].upper()} ≈${l['cur']:.2f} close (P&L ${l['pnl']:,.0f})")
+    return tips
+
+
+def _pl_beta(conn, tk, lookback=60):
+    """Beta of ticker vs SPY from stock_daily (defaults to 1.0)."""
+    try:
+        sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+        a = pd.read_sql(f"SELECT trade_date,close FROM stock_daily WHERE ticker=? ORDER BY {sk}", conn, params=(tk.upper(),))
+        s = pd.read_sql(f"SELECT trade_date,close FROM stock_daily WHERE ticker='SPY' ORDER BY {sk}", conn)
+    except Exception:
+        return 1.0
+    if len(a) < 20 or len(s) < 20:
+        return 1.0
+    m = a.merge(s, on="trade_date", suffixes=("", "_s")).tail(lookback + 1)
+    if len(m) < 20:
+        return 1.0
+    ra = pd.to_numeric(m["close"], errors="coerce").pct_change().dropna().values
+    rs = pd.to_numeric(m["close_s"], errors="coerce").pct_change().dropna().values
+    n = min(len(ra), len(rs))
+    if n < 15 or np.var(rs[-n:]) <= 0:
+        return 1.0
+    return float(np.cov(ra[-n:], rs[-n:])[0, 1] / np.var(rs[-n:]))
+
+
 def _next_day_plan(conn):
     """Condensed whole-portfolio next-day plan: regime + Greeks + per-stock levels,
     expected move, StockTwits sentiment, per-leg actions, and a morning checklist."""
@@ -15851,6 +15986,9 @@ def _next_day_plan(conn):
     for _, t in tr.iterrows():
         by.setdefault(str(t["ticker"]).upper(), []).append(t)
     net_dd = net_th = 0.0
+    port_maxp = port_maxl = port_ev = spy_dd = 0.0
+    port_up = port_dn = False
+    gross_by = {}
     checklist, blocks = [], []
     for tk, legs in by.items():
         spot = _gex_spot(conn, tk) or _last_price(tk)
@@ -15863,7 +16001,7 @@ def _next_day_plan(conn):
             pass
         cw, pw = g.get("call_wall"), g.get("put_wall")
         tk_dd = tk_th = 0.0
-        ivs, leglines = [], []
+        ivs, leglines, tk_legs = [], [], []
         for t in legs:
             typ = "call" if str(t["option_type"]).lower().startswith("c") else "put"
             K = float(t["strike"] or 0); qty = int(t["quantity"] or 0); exp = str(t["expiry"])
@@ -15899,6 +16037,9 @@ def _next_day_plan(conn):
                             f"{dte}d {money} {pnlp:+.0f}% → {a}")
             if acts:
                 checklist.append(f"{tk} ${K:.0f}{typ[0].upper()}: {a}")
+            tk_legs.append({"K": K, "typ": typ, "entry": entry, "m": m, "iv": iv,
+                            "dte": dte, "cur": cur, "side": side, "qty": qty, "exp": exp,
+                            "ticker": tk, "spot": spot, "pnl": (cur - entry) * m})
         net_dd += tk_dd; net_th += tk_th
         ivm = sorted(ivs)[len(ivs) // 2] if ivs else 0.30
         em = spot * ivm * (1 / 252.0) ** 0.5
@@ -15931,8 +16072,41 @@ def _next_day_plan(conn):
         _trl = _plan_trust(conn, tk)
         if _trl:
             extra.append(_trl)
-        blocks.append(head + "\n" + ("\n".join(extra) + "\n" if extra else "") + "\n".join(leglines))
+        _b = _pl_bounds(tk_legs, spot)
+        _a = _pl_analytics(tk_legs, spot)
+        if _b:
+            port_maxp += _b["maxp"]; port_maxl += _b["maxl"]
+            port_up = port_up or _b["up"]; port_dn = port_dn or _b["dn"]
+        if _a:
+            port_ev += _a["ev"]
+        try:
+            spy_dd += tk_dd * _pl_beta(conn, tk)
+        except Exception:
+            spy_dd += tk_dd
+        for _l in tk_legs:
+            _g = abs(_l["cur"] * _l["m"]) if _l["side"] == "long" else _l["entry"] * abs(_l["m"])
+            gross_by[tk] = gross_by.get(tk, 0.0) + _g
+        ana = []
+        if _b:
+            ana.append(f"  💰 MaxP {_pl_mp(_b)} · MaxL {_pl_ml(_b)}")
+        if _a:
+            _be = ", ".join(f"${x:.0f}" for x in _a["be"]) or "—"
+            ana.append(f"  📈 POP {_a['pop']:.0f}% {_bar(_a['pop'])} · EV ${_a['ev']:,.0f} · B/E {_be}")
+        _xs = [r for r in _pl_exit(tk_legs, spot) if r["sc"] > 0][:2]
+        if _xs:
+            ana.append("  🎯 Close first: " + " | ".join(
+                f"{_kfb(r['l']['K'])}{r['l']['typ'][0].upper()} ({r['why']})" for r in _xs))
+        for _t in _pl_tickets(tk_legs, spot, cw, pw)[:4]:
+            ana.append("  🧾 " + _t)
+        blocks.append(head + "\n" + ("\n".join(extra) + "\n" if extra else "")
+                      + "\n".join(leglines) + ("\n" + "\n".join(ana) if ana else ""))
     L.append(f"Net Δ/+1% <b>${net_dd:,.0f}</b> · Θ/day <b>${net_th:,.0f}</b>")
+    L.append(f"📊 Port MaxP <b>{'∞' if port_up else f'${port_maxp:,.0f}'}</b> · "
+             f"MaxL <b>{'∞' if port_dn else f'${port_maxl:,.0f}'}</b> · EV <b>${port_ev:,.0f}</b>")
+    _conc = (f" · top {max(gross_by, key=gross_by.get)} "
+             f"{gross_by[max(gross_by, key=gross_by.get)]/sum(gross_by.values())*100:.0f}%"
+             if gross_by and sum(gross_by.values()) > 0 else "")
+    L.append(f"📐 SPY-Δ <b>${spy_dd:,.0f}</b>/+1% SPY{_conc}")
     L.append("")
     L += blocks
     if checklist:
