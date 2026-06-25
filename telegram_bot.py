@@ -16218,11 +16218,56 @@ def _wrap_pick(seed, opts):
     return opts[int(seed) % len(opts)]
 
 
+_WRAP_BLS = {"CUUR0000SA0": "CPI", "CUUR0000SA0L1E": "Core CPI"}
+_WRAP_MACRO_CACHE = {"ts": 0.0, "data": None}
+
+
+def _wrap_macro():
+    """Latest CPI / Core CPI YoY from the BLS public API (keyless, free, cached 6h).
+    Returns {label: {yoy, month}} or None — the macro print line, no fabrication."""
+    import time as _t, json as _json, urllib.request as _ur, datetime as _dtm
+    now = _t.time()
+    if _WRAP_MACRO_CACHE["data"] is not None and now - _WRAP_MACRO_CACHE["ts"] < 21600:
+        return _WRAP_MACRO_CACHE["data"]
+    try:
+        yr = _dtm.datetime.now().year
+        body = _json.dumps({"seriesid": list(_WRAP_BLS), "startyear": str(yr - 2),
+                            "endyear": str(yr)}).encode()
+        req = _ur.Request("https://api.bls.gov/publicAPI/v1/timeseries/data/", data=body,
+                          headers={"Content-Type": "application/json", "User-Agent": "nyse-data/1.0"})
+        j = _json.load(_ur.urlopen(req, timeout=15))
+        out = {}
+        for s in j.get("Results", {}).get("series", []):
+            sid = s.get("seriesID")
+            pts = []
+            for d in s.get("data", []):
+                if not str(d.get("period", "")).startswith("M"):
+                    continue
+                try:
+                    pts.append((d["year"], d["period"], float(d["value"])))
+                except Exception:
+                    pass
+            if len(pts) < 13:
+                continue
+            latest = pts[0]
+            prior = next((p for p in pts if p[1] == latest[1] and int(p[0]) == int(latest[0]) - 1), None)
+            if not prior or prior[2] == 0:
+                continue
+            mname = _dtm.date(2000, int(latest[1][1:]), 1).strftime("%b")
+            out[_WRAP_BLS[sid]] = {"yoy": (latest[2] / prior[2] - 1) * 100, "month": f"{mname} {latest[0]}"}
+        if out:  # only cache on success so transient failures retry next call
+            _WRAP_MACRO_CACHE["ts"] = now
+            _WRAP_MACRO_CACHE["data"] = out
+        return out or None
+    except Exception:
+        return None
+
+
 def wrap_facts(conn, universe_cap=120):
     """Compute the structured fact pack for the market wrap."""
     F = {"ts": datetime.now(), "indices": [], "lead": None, "shape": None,
          "vix": None, "cross": [], "lev": [], "movers_up": [], "movers_dn": [],
-         "breadth": None, "options": None, "book": None, "catalyst": None}
+         "breadth": None, "options": None, "book": None, "catalyst": None, "macro": None}
 
     for sym, name, cap in _WRAP_IDX:
         q = _wrap_quote(sym)
@@ -16239,6 +16284,8 @@ def wrap_facts(conn, universe_cap=120):
     vq = _wrap_quote("^VIX")
     if vq:
         F["vix"] = vq
+
+    F["macro"] = _wrap_macro()
 
     for sym, name, kind in _WRAP_CROSS:
         q = _wrap_quote(sym)
@@ -16398,6 +16445,15 @@ def wrap_narrative(F, html=True):
         L.append("\n🌪 " + b("VOLATILITY") + "\n"
                  f"The VIX is at {v['last']:.1f} ({v['pct']:+.1f}%), {tone}. "
                  + ("Above 20 signals real stress." if v["last"] >= 20 else "Still contained below 20."))
+
+    if F.get("macro"):
+        m = F["macro"]
+        bits = [f"{k} {m[k]['yoy']:.1f}% YoY ({m[k]['month']})" for k in ("CPI", "Core CPI") if k in m]
+        if bits:
+            hot = m.get("CPI", {}).get("yoy", 0)
+            vs = "well above" if hot >= 3 else "above" if hot > 2.3 else "near"
+            L.append("\n📅 " + b("MACRO BACKDROP") + "\n"
+                     f"Inflation backdrop: {', '.join(bits)} — {vs} the Fed's 2% target.")
 
     if F["cross"]:
         parts = []
