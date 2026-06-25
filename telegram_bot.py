@@ -10606,6 +10606,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await mom_view(query)
         elif data == "plan_view":
             await plan_view(query)
+        elif data.startswith("plan_chart_"):
+            await plan_chart_view(query, data.split("plan_chart_", 1)[1])
         elif data == "mom_recompute":
             await mom_recompute_view(query)
         elif data == "mom_help":
@@ -15671,9 +15673,20 @@ def _plan_prem(conn, tk, K, exp, typ):
         pass
     return None
 
-def _kb_plan():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="plan_view"),
-                                  InlineKeyboardButton("⬅️ Hub", callback_data="hub_menu")]])
+def _kb_plan(conn=None):
+    rows = []
+    if conn is not None:
+        try:
+            tks = [r[0] for r in conn.execute(
+                "SELECT DISTINCT UPPER(ticker) FROM trades WHERE status='OPEN' ORDER BY 1").fetchall()]
+            btns = [InlineKeyboardButton(f"📈 {t}", callback_data=f"plan_chart_{t}") for t in tks[:9]]
+            for i in range(0, len(btns), 3):
+                rows.append(btns[i:i + 3])
+        except Exception:
+            pass
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="plan_view"),
+                 InlineKeyboardButton("⬅️ Hub", callback_data="hub_menu")])
+    return InlineKeyboardMarkup(rows)
 
 def _plan_oi_flow(conn, tk, spot):
     """Compact OI-flow line for /plan: net build, vol-PCR, buy/sell/hedge split, calendar tilt."""
@@ -16123,17 +16136,129 @@ async def plan_command(update, ctx):
     conn = get_conn()
     try:
         txt = _next_day_plan(conn)
+        kb = _kb_plan(conn)
     finally:
         conn.close()
-    await update.message.reply_text(txt, parse_mode=H, reply_markup=_kb_plan())
+    await update.message.reply_text(txt, parse_mode=H, reply_markup=kb)
 
 async def plan_view(query):
     conn = get_conn()
     try:
         txt = _next_day_plan(conn)
+        kb = _kb_plan(conn)
     finally:
         conn.close()
-    await query.message.reply_text(txt, parse_mode=H, reply_markup=_kb_plan())
+    await query.message.reply_text(txt, parse_mode=H, reply_markup=kb)
+
+
+def _plan_legs_for(conn, tk):
+    """Rebuild structured legs (+ spot, walls) for one ticker's open positions."""
+    R = 0.045
+    try:
+        tr = pd.read_sql("SELECT ticker,option_type,strike,quantity,expiry,entry_price,entry_iv "
+                         "FROM trades WHERE status='OPEN' AND UPPER(ticker)=?", conn, params=(tk.upper(),))
+    except Exception:
+        return [], None, None, None
+    if tr is None or tr.empty:
+        return [], None, None, None
+    spot = _gex_spot(conn, tk) or _last_price(tk)
+    if not spot:
+        return [], None, None, None
+    cw = pw = None
+    try:
+        g = _compute_gex(tk, conn, spot); cw, pw = g.get("call_wall"), g.get("put_wall")
+    except Exception:
+        pass
+    legs = []
+    for _, t in tr.iterrows():
+        typ = "call" if str(t["option_type"]).lower().startswith("c") else "put"
+        K = float(t["strike"] or 0); qty = int(t["quantity"] or 0); exp = str(t["expiry"])
+        dte = None
+        for fmt in ("%Y-%m-%d", "%m-%d-%Y"):
+            try:
+                dte = (datetime.strptime(exp, fmt) - datetime.now()).days; break
+            except Exception:
+                pass
+        if dte is None or K <= 0 or qty == 0:
+            continue
+        T = max(dte, 0) / 365.0; entry = float(t["entry_price"] or 0)
+        prem = _plan_prem(conn, tk, K, exp, typ)
+        iv = _implied_vol_hp(prem, spot, K, T, R) if (prem and T > 0) else (float(t["entry_iv"] or 0) or 0.30)
+        gg = bs_greeks(spot, K, T, R, iv, typ) if T > 0 else {"price": (prem or entry)}
+        cur = prem if prem else gg.get("price", entry); m = qty * 100
+        legs.append({"K": K, "typ": typ, "entry": entry, "m": m, "iv": iv, "dte": dte, "cur": cur,
+                     "side": "short" if qty < 0 else "long", "qty": qty, "exp": exp,
+                     "ticker": tk, "spot": spot, "pnl": (cur - entry) * m})
+    return legs, spot, cw, pw
+
+
+def _plan_payoff_png(tk, legs, spot, cw, pw):
+    """Render a payoff-at-expiry PNG (profit/loss zones, spot, breakevens, walls)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    ks = [l["K"] for l in legs]
+    lo = max(min(min(ks), spot) * 0.7, 0.01); hi = max(max(ks), spot) * 1.3
+    prices = np.linspace(lo, hi, 300)
+    payoff = np.zeros_like(prices)
+    for l in legs:
+        intr = np.maximum(prices - l["K"], 0) if l["typ"] == "call" else np.maximum(l["K"] - prices, 0)
+        payoff += (intr - l["entry"]) * l["m"]
+    a = _pl_analytics(legs, spot)
+    fig, ax = plt.subplots(figsize=(9, 4.6))
+    ax.plot(prices, payoff, color="#3d8bff", lw=2.2)
+    ax.axhline(0, color="gray", ls="--", lw=0.8)
+    ax.axvline(spot, color="orange", ls=":", lw=1.3, label=f"Spot ${spot:.0f}")
+    ax.fill_between(prices, payoff, 0, where=(payoff >= 0), alpha=0.25, color="green")
+    ax.fill_between(prices, payoff, 0, where=(payoff < 0), alpha=0.25, color="red")
+    for be in (a["be"] if a else []):
+        ax.axvline(be, color="purple", ls="--", lw=1)
+        ax.text(be, ax.get_ylim()[0] * 0.92, f"BE ${be:.0f}", color="purple", fontsize=7, ha="center")
+    if cw:
+        ax.axvline(cw, color="#c62828", ls="-.", lw=0.9, alpha=0.6, label=f"Call wall ${cw:.0f}")
+    if pw:
+        ax.axvline(pw, color="#2e7d32", ls="-.", lw=0.9, alpha=0.6, label=f"Put wall ${pw:.0f}")
+    sub = f"Max P ${payoff.max():+,.0f} · Max L ${payoff.min():+,.0f}"
+    if a:
+        sub += f" · POP {a['pop']:.0f}% · EV ${a['ev']:,.0f}"
+    ax.set_title(f"{tk} payoff at expiry\n{sub}", fontsize=10)
+    ax.set_xlabel("Price at expiry"); ax.set_ylabel("P&L ($)")
+    ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+    plt.tight_layout()
+    buf = BytesIO(); fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    plt.close(fig); buf.seek(0)
+    return buf
+
+
+async def plan_chart_view(query, tk):
+    """Send a per-ticker payoff chart + breakeven/POP/EV + order tickets."""
+    conn = get_conn()
+    try:
+        legs, spot, cw, pw = _plan_legs_for(conn, tk)
+    finally:
+        conn.close()
+    if not legs or not spot:
+        await query.message.reply_text(f"No open {tk} position.", parse_mode=H)
+        return
+    try:
+        buf = _plan_payoff_png(tk, legs, spot, cw, pw)
+    except Exception as e:
+        await query.message.reply_text(f"Chart error for {tk}: {e}")
+        return
+    b = _pl_bounds(legs, spot); a = _pl_analytics(legs, spot)
+    cap = [f"📈 <b>{tk}</b> ${spot:.2f} · payoff at expiry"]
+    if b:
+        cap.append(f"💰 Max P {_pl_mp(b)} · Max L {_pl_ml(b)}")
+    if a:
+        be = ", ".join(f"${x:.0f}" for x in a["be"]) or "—"
+        cap.append(f"📊 POP {a['pop']:.0f}% · EV ${a['ev']:,.0f} · B/E {be}")
+    tix = _pl_tickets(legs, spot, cw, pw)
+    if tix:
+        cap.append("\n🧾 <b>Order ideas:</b>")
+        for t in tix[:5]:
+            cap.append("• " + t)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to plan", callback_data="plan_view")]])
+    await query.message.reply_photo(buf, caption="\n".join(cap)[:1000], parse_mode=H, reply_markup=kb)
 
 async def plan_alert(ctx):
     """Pre-market auto-send of the next-day game plan."""
