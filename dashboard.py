@@ -363,9 +363,10 @@ def _get_ah_price(ticker: str) -> dict:
         result["spot_reg"] = reg
 
         post = 0.0; pre = 0.0
-        # The slow .info call is only needed for pre/post-market prices; during regular hours
-        # (or when closed) fast_info.last_price is enough — skip .info to keep live refresh fast.
-        if _market_state() in ("PRE", "AFTER", "UNKNOWN"):
+        # When the market is OPEN, fast_info.last_price IS the live price — skip the slow .info.
+        # Any other time (pre/after/closed/unknown) fetch .info so we show the latest pre/post
+        # (after-hours) price rather than the stale regular close.
+        if _market_state() != "OPEN":
             try:
                 _di = yf.Ticker(ticker).info
                 post = float(_di.get("postMarketPrice") or 0)
@@ -3055,6 +3056,35 @@ def _gp_order_tickets(tl, spot, w, r=0.045):
     return tips
 
 
+def _gp_booking_notes(tl, spot):
+    """When a leg has captured most of its achievable profit, advise booking it with a concrete
+    pre-market limit price — short premium nearly decayed (buy-to-close cheap) or a profitable
+    long near expiry / up big (sell-to-close). Returns (notes, checklist_items)."""
+    notes, chk = [], []
+    for l in tl:
+        q = abs(l["qty"]); buf = max(0.05, round(l["cur"] * 0.05, 2))
+        tag = f"${_kf(l['K'])}{l['typ'][0].upper()}"
+        if l["side"] == "short":
+            maxp = l["entry"] * q * 100                      # premium collected = max profit (capped)
+            cap = (l["pnl"] / maxp) if maxp > 1e-6 else 0.0
+            if l["pnl"] > 0 and cap >= 0.75:
+                lim = max(round(l["cur"] + buf, 2), 0.01)
+                notes.append(f"✅ **{tag} (short)** — **{cap*100:.0f}% of max premium (${maxp:,.0f}) captured.** "
+                             f"Place **BUY {q}× to close @ ${lim:.2f}** pre-market to lock it — the last "
+                             "few cents aren't worth a reversal/assignment.")
+                chk.append(f"{l['ticker']} {tag}: book profit — BUY-to-close @ ${lim:.2f}")
+        else:
+            pnlp = ((l["cur"] - l["entry"]) / l["entry"] * 100) if l["entry"] else 0
+            if l["pnl"] > 0 and (pnlp >= 50 or l["dte"] <= 5):
+                lim = max(round(l["cur"] - buf, 2), 0.01)
+                why = (f"up {pnlp:+.0f}%" + (f", only {l['dte']}DTE" if l["dte"] <= 5 else ""))
+                notes.append(f"✅ **{tag} (long)** — {why}. Place **SELL {q}× to close @ ${lim:.2f}** "
+                             f"pre-market (target ≈ mark ${l['cur']:.2f}; scale the limit down if it "
+                             "doesn't fill) to bank the gain before theta/reversal.")
+                chk.append(f"{l['ticker']} {tag}: take profit — SELL-to-close @ ${lim:.2f}")
+    return notes, chk
+
+
 def _gp_exec_timing(tk, tl, spot, chg):
     """Scenario-based execution timing: close at open vs wait, order type, and the time-of-day
     windows where liquidity/institutions concentrate. Uses volatility, swings and volume."""
@@ -4140,8 +4170,16 @@ with st.sidebar:
     page = st.radio("Navigate", _NAV_GROUPS[_cat], label_visibility="collapsed")
 
     st.markdown("---")
-    # ── Global live auto-refresh (in-place, no page reload) — applies to every page ──
+    # ── Global price source — applies to every page via _spot() ──
     _gms = _market_state()
+    _src_now = {"OPEN": "🔴 LIVE", "PRE": "🌅 PM", "AFTER": "🌙 AH",
+                "CLOSED": "🌙 AH (last)", "UNKNOWN": "🔴 live"}.get(_gms, "live")
+    st.checkbox(f"🔴 Live / AH prices  ·  now: {_src_now}",
+                value=st.session_state.get("use_ah", True), key="use_ah",
+                help="ON (default): live prices while the market is open, after-hours/pre-market (AH/PM) "
+                     "when it's closed. UNCHECK to freeze on the last EOD close instead.")
+
+    # ── Global live auto-refresh (in-place, no page reload) — applies to every page ──
     _gms_badge = {"OPEN": "🟢 Market OPEN", "PRE": "🌅 Pre-market", "AFTER": "🌙 After-hours",
                   "CLOSED": "🔴 Market closed", "UNKNOWN": "⏱ —"}.get(_gms, _gms)
     _gar1, _gar2 = st.columns([1, 1])
@@ -11807,20 +11845,15 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                      "UNKNOWN": "⏱ Session unknown"}.get(_ms, _ms)
         # Price source is AUTOMATIC: live during RTH, AH/PM when extended hours, EOD when closed.
         # The only control is an EOD override.
-        _gp_eod_col, _gp_ah_note = st.columns([1.2, 3.0])
-        _gp_force_eod = _gp_eod_col.toggle(
-            "🕘 EOD close", value=st.session_state.get("gp_force_eod", False), key="gp_force_eod",
-            help="Default: live prices during market hours, after-hours/pre-market (AH/PM) when "
-                 "extended, EOD close when fully closed. Turn this ON to force the last EOD close.")
-        _gp_use_ah = not _gp_force_eod
-        st.session_state["use_ah"] = _gp_use_ah          # drives _spot() everywhere
-        # auto source label for this session
+        # Price source is the GLOBAL sidebar checkbox (🔴 Live/AH prices). Here we just read it.
+        _gp_use_ah = bool(st.session_state.get("use_ah", True))
+        _gp_force_eod = not _gp_use_ah
         _src_tag = "EOD" if _gp_force_eod else {"OPEN": "LIVE", "PRE": "PM", "AFTER": "AH",
-                                                "CLOSED": "EOD", "UNKNOWN": "EOD"}.get(_ms, "LIVE")
+                                                "CLOSED": "AH", "UNKNOWN": "LIVE"}.get(_ms, "LIVE")
         _src_emoji = {"LIVE": "🔴", "PM": "🌅", "AH": "🌙", "EOD": "🕘"}.get(_src_tag, "🔴")
-        _gp_ah_note.caption(f"**{_ms_badge}** · price source: {_src_emoji} **{_src_tag}**"
-                            + (" (forced)" if _gp_force_eod else " (auto)")
-                            + "  ·  live refresh is in the sidebar (🔁 Live refresh), applies to every page.")
+        st.caption(f"**{_ms_badge}** · price source: {_src_emoji} **{_src_tag}**"
+                   + (" (forced EOD)" if _gp_force_eod else " (auto)")
+                   + "  ·  toggle Live/AH vs EOD and live-refresh in the sidebar (applies to every page).")
         _gp_conn = get_conn()
         try:
             _gp_tr = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", _gp_conn)
@@ -12055,7 +12088,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _dte = None
             for _fmt in ("%Y-%m-%d", "%m-%d-%Y"):
                 try:
-                    _dte = (datetime.strptime(_exp, _fmt) - datetime.now()).days; break
+                    # date-only diff: an option expiring tomorrow is 1 DTE all day, not 0 in the afternoon
+                    _dte = (datetime.strptime(_exp, _fmt).date() - datetime.now().date()).days; break
                 except Exception:
                     pass
             if _eod_spot is None or _dte is None or _K <= 0 or _qty == 0:
@@ -12282,6 +12316,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             for p in _gp_patterns(_tk, _ps, None, None):
                 if p["sig"] in ("BULL", "BEAR") and any(k in p["name"] for k in ("flag", "cross")):
                     _checklist.append(f"**{_tk}** {p['name']}: {p['why']}")
+            _, _bchk = _gp_booking_notes(_tl, _ps)
+            _checklist += _bchk
         # register tickers so the live heartbeat only reruns when these prices actually move
         st.session_state["_live_tickers"] = list(_by_tk)
 
@@ -12314,7 +12350,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _fvd = bs_greeks(max(l["spot"] - _fsig, 0.01), l["K"], _fTn, _R, l["iv"], l["typ"])["price"]
                     _folo, _fohi = min(_fvu, _fvd), max(_fvu, _fvd)
                     _ftopen = bs_greeks(l["spot"], l["K"], max(l["dte"] - 1, 0) / 365.0, _R, l["iv"], l["typ"])["price"]
-                    _ftopen_disp = ("expired" if l["dte"] <= 0 else
+                    _ftopen_disp = ("expired" if l["dte"] < 0 else "exp today" if l["dte"] == 0 else
                                     "~$0.00" if _ftopen < 0.005 else f"${_ftopen:.2f}")
                     _fbuf = max(0.05, round(l["cur"] * 0.03, 2))
                     _fclimit = (f"SELL ≤ ${max(l['cur'] - _fbuf, 0.01):.2f}" if l["side"] == "long"
@@ -12488,6 +12524,11 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         st.plotly_chart(_pos_payoff_fig(_tk, _pa), use_container_width=True)
                     except Exception:
                         pass
+
+                # ── Profit-booking advice (capped max reached / long up big or near expiry) ──
+                _bnotes, _ = _gp_booking_notes(_tl, _spot)
+                for _bn in _bnotes:
+                    st.success(_bn.replace("$", "\\$"))
 
                 # ── Ready-to-place order ideas (cost-reduction sells · max value · close) ──
                 _tix = _gp_order_tickets(_tl, _spot, _w)
@@ -12765,9 +12806,11 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _vd = bs_greeks(max(l["spot"] - _sig, 0.01), l["K"], _Tn, _R, l["iv"], l["typ"])["price"]
                     _olo, _ohi = min(_vu, _vd), max(_vu, _vd)
                     _topen = bs_greeks(l["spot"], l["K"], max(l["dte"] - 1, 0) / 365.0, _R, l["iv"], l["typ"])["price"]
-                    # label clearly: a 0DTE option has expired by the next session; sub-penny reads "~0"
-                    if l["dte"] <= 0:
+                    # label clearly: <0 truly expired; 0 = expires today; sub-penny reads "~0"
+                    if l["dte"] < 0:
                         _topen_disp = "expired"
+                    elif l["dte"] == 0:
+                        _topen_disp = "exp today"
                     elif _topen < 0.005:
                         _topen_disp = "~$0.00"
                     else:
