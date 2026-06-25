@@ -61,6 +61,17 @@ def compute_walls(df, spot=None):
         return out
     return out
 
+
+def _kf(k):
+    """Format an option strike without rounding away half-dollar (or finer) strikes:
+    385.0 → '385', 617.5 → '617.5', 62.5 → '62.5'."""
+    try:
+        k = float(k)
+    except Exception:
+        return str(k)
+    return f"{k:.0f}" if k == int(k) else (f"{k:.2f}".rstrip("0").rstrip("."))
+
+
 import re
 
 # Sanitize strings passed to Streamlit `markdown`/`write` to strip , style, and class
@@ -2052,9 +2063,9 @@ def _gp_writeup(tk, spot, em, walls, r1, s1, dd, th, nw, tlegs, stt=None):
     for l in tlegs:
         money = "ITM" if ((l["spot"] > l["K"]) if l["typ"] == "call" else (l["spot"] < l["K"])) else "OTM"
         if l["side"] == "short" and money == "ITM":
-            risks.append(f"short ${l['K']:.0f}{l['typ'][0].upper()} is ITM (assignment risk)")
+            risks.append(f"short ${_kf(l['K'])}{l['typ'][0].upper()} is ITM (assignment risk)")
         if l["dte"] <= 7:
-            risks.append(f"${l['K']:.0f}{l['typ'][0].upper()} has {l['dte']}DTE (theta/gamma spike)")
+            risks.append(f"${_kf(l['K'])}{l['typ'][0].upper()} has {l['dte']}DTE (theta/gamma spike)")
     if risks:
         P.append("Watch: " + "; ".join(dict.fromkeys(risks)) + ".")
     if cw and pw and pw < spot < cw and th >= 0:
@@ -2254,7 +2265,7 @@ def _gp_oi_analytics(tk, spot):
     fdf["tot_chg"] = fdf["change_OI_Call"].abs() + fdf["change_OI_Put"].abs()
     top_strikes = fdf.sort_values("tot_chg", ascending=False).head(8)
     strike_rows = [{
-        "Strike": f"${r['strike']:.0f}",
+        "Strike": f"${_kf(r['strike'])}",
         "vs spot": f"{(r['strike']/spot-1)*100:+.1f}%",
         "Call ΔOI": int(r["change_OI_Call"]), "Put ΔOI": int(r["change_OI_Put"]),
         "Read": ("call build" if r["change_OI_Call"] > abs(r["change_OI_Put"]) and r["change_OI_Call"] > 0
@@ -11610,7 +11621,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 _na_c1, _na_c2, _na_c3, _na_c4 = st.columns(4)
                 _na_typ = _na_c1.selectbox("Type", ["call", "put"], key="gp_add_typ")
                 _na_side = _na_c2.selectbox("Side", ["long", "short"], key="gp_add_side")
-                _na_K = _na_c3.number_input("Strike", min_value=0.0, step=1.0, key="gp_add_K")
+                _na_K = _na_c3.number_input("Strike", min_value=0.0, step=0.5, format="%.2f", key="gp_add_K")
                 _na_qty = _na_c4.number_input("Contracts", min_value=1, step=1, value=1, key="gp_add_qty")
                 _na_c5, _na_c6, _na_c7 = st.columns(3)
                 _na_exp = _na_c5.text_input("Expiry (YYYY-MM-DD)", key="gp_add_exp", placeholder="2026-07-18")
@@ -11647,7 +11658,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 else:
                     def _trlabel(r):
                         _s = "🟢" if str(r["status"]).upper() == "OPEN" else "⚪"
-                        return (f"{_s} {r['ticker']} ${float(r['strike'] or 0):.0f}"
+                        return (f"{_s} {r['ticker']} ${_kf(r['strike'] or 0)}"
                                 f"{str(r['option_type'])[0].upper()} {r['expiry']} ×{int(r['quantity'] or 0)} "
                                 f"· {r['status']} (id {int(r['trade_id'])})")
                     _em_map = {_trlabel(r): int(r["trade_id"]) for _, r in _all_tr.iterrows()}
@@ -11675,7 +11686,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _ed_side = _e3.selectbox("Side", ["long", "short"],
                                              index=0 if _cur_qty >= 0 else 1, key=f"ed_side_{_tid}")
                     _e4, _e5, _e6 = st.columns(3)
-                    _ed_K = _e4.number_input("Strike", min_value=0.0, step=1.0, value=_sv("strike"), key=f"ed_K_{_tid}")
+                    _ed_K = _e4.number_input("Strike", min_value=0.0, step=0.5, format="%.2f", value=_sv("strike"), key=f"ed_K_{_tid}")
                     _ed_qty = _e5.number_input("Contracts", min_value=1, step=1, value=max(abs(_cur_qty), 1), key=f"ed_qty_{_tid}")
                     _ed_px = _e6.number_input("Entry premium", min_value=0.0, step=0.05, value=_sv("entry_price"), key=f"ed_px_{_tid}")
                     _e7, _e8, _e9 = st.columns(3)
@@ -11999,7 +12010,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     if l["dte"] <= 21 or (l["side"] == "short" and _mny == "ITM"):
                         _rs = _roll_suggestion(_gp_conn, l)
                         if _rs: _act += f" · {_rs}"
-                    _checklist.append(f"**{_tk} ${l['K']:.0f}{l['typ'][0].upper()}** ({l['side']}, {l['dte']}DTE): {_act}")
+                    _checklist.append(f"**{_tk} ${_kf(l['K'])}{l['typ'][0].upper()}** ({l['side']}, {l['dte']}DTE): {_act}")
             for p in _gp_patterns(_tk, _ps, None, None):
                 if p["sig"] in ("BULL", "BEAR") and any(k in p["name"] for k in ("flag", "cross")):
                     _checklist.append(f"**{_tk}** {p['name']}: {p['why']}")
@@ -12042,7 +12053,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                                 else f"BUY ≥ ${l['cur'] + _fbuf:.2f}")
                     _flat.append({
                         "Ticker": _ftk, "Spot": round(l["spot"], 2),
-                        "Leg": f"{l['side']} {abs(l['qty'])}× ${l['K']:.0f}{l['typ'][0].upper()}",
+                        "Leg": f"{l['side']} {abs(l['qty'])}× ${_kf(l['K'])}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": _fm,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
                         "Est Open": _ftopen_disp, "Day L–H": f"${_folo:.2f}–${_fohi:.2f}",
@@ -12126,10 +12137,10 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         pass
                 _stt = _stocktwits_sentiment(_tk)
                 _lv = []
-                if _w.get("put_wall"): _lv.append(f"🟩 put wall ${_w['put_wall']:.0f}")
-                if _w.get("call_wall"): _lv.append(f"🟥 call wall ${_w['call_wall']:.0f}")
-                if _s1: _lv.append(f"S1 ${_s1:.0f}")
-                if _r1: _lv.append(f"R1 ${_r1:.0f}")
+                if _w.get("put_wall"): _lv.append(f"🟩 put wall ${_kf(_w['put_wall'])}")
+                if _w.get("call_wall"): _lv.append(f"🟥 call wall ${_kf(_w['call_wall'])}")
+                if _s1: _lv.append(f"S1 ${_kf(_s1)}")
+                if _r1: _lv.append(f"R1 ${_kf(_r1)}")
                 if _lv:
                     st.markdown("**Key levels:** " + " · ".join(_lv))
                 # dual-class siblings trade separate option chains — keep them distinct, never merge
@@ -12432,7 +12443,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _climit = (f"SELL ≤ ${max(l['cur'] - _buf, 0.01):.2f}" if l["side"] == "long"
                                else f"BUY ≥ ${l['cur'] + _buf:.2f}")
                     _rows.append({
-                        "Leg": f"{l['side']} {abs(l['qty'])}× ${l['K']:.0f}{l['typ'][0].upper()}",
+                        "Leg": f"{l['side']} {abs(l['qty'])}× ${_kf(l['K'])}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": money,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
                         "Est Open": _topen_disp, "Day L–H": f"${_olo:.2f}–${_ohi:.2f}",
