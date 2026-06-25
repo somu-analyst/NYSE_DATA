@@ -4524,19 +4524,17 @@ with st.sidebar:
 
 # ── Page header helper ──────────────────────────────────────────────
 def _page_header(title: str, help_text: str = ""):
-    """Render a styled page header with AH toggle top-right and optional help pill."""
+    """Render a styled page header + a read-only price-mode badge top-right.
+    The actual toggle lives once in the sidebar (key='use_ah') — duplicating the
+    widget here would raise StreamlitDuplicateElementKey, so this only mirrors it."""
     h1, h_ah, h2 = st.columns([4, 2, 1])
     with h1:
         st.markdown(f"<h2>{title}</h2>", unsafe_allow_html=True)
     with h_ah:
-        st.toggle(
-            "🌙 AH Prices",
-            value=st.session_state.get("use_ah", False),
-            key="use_ah",
-            help="Use After-Hours / Pre-Market price for all spot, premium & P&L calculations across every page.",
-        )
-        _mode_lbl = "🌙 After-Hours mode" if st.session_state.get("use_ah") else "☀️ EOD close mode"
-        st.caption(_mode_lbl)
+        if st.session_state.get("use_ah", True):
+            st.caption("🔴 Live / AH prices  ·  *toggle in sidebar*")
+        else:
+            st.caption("☀️ EOD close mode  ·  *toggle in sidebar*")
     if help_text:
         with h2:
             with st.popover("ℹ️ Help"):
