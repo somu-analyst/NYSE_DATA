@@ -2102,7 +2102,8 @@ MAIN_MENU_KB = InlineKeyboardMarkup([
      InlineKeyboardButton("🧩 More",       callback_data="menu_more")],
     # ── MACRO & EVENTS ───────────────────────────────────────────
     [InlineKeyboardButton("━━  MACRO & EVENTS  ━━━━━━━━", callback_data="noop")],
-    [InlineKeyboardButton("📡 Macro/Event Hub", callback_data="hub_menu")],
+    [InlineKeyboardButton("📡 Macro/Event Hub", callback_data="hub_menu"),
+     InlineKeyboardButton("📰 Market Wrap", callback_data="wrap_view")],
     # ── AI + SETTINGS ────────────────────────────────────────────
     [InlineKeyboardButton("━━  AI & TOOLS  ━━━━━━━━━━━━", callback_data="noop")],
     [InlineKeyboardButton("🤖 Ask AI",     callback_data="menu_ai_chat"),
@@ -10797,6 +10798,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await mom_view(query)
         elif data == "plan_view":
             await plan_view(query)
+        elif data == "wrap_view":
+            await wrap_view(query)
         elif data == "plan_port_chart":
             await plan_port_chart_view(query)
         elif data.startswith("plan_chart_"):
@@ -20045,6 +20048,394 @@ def _next_day_plan(conn):
     L.append("<i>Educational, not advice.</i>")
     return "\n".join(L)
 
+# ═══════════════════════════════════════════════════════════════════
+# ── MARKET WRAP — "what just happened" narrator (data-driven, offline)
+#    Builds a Kobeissi-style write-up from the DB + yfinance. Only ever
+#    states numbers the system actually computes — it never invents figures
+#    (no fabricated liquidation $, ETF AUM or econ prints).
+# ═══════════════════════════════════════════════════════════════════
+_WRAP_IDX = [("^GSPC", "S&P 500", 52e12), ("^NDX", "Nasdaq 100", 32e12),
+             ("^IXIC", "Nasdaq Comp", None), ("^DJI", "Dow", None), ("^RUT", "Russell 2000", None)]
+_WRAP_CROSS = [("BTC-USD", "Bitcoin", "crypto"), ("ETH-USD", "Ethereum", "crypto"),
+               ("GC=F", "Gold", "metal"), ("CL=F", "Crude oil", "energy"),
+               ("DX-Y.NYB", "US Dollar", "fx"), ("^TNX", "10Y yield", "rates")]
+_WRAP_LEV = [("TQQQ", "3x Nasdaq", 3), ("SOXL", "3x Semis", 3), ("SPXL", "3x S&P", 3),
+             ("TSLL", "2x Tesla", 2), ("SOXS", "-3x Semis", -3), ("SQQQ", "-3x Nasdaq", -3)]
+
+
+def _wrap_hist(sym, period="6d", interval="1d"):
+    try:
+        h = yf.Ticker(sym).history(period=period, interval=interval)
+        return h if h is not None and not h.empty else None
+    except Exception:
+        return None
+
+
+def _wrap_quote(sym):
+    """{last, prev, pct, pts} from daily history (last row = current/partial day)."""
+    h = _wrap_hist(sym, "6d", "1d")
+    if h is None or len(h) < 2:
+        return None
+    c = h["Close"].dropna()
+    if len(c) < 2:
+        return None
+    last, prev = float(c.iloc[-1]), float(c.iloc[-2])
+    if prev == 0:
+        return None
+    return {"last": last, "prev": prev, "pct": (last / prev - 1) * 100, "pts": last - prev}
+
+
+def _wrap_intraday_shape(sym):
+    """Opening behaviour + sharpest peak→trough drawdown window from 5m bars."""
+    h = _wrap_hist(sym, "1d", "5m")
+    if h is None or len(h) < 3:
+        return None
+    highs = h["High"].cummax()
+    dd = (h["Low"] - highs) / highs
+    i_tr = dd.idxmin()
+    i_pk = h.loc[:i_tr, "High"].idxmax()
+    mins = max(int((i_tr - i_pk).total_seconds() // 60), 0)
+    return {"open": float(h["Open"].iloc[0]), "cur": float(h["Close"].iloc[-1]),
+            "hi": float(h["High"].max()), "lo": float(h["Low"].min()),
+            "dd_pct": float(dd.min()) * 100, "dd_mins": mins,
+            "peak": float(highs.loc[i_tr]), "trough": float(h["Low"].loc[i_tr]),
+            "t_peak": i_pk, "t_trough": i_tr}
+
+
+def _wrap_fmt_t(ts):
+    try:
+        return ts.strftime("%I:%M %p ET").lstrip("0")
+    except Exception:
+        return str(ts)
+
+
+def _wrap_money(x):
+    a = abs(x)
+    if a >= 1e12:
+        return f"${x/1e12:.2f}T"
+    if a >= 1e9:
+        return f"${x/1e9:.1f}B"
+    if a >= 1e6:
+        return f"${x/1e6:.0f}M"
+    return f"${x:,.0f}"
+
+
+def _wrap_pick(seed, opts):
+    """Deterministic-but-varied phrasing pick (no RNG dependency)."""
+    return opts[int(seed) % len(opts)]
+
+
+def wrap_facts(conn, universe_cap=120):
+    """Compute the structured fact pack for the market wrap."""
+    F = {"ts": datetime.now(), "indices": [], "lead": None, "shape": None,
+         "vix": None, "cross": [], "lev": [], "movers_up": [], "movers_dn": [],
+         "breadth": None, "options": None, "book": None, "catalyst": None}
+
+    for sym, name, cap in _WRAP_IDX:
+        q = _wrap_quote(sym)
+        if not q:
+            continue
+        d = {"sym": sym, "name": name, "cap": cap, **q}
+        if cap:
+            d["dollars"] = cap * (q["pct"] / 100.0)
+        F["indices"].append(d)
+    if F["indices"]:
+        F["lead"] = max(F["indices"], key=lambda d: abs(d["pct"]))
+        F["shape"] = _wrap_intraday_shape(F["lead"]["sym"])
+
+    vq = _wrap_quote("^VIX")
+    if vq:
+        F["vix"] = vq
+
+    for sym, name, kind in _WRAP_CROSS:
+        q = _wrap_quote(sym)
+        if q:
+            F["cross"].append({"name": name, "kind": kind, **q})
+
+    for sym, name, mult in _WRAP_LEV:
+        q = _wrap_quote(sym)
+        if q:
+            F["lev"].append({"sym": sym, "name": name, "mult": mult, **q})
+
+    try:
+        tks = [r[0] for r in conn.execute("SELECT DISTINCT ticker FROM stock_daily").fetchall()][:universe_cap]
+    except Exception:
+        tks = []
+    rows = []
+    if tks:
+        try:
+            data = yf.download(tks, period="6d", interval="1d", group_by="ticker",
+                               threads=True, progress=False)
+            for t in tks:
+                try:
+                    c = data[t]["Close"].dropna() if len(tks) > 1 else data["Close"].dropna()
+                    if len(c) >= 2 and float(c.iloc[-2]) > 0:
+                        rows.append({"t": t, "pct": (float(c.iloc[-1]) / float(c.iloc[-2]) - 1) * 100,
+                                     "last": float(c.iloc[-1])})
+                except Exception:
+                    continue
+        except Exception:
+            rows = []
+    if not rows:  # DB EOD fallback
+        sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+        for t in tks:
+            try:
+                c = pd.read_sql(f"SELECT close FROM stock_daily WHERE ticker=? ORDER BY {sk} DESC LIMIT 2",
+                                conn, params=(t,))
+                v = pd.to_numeric(c["close"], errors="coerce").dropna().tolist()
+                if len(v) >= 2 and v[1] > 0:
+                    rows.append({"t": t, "pct": (v[0] / v[1] - 1) * 100, "last": v[0]})
+            except Exception:
+                continue
+    if rows:
+        up = sum(1 for r in rows if r["pct"] > 0); dn = sum(1 for r in rows if r["pct"] < 0)
+        F["breadth"] = {"up": up, "dn": dn, "n": len(rows)}
+        rows.sort(key=lambda r: r["pct"])
+        F["movers_dn"] = rows[:5]
+        F["movers_up"] = rows[-5:][::-1]
+
+    cand = None
+    if F["movers_dn"] or F["movers_up"]:
+        cand = max(F["movers_dn"] + F["movers_up"], key=lambda r: abs(r["pct"]))["t"]
+    if cand:
+        try:
+            for n in (yf.Ticker(cand).news or []):
+                title = (n.get("content", {}) or {}).get("title") or n.get("title")
+                if title:
+                    F["catalyst"] = {"ticker": cand, "title": title}
+                    break
+        except Exception:
+            pass
+
+    try:
+        sk = "substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2)"
+        snap = conn.execute(f"SELECT trade_date_now FROM options_change ORDER BY {sk} DESC LIMIT 1").fetchone()
+        if snap:
+            d0 = snap[0]
+            agg = pd.read_sql(
+                "SELECT ticker, SUM(change_OI_Call) cc, SUM(change_OI_Put) cp, "
+                "SUM(openInt_Call_now) oc, SUM(openInt_Put_now) op "
+                "FROM options_change WHERE trade_date_now=? GROUP BY ticker", conn, params=(d0,))
+            if not agg.empty:
+                agg = agg[~agg["ticker"].astype(str).str.startswith("^")]
+                tc = float(agg["cc"].sum()); tp = float(agg["cp"].sum())
+                oc = float(agg["oc"].sum()); op = float(agg["op"].sum())
+                agg["net"] = agg["cp"].fillna(0) - agg["cc"].fillna(0)
+                put_heavy = agg.reindex(agg["net"].sort_values(ascending=False).index).head(3)
+                F["options"] = {"date": d0, "call_chg": tc, "put_chg": tp,
+                                "pcr": (op / oc) if oc else None,
+                                "put_heavy": list(put_heavy["ticker"])}
+    except Exception:
+        pass
+
+    try:
+        tr = pd.read_sql("SELECT ticker,option_type,quantity FROM trades WHERE status='OPEN'", conn)
+        if not tr.empty:
+            mv = {r["t"]: r["pct"] for r in rows}
+            bt = {}
+            for _, t in tr.iterrows():
+                tk = str(t["ticker"]).upper()
+                pc = mv.get(tk)
+                if pc is None:
+                    q = _wrap_quote(tk); pc = q["pct"] if q else 0.0
+                typ = "call" if str(t["option_type"]).lower().startswith("c") else "put"
+                qty = int(t["quantity"] or 0)
+                bt.setdefault(tk, {"pct": pc, "dir": 0})
+                bt[tk]["dir"] += (1 if (typ == "call") == (qty > 0) else -1)
+            F["book"] = {"tickers": [{"tk": k, "pct": v["pct"], "dir": v["dir"]} for k, v in bt.items()]}
+    except Exception:
+        pass
+
+    return F
+
+
+def wrap_narrative(F, html=True):
+    """Render the fact pack into a punchy 'what just happened' write-up."""
+    b = (lambda s: f"<b>{s}</b>") if html else (lambda s: s)
+    esc = (lambda s: str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")) if html else (lambda s: s)
+    L = []
+    lead = F["lead"]; shape = F["shape"]
+    seed = int(F["ts"].strftime("%Y%m%d"))
+
+    if lead:
+        d = lead["pct"]
+        big_swing = bool(shape and abs(shape["dd_pct"]) >= 1.2 and shape["dd_mins"] > 0)
+        if big_swing:
+            op = (shape["open"] / lead["prev"] - 1) * 100
+            dollar = f" — an estimated {_wrap_money(abs(lead['dollars']))} in value" if lead.get("dollars") else ""
+            hooks = [
+                f"In just {shape['dd_mins']} minutes, the {lead['name']} cratered {shape['dd_pct']:.1f}% from its "
+                f"intraday peak{dollar}. It opened {op:+.1f}% and is now {d:+.1f}% — a violent round trip on the day.",
+                f"A textbook volatility shock: the {lead['name']} ran to {op:+.1f}% at the open, then dumped "
+                f"{shape['dd_pct']:.1f}% in {shape['dd_mins']} minutes{dollar}, settling {d:+.1f}% on the day."]
+            L.append("⚡ " + b("WHAT JUST HAPPENED") + "\n" + _wrap_pick(seed, hooks))
+        elif lead.get("dollars"):
+            verb = "erased" if d < 0 else "added"
+            hooks = [
+                f"The {lead['name']} {verb} an estimated {_wrap_money(abs(lead['dollars']))} in market value today, "
+                f"moving {d:+.1f}% ({lead['pts']:+,.0f} pts).",
+                f"An estimated {_wrap_money(abs(lead['dollars']))} {('vanished from' if d<0 else 'flowed into')} the "
+                f"{lead['name']} today as it moved {d:+.1f}% ({lead['pts']:+,.0f} pts)."]
+            L.append("⚡ " + b("WHAT JUST HAPPENED") + "\n" + _wrap_pick(seed, hooks))
+        else:
+            risk = "sell-off" if d < 0 else "rally"
+            L.append("⚡ " + b("WHAT JUST HAPPENED") + "\n"
+                     f"The {lead['name']} is {('down' if d<0 else 'up')} {abs(d):.1f}% "
+                     f"({lead['pts']:+,.0f} pts) in a session {risk}.")
+
+    if shape and lead:
+        op = (shape["open"] / lead["prev"] - 1) * 100
+        L.append("\n🕘 " + b("THE TIMELINE") + "\n"
+                 f"The {lead['name']} opened {op:+.1f}% vs the prior close, peaked near {shape['peak']:,.0f} at "
+                 f"{_wrap_fmt_t(shape['t_peak'])}, then slid to {shape['trough']:,.0f} by {_wrap_fmt_t(shape['t_trough'])} "
+                 f"({shape['dd_pct']:+.1f}%). It now trades at {shape['cur']:,.0f}.")
+
+    if F["catalyst"]:
+        big = next((m for m in (F["movers_dn"] + F["movers_up"]) if m["t"] == F["catalyst"]["ticker"]), None)
+        if big:
+            line = (f"{big['t']} moved {big['pct']:+.1f}% — the session's standout — on the headline: "
+                    f"“{esc(F['catalyst']['title'])}”.")
+        else:
+            line = f"A key catalyst: {F['catalyst']['ticker']} — “{esc(F['catalyst']['title'])}”."
+        L.append("\n📰 " + b("THE CATALYST") + "\n" + line)
+
+    if F["vix"]:
+        v = F["vix"]
+        tone = "spiking — fear is back" if v["pct"] > 8 else "rising" if v["pct"] > 0 else "easing"
+        L.append("\n🌪 " + b("VOLATILITY") + "\n"
+                 f"The VIX is at {v['last']:.1f} ({v['pct']:+.1f}%), {tone}. "
+                 + ("Above 20 signals real stress." if v["last"] >= 20 else "Still contained below 20."))
+
+    if F["cross"]:
+        parts = []
+        for c in F["cross"]:
+            if c["kind"] == "rates":
+                parts.append(f"the 10Y yield {('rose' if c['pct']>0 else 'fell')} to {c['last']:.2f}%")
+            else:
+                parts.append(f"{c['name']} {c['pct']:+.1f}%")
+        L.append("\n🌐 " + b("CROSS-ASSET") + "\nContagion check — " + "; ".join(parts) + ".")
+
+    lev_lines = []
+    if F["lev"]:
+        worst = max(F["lev"], key=lambda x: abs(x["pct"]))
+        lev_lines.append(f"Leveraged ETFs are amplifying the move: {worst['name']} ({worst['sym']}) "
+                         f"{worst['pct']:+.1f}%. 3x funds magnify every swing — and the crowd is in them.")
+    if F["options"]:
+        o = F["options"]
+        flow = ("put-heavy (hedging/bearish)" if (o["put_chg"] or 0) > (o["call_chg"] or 0)
+                else "call-heavy (bullish/chasing)")
+        pcr = f", market PCR {o['pcr']:.2f}" if o.get("pcr") else ""
+        ph = ", ".join(o["put_heavy"]) if o.get("put_heavy") else "—"
+        lev_lines.append(f"Options flow is {flow}: net ΔOI calls {o['call_chg']:+,.0f} / puts {o['put_chg']:+,.0f}{pcr}. "
+                         f"Heaviest put builds: {ph}.")
+    if lev_lines:
+        L.append("\n🎰 " + b("LEVERAGE & POSITIONING") + "\n" + " ".join(lev_lines))
+
+    if F["breadth"]:
+        br = F["breadth"]
+        tilt = "risk-off" if br["dn"] > br["up"] else "risk-on" if br["up"] > br["dn"] else "mixed"
+        ups = ", ".join(f"{m['t']} {m['pct']:+.1f}%" for m in F["movers_up"][:3])
+        dns = ", ".join(f"{m['t']} {m['pct']:+.1f}%" for m in F["movers_dn"][:3])
+        L.append("\n📊 " + b("BREADTH & MOVERS") + "\n"
+                 f"{br['up']}/{br['n']} names green, {br['dn']} red — a {tilt} tape. "
+                 f"Leaders: {ups}. Laggards: {dns}.")
+
+    if F["book"] and F["book"]["tickers"]:
+        bl = []
+        helped_n = 0
+        for t in F["book"]["tickers"]:
+            helped = (t["pct"] > 0) == (t["dir"] >= 0)
+            helped_n += helped
+            bl.append(f"{t['tk']} {t['pct']:+.1f}% ({'tailwind' if helped else 'headwind'})")
+        L.append("\n💼 " + b("YOUR BOOK") + "\n"
+                 f"Your open names today: {', '.join(bl)}. Net directional exposure is being "
+                 + ("helped" if helped_n >= len(F["book"]["tickers"]) / 2 else "pressured") + " by the move.")
+
+    closers = ["Volatility always comes with change.",
+               "Record leverage + rising uncertainty = swings are here to stay.",
+               "When everyone is positioned one way, the exit gets narrow.",
+               "Opportunity lives in the broadening swings — if you respect the risk."]
+    L.append("\n— " + _wrap_pick(seed + 2, closers))
+    return "\n".join(L)
+
+
+def _wrap_chart_png(F):
+    """Intraday line of the lead index with open / peak / trough markers."""
+    lead = F.get("lead")
+    if not lead:
+        return None
+    h = _wrap_hist(lead["sym"], "1d", "5m")
+    if h is None or len(h) < 3:
+        return None
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    sh = F.get("shape") or {}
+    fig, ax = plt.subplots(figsize=(9, 4.4))
+    ax.plot(h.index, h["Close"], color="#3d8bff", lw=1.8)
+    ax.axhline(lead["prev"], color="gray", ls="--", lw=0.9, label=f"Prev close {lead['prev']:,.0f}")
+    if sh.get("t_peak") is not None:
+        ax.scatter([sh["t_peak"]], [sh["peak"]], color="#2e7d32", zorder=5, label=f"Peak {sh['peak']:,.0f}")
+    if sh.get("t_trough") is not None:
+        ax.scatter([sh["t_trough"]], [sh["trough"]], color="#c62828", zorder=5, label=f"Trough {sh['trough']:,.0f}")
+    ax.fill_between(h.index, h["Close"], lead["prev"],
+                    where=(h["Close"] >= lead["prev"]), alpha=0.15, color="green")
+    ax.fill_between(h.index, h["Close"], lead["prev"],
+                    where=(h["Close"] < lead["prev"]), alpha=0.15, color="red")
+    ax.set_title(f"{lead['name']} — today ({lead['pct']:+.1f}%)", fontsize=11)
+    ax.set_ylabel("Index level"); ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+    import matplotlib.dates as mdates
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    plt.tight_layout()
+    buf = BytesIO(); fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    plt.close(fig); buf.seek(0)
+    return buf
+
+
+def _kb_wrap():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="wrap_view"),
+                                  InlineKeyboardButton("⬅️ Menu", callback_data="menu_main")]])
+
+
+async def wrap_command(update, ctx):
+    """/wrap - 'what just happened' market write-up from your own data."""
+    conn = get_conn()
+    try:
+        F = wrap_facts(conn)
+    finally:
+        conn.close()
+    txt = wrap_narrative(F, html=True)
+    try:
+        buf = _wrap_chart_png(F)
+    except Exception:
+        buf = None
+    if buf:
+        await update.message.reply_photo(buf, caption=txt[:1024], parse_mode=H)
+        if len(txt) > 1024:
+            await update.message.reply_text(txt[1024:], parse_mode=H, reply_markup=_kb_wrap())
+    else:
+        await update.message.reply_text(txt[:4096], parse_mode=H, reply_markup=_kb_wrap())
+
+
+async def wrap_view(query):
+    conn = get_conn()
+    try:
+        F = wrap_facts(conn)
+    finally:
+        conn.close()
+    txt = wrap_narrative(F, html=True)
+    try:
+        buf = _wrap_chart_png(F)
+    except Exception:
+        buf = None
+    if buf:
+        await query.message.reply_photo(buf, caption=txt[:1024], parse_mode=H)
+        if len(txt) > 1024:
+            await query.message.reply_text(txt[1024:], parse_mode=H, reply_markup=_kb_wrap())
+    else:
+        await query.message.reply_text(txt[:4096], parse_mode=H, reply_markup=_kb_wrap())
+
+
 async def plan_command(update, ctx):
     """/plan - condensed next-day game plan for your open positions."""
     conn = get_conn()
@@ -21707,6 +22098,7 @@ def main():
     app.add_handler(CommandHandler("event", event_command))
     app.add_handler(CommandHandler("briefing", briefing_command))
     app.add_handler(CommandHandler("plan", plan_command))
+    app.add_handler(CommandHandler("wrap", wrap_command))
     app.add_handler(CommandHandler("journal", journal_command))
     app.add_handler(CommandHandler("logevent", logevent_command))
     app.add_handler(CommandHandler("bookmarks", bookmarks_command))
@@ -21741,6 +22133,16 @@ def main():
         job_queue.run_repeating(position_alerts, interval=300, first=90)
         log.info("Scheduled 5-min smart position alerts")
         log.info("Scheduled 10-min position health monitor")
+
+        # Event writeup system — pre/post macro briefs + anomaly scan
+        try:
+            _lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_lib")
+            if _lib_path not in sys.path:
+                sys.path.insert(0, _lib_path)
+            from event_writeup_bot_hooks import register_event_writeup_jobs
+            register_event_writeup_jobs(job_queue, log)
+        except Exception as _ew_err:
+            log.warning(f"Event writeup jobs not registered: {_ew_err}")
 
     # Auto-close any positions that expired before bot started
     expired = _close_expired_positions()
