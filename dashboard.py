@@ -12631,9 +12631,15 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                                "are most active. Real-time HFT order flow (Jane Street etc.) isn't public; this is "
                                "timing/liquidity edge, not their order book. All times ET.")
 
-                # ── Deep analysis (indicators / order flow / 24-model) — gated for speed ──
-                if st.checkbox(f"🔬 Deep analysis — indicators, order flow & 24-model ({_tk})",
-                               key=f"gp_deep_{_tk}"):
+                # ── Deep analysis (indicators / order flow / 24-model) — default-ON but isolated
+                #    in an st.fragment so the heavy 24-model compute reruns on its own and never
+                #    freezes the rest of the card (prices, payoff, metrics paint first). ──
+                @st.fragment
+                def _gp_deep_frag(_tk=_tk, _spot=_spot, _w=_w):
+                    if not st.checkbox(f"🔬 Deep analysis — indicators, order flow & 24-model ({_tk})",
+                                       value=True, key=f"gp_deep_{_tk}"):
+                        st.caption("Deep analysis off — flip on for indicators, order flow & the 24-model engine.")
+                        return
                     _inds = _gp_indicators(_tk)
                     if _inds:
                         st.markdown("**📊 Indicators — what each says & whether to weight it**")
@@ -12770,6 +12776,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                                                "🎯 Signal Accuracy page for each model's forward-tracked hit-rate.")
                     except Exception as _ee:
                         st.caption(f"(24-model engine unavailable: {_ee})")
+                _gp_deep_frag()
 
                 with st.expander(f"📰 Latest headlines & tone ({len(_nw['items'])})", expanded=False):
                     if _nw["items"]:

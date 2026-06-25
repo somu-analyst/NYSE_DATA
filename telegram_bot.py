@@ -10606,6 +10606,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await mom_view(query)
         elif data == "plan_view":
             await plan_view(query)
+        elif data == "plan_port_chart":
+            await plan_port_chart_view(query)
         elif data.startswith("plan_chart_"):
             await plan_chart_view(query, data.split("plan_chart_", 1)[1])
         elif data == "mom_recompute":
@@ -15682,6 +15684,8 @@ def _kb_plan(conn=None):
             btns = [InlineKeyboardButton(f"📈 {t}", callback_data=f"plan_chart_{t}") for t in tks[:9]]
             for i in range(0, len(btns), 3):
                 rows.append(btns[i:i + 3])
+            if tks:
+                rows.append([InlineKeyboardButton("📊 Portfolio chart", callback_data="plan_port_chart")])
         except Exception:
             pass
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="plan_view"),
@@ -16068,6 +16072,9 @@ def _next_day_plan(conn):
         fh = _finnhub_sentiment(tk)
         if fh:
             head += f"\n  🛰 Finnhub {fh['label']} ({fh['bull_pct']:.0f}% bull)"
+        rd = _reddit_sentiment(tk)
+        if rd:
+            head += f"\n  👽 r/WSB {rd['label']} ({rd['bull']}🟢/{rd['bear']}🔴 of {rd['n']})"
         ivr = _iv_rank(conn, tk)
         if ivr:
             hint = "cheap→buy" if ivr["rank"] < 30 else "rich→sell" if ivr["rank"] > 70 else "mid"
@@ -16192,8 +16199,23 @@ def _plan_legs_for(conn, tk):
     return legs, spot, cw, pw
 
 
+def _plan_price_hist(tk, n=40):
+    """Last n daily closes for a ticker from stock_daily (oldest→newest)."""
+    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    conn = get_conn()
+    try:
+        d = pd.read_sql(f"SELECT close FROM stock_daily WHERE ticker=? ORDER BY {sk} DESC LIMIT ?",
+                        conn, params=(tk.upper(), int(n)))
+    except Exception:
+        return []
+    finally:
+        conn.close()
+    return list(pd.to_numeric(d["close"], errors="coerce").dropna())[::-1]
+
+
 def _plan_payoff_png(tk, legs, spot, cw, pw):
-    """Render a payoff-at-expiry PNG (profit/loss zones, spot, breakevens, walls)."""
+    """2-panel PNG: top = recent price sparkline with spot/walls/breakevens; bottom = payoff
+    at expiry (profit/loss zones, spot, breakevens, walls)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -16205,7 +16227,23 @@ def _plan_payoff_png(tk, legs, spot, cw, pw):
         intr = np.maximum(prices - l["K"], 0) if l["typ"] == "call" else np.maximum(l["K"] - prices, 0)
         payoff += (intr - l["entry"]) * l["m"]
     a = _pl_analytics(legs, spot)
-    fig, ax = plt.subplots(figsize=(9, 4.6))
+    hist = _plan_price_hist(tk, 40)
+    fig, (ax0, ax) = plt.subplots(2, 1, figsize=(9, 6.2), height_ratios=[1, 2])
+    # ── price + levels sparkline ──
+    if hist:
+        ax0.plot(range(len(hist)), hist, color="#9db8ff", lw=1.7)
+        ax0.axhline(spot, color="orange", ls=":", lw=1.1)
+        if cw:
+            ax0.axhline(cw, color="#c62828", ls="-.", lw=0.8, alpha=0.7)
+        if pw:
+            ax0.axhline(pw, color="#2e7d32", ls="-.", lw=0.8, alpha=0.7)
+        for be in (a["be"] if a else []):
+            ax0.axhline(be, color="purple", ls="--", lw=0.7, alpha=0.6)
+        ax0.set_title(f"{tk} ${spot:.2f} · last {len(hist)}d price + levels", fontsize=9)
+        ax0.set_xticks([]); ax0.grid(True, alpha=0.2)
+    else:
+        ax0.text(0.5, 0.5, "no price history", ha="center", va="center"); ax0.axis("off")
+    # ── payoff ──
     ax.plot(prices, payoff, color="#3d8bff", lw=2.2)
     ax.axhline(0, color="gray", ls="--", lw=0.8)
     ax.axvline(spot, color="orange", ls=":", lw=1.3, label=f"Spot ${spot:.0f}")
@@ -16259,6 +16297,145 @@ async def plan_chart_view(query, tk):
             cap.append("• " + t)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to plan", callback_data="plan_view")]])
     await query.message.reply_photo(buf, caption="\n".join(cap)[:1000], parse_mode=H, reply_markup=kb)
+
+
+def _beta_to_spy_bot(conn, tk, lookback=60):
+    """Beta of a ticker vs SPY from stock_daily daily returns (or 1.0 fallback)."""
+    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    try:
+        a = pd.read_sql(f"SELECT trade_date,close FROM stock_daily WHERE ticker=? ORDER BY {sk}",
+                        conn, params=(tk.upper(),))
+        s = pd.read_sql(f"SELECT trade_date,close FROM stock_daily WHERE ticker='SPY' ORDER BY {sk}", conn)
+    except Exception:
+        return None
+    if len(a) < 20 or len(s) < 20:
+        return None
+    mg = a.merge(s, on="trade_date", suffixes=("", "_spy")).tail(lookback + 1)
+    if len(mg) < 20:
+        return None
+    ra = pd.to_numeric(mg["close"], errors="coerce").pct_change().dropna().values
+    rs = pd.to_numeric(mg["close_spy"], errors="coerce").pct_change().dropna().values
+    n = min(len(ra), len(rs))
+    if n < 15 or np.var(rs[-n:]) <= 0:
+        return None
+    return float(np.cov(ra[-n:], rs[-n:])[0, 1] / np.var(rs[-n:]))
+
+
+_RED_CACHE = {}
+_RED_TOKEN = {"tok": None, "exp": 0.0}
+
+
+def _reddit_sentiment(tk):
+    """r/wallstreetbets crowd tone via Reddit OAuth (needs env REDDIT_CLIENT_ID / _SECRET).
+    Returns {label,bull,bear,n} or None (dormant until creds are set)."""
+    import os
+    cid = os.environ.get("REDDIT_CLIENT_ID"); csec = os.environ.get("REDDIT_CLIENT_SECRET")
+    if not cid or not csec:
+        return None
+    import time as _t, json, base64, urllib.request, urllib.parse
+    key = tk.upper(); now = _t.time()
+    if key in _RED_CACHE and _RED_CACHE[key][0] > now:
+        return _RED_CACHE[key][1]
+    try:
+        if not _RED_TOKEN["tok"] or _RED_TOKEN["exp"] < now:
+            auth = base64.b64encode(f"{cid}:{csec}".encode()).decode()
+            data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
+            req = urllib.request.Request("https://www.reddit.com/api/v1/access_token", data=data,
+                                         headers={"Authorization": f"Basic {auth}",
+                                                  "User-Agent": "nyse-data-sentiment/1.0"})
+            j = json.load(urllib.request.urlopen(req, timeout=10))
+            _RED_TOKEN["tok"] = j["access_token"]; _RED_TOKEN["exp"] = now + j.get("expires_in", 3600) - 60
+        url = (f"https://oauth.reddit.com/r/wallstreetbets/search?q={urllib.parse.quote(key)}"
+               "&restrict_sr=1&sort=new&limit=25&t=week")
+        req = urllib.request.Request(url, headers={"Authorization": f"bearer {_RED_TOKEN['tok']}",
+                                                   "User-Agent": "nyse-data-sentiment/1.0"})
+        posts = json.load(urllib.request.urlopen(req, timeout=10)).get("data", {}).get("children", [])
+    except Exception:
+        return None
+    if not posts:
+        return None
+    POS = ("call", "calls", "moon", "buy", "long", "squeeze", "rip", "bull", "green", "up")
+    NEG = ("put", "puts", "short", "sell", "crash", "dump", "bear", "red", "down", "drill")
+    bull = bear = 0
+    for p in posts:
+        t = (p.get("data", {}).get("title") or "").lower()
+        b = sum(w in t for w in POS); s = sum(w in t for w in NEG)
+        if b > s:
+            bull += 1
+        elif s > b:
+            bear += 1
+    if bull + bear == 0:
+        return None
+    lbl = "BULLISH" if bull > bear * 1.2 else "BEARISH" if bear > bull * 1.2 else "MIXED"
+    res = {"label": lbl, "bull": bull, "bear": bear, "n": len(posts)}
+    _RED_CACHE[key] = (now + 600, res)
+    return res
+
+
+def _plan_portfolio_png(conn):
+    """Beta-weighted whole-book P&L vs a SPY move (next session). Returns (buf, stats)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    R = 0.045
+    tks = [r[0] for r in conn.execute(
+        "SELECT DISTINCT UPPER(ticker) FROM trades WHERE status='OPEN'").fetchall()]
+    all_legs = []
+    for tk in tks:
+        legs, spot, cw, pw = _plan_legs_for(conn, tk)
+        if not legs or not spot:
+            continue
+        beta = _beta_to_spy_bot(conn, tk) or 1.0
+        for l in legs:
+            all_legs.append(dict(l, beta=beta))
+    if not all_legs:
+        return None, None
+    moves = np.linspace(-0.10, 0.10, 41)
+    pnl = np.zeros_like(moves)
+    for i, s in enumerate(moves):
+        tot = 0.0
+        for l in all_legs:
+            us = max(l["spot"] * (1 + l["beta"] * s), 0.01)
+            rem = max(l["dte"] - 1, 0) / 365.0
+            val = (bs_greeks(us, l["K"], rem, R, l["iv"], l["typ"])["price"] if rem > 0
+                   else (max(us - l["K"], 0) if l["typ"] == "call" else max(l["K"] - us, 0)))
+            tot += (val - l["entry"]) * l["m"]
+        pnl[i] = tot
+    mid = len(moves) // 2
+    per1 = (pnl[mid + 5] - pnl[mid - 5]) / (moves[mid + 5] - moves[mid - 5]) / 100.0  # $ per +1% SPY
+    d2 = float(np.interp(-0.02, moves, pnl)); u2 = float(np.interp(0.02, moves, pnl))
+    fig, ax = plt.subplots(figsize=(9, 4.4))
+    ax.plot(moves * 100, pnl, color="#3d8bff", lw=2.2)
+    ax.axhline(0, color="gray", ls="--", lw=0.8)
+    ax.axvline(0, color="orange", ls=":", lw=1.2, label="flat")
+    ax.fill_between(moves * 100, pnl, 0, where=(pnl >= 0), alpha=0.25, color="green")
+    ax.fill_between(moves * 100, pnl, 0, where=(pnl < 0), alpha=0.25, color="red")
+    ax.set_title(f"Portfolio P&L vs SPY move (next session, beta-weighted)\n"
+                 f"≈${per1:,.0f}/+1% SPY · −2%→${d2:,.0f} · +2%→${u2:,.0f}", fontsize=10)
+    ax.set_xlabel("SPY move %"); ax.set_ylabel("Portfolio P&L ($)")
+    ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+    plt.tight_layout()
+    buf = BytesIO(); fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    plt.close(fig); buf.seek(0)
+    return buf, {"per1": per1, "d2": d2, "u2": u2, "n": len(all_legs), "tks": len(tks)}
+
+
+async def plan_port_chart_view(query):
+    """Send the beta-weighted portfolio exposure chart."""
+    conn = get_conn()
+    try:
+        buf, stats = _plan_portfolio_png(conn)
+    finally:
+        conn.close()
+    if not buf:
+        await query.message.reply_text("No open positions to chart.", parse_mode=H)
+        return
+    cap = ["📊 <b>Portfolio</b> — P&L vs SPY move (beta-weighted, next session)",
+           f"≈ <b>${stats['per1']:,.0f}</b> per +1% SPY · −2% → ${stats['d2']:,.0f} · +2% → ${stats['u2']:,.0f}",
+           f"<i>{stats['n']} legs · {stats['tks']} tickers</i>"]
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to plan", callback_data="plan_view")]])
+    await query.message.reply_photo(buf, caption="\n".join(cap), parse_mode=H, reply_markup=kb)
+
 
 async def plan_alert(ctx):
     """Pre-market auto-send of the next-day game plan."""

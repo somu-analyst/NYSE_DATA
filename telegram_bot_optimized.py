@@ -19979,6 +19979,9 @@ def _next_day_plan(conn):
         fh = _finnhub_sentiment(tk)
         if fh:
             head += f"\n  🛰 Finnhub {fh['label']} ({fh['bull_pct']:.0f}% bull)"
+        rd = _reddit_sentiment(tk)
+        if rd:
+            head += f"\n  👽 r/WSB {rd['label']} ({rd['bull']}🟢/{rd['bear']}🔴 of {rd['n']})"
         ivr = _iv_rank(conn, tk)
         if ivr:
             hint = "cheap→buy" if ivr["rank"] < 30 else "rich→sell" if ivr["rank"] > 70 else "mid"
