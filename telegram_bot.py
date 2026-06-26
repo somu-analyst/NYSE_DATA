@@ -1913,7 +1913,8 @@ MAIN_MENU_KB = InlineKeyboardMarkup([
     # ── MACRO & EVENTS ───────────────────────────────────────────
     [InlineKeyboardButton("━━  MACRO & EVENTS  ━━━━━━━━", callback_data="noop")],
     [InlineKeyboardButton("📡 Macro/Event Hub", callback_data="hub_menu"),
-     InlineKeyboardButton("📰 Market Wrap", callback_data="wrap_view")],
+     InlineKeyboardButton("📰 Market Wrap", callback_data="wrap_view"),
+     InlineKeyboardButton("📺 TradingView", callback_data="tv_view")],
     # ── AI + SETTINGS ────────────────────────────────────────────
     [InlineKeyboardButton("━━  AI & TOOLS  ━━━━━━━━━━━━", callback_data="noop")],
     [InlineKeyboardButton("🤖 Ask AI",     callback_data="menu_ai_chat"),
@@ -10609,6 +10610,10 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await plan_view(query)
         elif data == "wrap_view":
             await wrap_view(query)
+        elif data == "tv_view":
+            await tv_view(query)
+        elif data.startswith("tvc_"):
+            await tv_view(query, data.split("tvc_", 1)[1])
         elif data == "plan_port_chart":
             await plan_port_chart_view(query)
         elif data.startswith("plan_chart_"):
@@ -16585,6 +16590,103 @@ async def wrap_view(query):
         await query.message.reply_text(txt[:4096], parse_mode=H, reply_markup=_kb_wrap())
 
 
+# ═══════════════════════════════════════════════════════════════════
+# ── TRADINGVIEW BRIDGE (CDP) — capture a TV chart + overlay our levels
+#    Needs the local bridge: `python tv_bridge.py launch` + TV login once.
+# ═══════════════════════════════════════════════════════════════════
+def _tv_capture(symbol, tf=None, settle=2.5):
+    """Capture a TradingView chart screenshot via the CDP bridge.
+    Returns (png_bytes, err) — err is a user-facing string when the bridge is down."""
+    try:
+        import tv_bridge
+    except Exception as e:
+        return None, f"📺 tv_bridge module unavailable: {e}"
+    tv = None
+    try:
+        tv = tv_bridge.TV()
+        tv.connect(timeout=8)
+    except Exception:
+        return None, ("📺 <b>TradingView bridge not connected.</b>\nOn the host machine run "
+                      "<code>python tv_bridge.py launch</code> and log into TradingView once, then retry.")
+    try:
+        png = tv.screenshot_symbol(symbol, tf, settle=settle) if symbol else tv.screenshot_bytes()
+        return png, None
+    except Exception as e:
+        return None, f"📺 TV capture error: {e}"
+    finally:
+        try:
+            if tv:
+                tv.close()
+        except Exception:
+            pass
+
+
+def _tv_levels_line(symbol):
+    """Our computed levels for the symbol (spot / gamma walls) as a caption line."""
+    sym = str(symbol).split(":")[-1].upper()
+    conn = get_conn()
+    spot = cw = pw = None
+    try:
+        try:
+            spot = _gex_spot(conn, sym) or _last_price(sym)
+        except Exception:
+            pass
+        if spot:
+            try:
+                g = _compute_gex(sym, conn, spot); cw, pw = g.get("call_wall"), g.get("put_wall")
+            except Exception:
+                pass
+    finally:
+        conn.close()
+    bits = [f"📺 <b>{sym}</b>"]
+    if spot:
+        bits.append(f"spot ${spot:,.2f}")
+    if cw:
+        bits.append(f"call wall ${cw:g}")
+    if pw:
+        bits.append(f"put wall ${pw:g}")
+    return " · ".join(bits)
+
+
+def _kb_tv(symbol):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data=f"tvc_{symbol}"),
+                                  InlineKeyboardButton("⬅️ Menu", callback_data="menu_main")]])
+
+
+def _tv_default_symbol():
+    conn = get_conn()
+    try:
+        r = conn.execute("SELECT UPPER(ticker) FROM trades WHERE status='OPEN' ORDER BY 1 LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    return r[0] if r else "SPY"
+
+
+async def tv_command(update, ctx):
+    """/tv SYMBOL [TF] — capture a TradingView chart (needs the local CDP bridge)."""
+    args = list(getattr(ctx, "args", []) or [])
+    symbol = args[0].upper() if args else _tv_default_symbol()
+    tf = args[1] if len(args) > 1 else None
+    await update.message.reply_text(f"📺 Capturing <b>{symbol}</b> from TradingView…", parse_mode=H)
+    png, err = _tv_capture(symbol, tf)
+    if err:
+        await update.message.reply_text(err, parse_mode=H)
+        return
+    cap = _tv_levels_line(symbol) + (f" · {tf}" if tf else "")
+    await update.message.reply_photo(BytesIO(png), caption=cap, parse_mode=H, reply_markup=_kb_tv(symbol))
+
+
+async def tv_view(query, symbol=None):
+    symbol = (symbol or _tv_default_symbol()).upper()
+    await query.message.reply_text(f"📺 Capturing <b>{symbol}</b> from TradingView…", parse_mode=H)
+    png, err = _tv_capture(symbol)
+    if err:
+        await query.message.reply_text(err, parse_mode=H)
+        return
+    await query.message.reply_photo(BytesIO(png), caption=_tv_levels_line(symbol),
+                                    parse_mode=H, reply_markup=_kb_tv(symbol))
+
+
 async def plan_command(update, ctx):
     """/plan - condensed next-day game plan for your open positions."""
     conn = get_conn()
@@ -16896,6 +16998,32 @@ async def plan_alert(ctx):
         await ctx.bot.send_message(chat_id=int(chat_id), text=txt, parse_mode=H)
     except Exception as e:
         log.warning(f"plan_alert failed: {e}")
+
+
+async def wrap_alert(ctx):
+    """Daily post-close auto-send of the 'what just happened' market wrap."""
+    try:
+        _, chat_id = load_creds()
+        conn = get_conn()
+        try:
+            F = wrap_facts(conn)
+            txt = wrap_narrative(F, html=True)
+        finally:
+            conn.close()
+        try:
+            buf = _wrap_chart_png(F)
+        except Exception:
+            buf = None
+        await ctx.bot.send_message(chat_id=int(chat_id), text="📰 <b>Daily Market Wrap</b>", parse_mode=H)
+        if buf:
+            await ctx.bot.send_photo(chat_id=int(chat_id), photo=buf, caption=txt[:1024], parse_mode=H)
+            if len(txt) > 1024:
+                await ctx.bot.send_message(chat_id=int(chat_id), text=txt[1024:], parse_mode=H)
+        else:
+            await ctx.bot.send_message(chat_id=int(chat_id), text=txt[:4096], parse_mode=H)
+    except Exception as e:
+        log.warning(f"wrap_alert failed: {e}")
+
 
 async def briefing_command(update, ctx):
     """/briefing - daily macro event brief with optimistic/pessimistic/balanced views."""
@@ -18407,6 +18535,7 @@ def main():
     app.add_handler(CommandHandler("briefing", briefing_command))
     app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("wrap", wrap_command))
+    app.add_handler(CommandHandler("tv", tv_command))
     app.add_handler(CommandHandler("journal", journal_command))
     app.add_handler(CommandHandler("logevent", logevent_command))
     app.add_handler(CommandHandler("bookmarks", bookmarks_command))
@@ -18432,6 +18561,7 @@ def main():
         job_queue.run_daily(morning_alert, time=dt_time(14, 0, 0))  # 9 AM ET = 14:00 UTC
         job_queue.run_daily(briefing_alert, time=dt_time(14, 5, 0))  # daily brief 9:05 AM ET
         job_queue.run_daily(plan_alert, time=dt_time(13, 30, 0))     # next-day game plan ~8:30 AM ET pre-market
+        job_queue.run_daily(wrap_alert, time=dt_time(21, 15, 0))     # daily market wrap ~4:15 PM ET post-close
         log.info("Scheduled morning alert at 9:00 AM ET daily")
         # 15-min intraday alert (fires every 15 min; function checks market hours internally)
         job_queue.run_repeating(intraday_alert, interval=900, first=30)

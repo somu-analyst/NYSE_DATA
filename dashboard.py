@@ -4537,6 +4537,7 @@ with st.sidebar:
             "🌍 Global Opportunities",
             "📡 Macro/Event Hub",
             "📰 Market Wrap",
+            "📺 TradingView",
         ],
     }
     _cat = st.selectbox("Section", list(_NAV_GROUPS), key="nav_cat")
@@ -17086,8 +17087,25 @@ if page == "📰 Market Wrap":
         _lead = _F["lead"]
         _h = _wrap_hist(_lead["sym"], "1d", "5m")
         if _h is not None and len(_h) > 2:
-            _cdf = pd.DataFrame({_lead["name"]: _h["Close"].values, "Prev close": _lead["prev"]}, index=_h.index)
-            st.line_chart(_cdf)
+            import altair as alt
+            _cdf = pd.DataFrame({"t": _h.index, "Close": _h["Close"].values})
+            # Auto-size y to the real intraday range (incl. prev close) with a small pad,
+            # so a sub-1% move isn't flattened by a zero-based axis.
+            _lo = float(min(_cdf["Close"].min(), _lead["prev"]))
+            _hi = float(max(_cdf["Close"].max(), _lead["prev"]))
+            _pad = max((_hi - _lo) * 0.08, _hi * 0.0005)
+            _dom = [_lo - _pad, _hi + _pad]
+            _up = _h["Close"].iloc[-1] >= _lead["prev"]
+            _line = alt.Chart(_cdf).mark_line(color="#2e7d32" if _up else "#c62828").encode(
+                x=alt.X("t:T", title=None, axis=alt.Axis(format="%H:%M")),
+                y=alt.Y("Close:Q", title=_lead["name"],
+                        scale=alt.Scale(domain=_dom, zero=False, nice=False)),
+                tooltip=[alt.Tooltip("t:T", title="Time", format="%H:%M"),
+                         alt.Tooltip("Close:Q", title=_lead["name"], format=",.0f")],
+            )
+            _prev = alt.Chart(pd.DataFrame({"y": [_lead["prev"]]})).mark_rule(
+                color="gray", strokeDash=[4, 4]).encode(y="y:Q")
+            st.altair_chart((_prev + _line).properties(height=320), use_container_width=True)
             if _F.get("shape"):
                 _sh = _F["shape"]
                 st.caption(f"Peak {_sh['peak']:,.0f} at {_wrap_fmt_t(_sh['t_peak'])} → trough {_sh['trough']:,.0f} "
@@ -17124,6 +17142,86 @@ if page == "📰 Market Wrap":
                     for t in _F["book"]["tickers"]]), hide_index=True, use_container_width=True)
         st.caption(f"As of {_F['ts'].strftime('%Y-%m-%d %H:%M')} · index $-cap figures are estimates · "
                    "not investment advice.")
+
+if page == "📺 TradingView":
+    _page_header("📺 TradingView — live chart via the CDP bridge")
+    st.caption("Captures a TradingView chart through the local Chrome DevTools bridge (tv_bridge.py), "
+               "then pairs it with your computed levels. Unofficial & fragile — it automates the TV web UI.")
+    with st.expander("⚙️ One-time setup — how to connect", expanded=False):
+        st.markdown(
+            "1. On this machine, run in a terminal: `python tv_bridge.py launch`\n"
+            "2. A dedicated Chrome window opens — **log into TradingView once** (the session persists in "
+            "its own profile).\n"
+            "3. Leave that Chrome open, come back here, and hit **Capture**.\n\n"
+            "_Note:_ programmatic drawings and external Pine backtests aren't possible on **web** "
+            "TradingView (the chart is a private canvas with no public API). This grabs the chart image "
+            "and overlays *our* levels — data TradingView doesn't have.")
+
+    _tv_def = "SPY"
+    try:
+        with get_conn() as _c:
+            _r = _c.execute("SELECT UPPER(ticker) FROM trades WHERE status='OPEN' ORDER BY 1 LIMIT 1").fetchone()
+        if _r:
+            _tv_def = _r[0]
+    except Exception:
+        pass
+
+    _c1, _c2, _c3 = st.columns([2, 1, 1])
+    _tv_sym = _c1.text_input("Symbol (e.g. NVDA or NASDAQ:NVDA)", value=_tv_def, key="tv_sym").strip().upper()
+    _tv_tf = _c2.selectbox("Timeframe", ["", "1", "5", "15", "60", "240", "D", "W"], index=4, key="tv_tf")
+    _go = _c3.button("📸 Capture", use_container_width=True)
+
+    with st.expander("🔌 Bridge health", expanded=False):
+        try:
+            import tv_bridge as _tvb
+            _tvh = _tvb.TV(); _tvh.connect(timeout=5)
+            st.json(_tvh.health()); _tvh.close()
+        except Exception as _he:
+            st.warning(f"Not connected — run `python tv_bridge.py launch` first. ({_he})")
+
+    if _go and _tv_sym:
+        try:
+            import tv_bridge as _tvb
+            _tv = _tvb.TV(); _tv.connect(timeout=8)
+            with st.spinner(f"Capturing {_tv_sym} from TradingView…"):
+                _png = _tv.screenshot_symbol(_tv_sym, _tv_tf or None)
+            _tv.close()
+            st.session_state["_tv_png"] = _png
+            st.session_state["_tv_png_sym"] = _tv_sym
+        except Exception as _ce:
+            st.error(f"📺 Capture failed: {_ce}\n\nRun `python tv_bridge.py launch` and log into "
+                     "TradingView once, then retry.")
+
+    if st.session_state.get("_tv_png"):
+        _psym = st.session_state.get("_tv_png_sym", "")
+        st.image(st.session_state["_tv_png"], caption=f"TradingView · {_psym}", use_container_width=True)
+        _lv = []
+        try:
+            _sp = _spot(_psym.split(":")[-1])
+            if _sp:
+                _lv.append(f"spot **${_sp:,.2f}**")
+        except Exception:
+            pass
+        try:
+            _wsym = _psym.split(":")[-1]
+            with get_conn() as _wc:
+                _wdf = pd.read_sql(
+                    "SELECT strike, openInt_Call_now, openInt_Put_now FROM options_change "
+                    "WHERE UPPER(ticker)=? AND trade_date_now=(SELECT trade_date_now FROM options_change "
+                    "WHERE UPPER(ticker)=? ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||"
+                    "substr(trade_date_now,4,2) DESC LIMIT 1)", _wc, params=(_wsym, _wsym))
+            _w = compute_walls(_wdf, _sp if _lv else None) if _wdf is not None and not _wdf.empty else None
+            if _w:
+                if _w.get("call_wall"):
+                    _lv.append(f"call wall **${_kf(_w['call_wall'])}**")
+                if _w.get("put_wall"):
+                    _lv.append(f"put wall **${_kf(_w['put_wall'])}**")
+        except Exception:
+            pass
+        if _lv:
+            st.info("📐 Our computed levels: " + " · ".join(_lv))
+    else:
+        st.info("Enter a symbol and hit **Capture** (after launching the bridge & logging in).")
 
 if page == "📡 Macro/Event Hub":
     _page_header("📡 Macro / Event Hub")

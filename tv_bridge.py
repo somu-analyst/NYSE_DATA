@@ -220,6 +220,84 @@ class TV:
         if tf:
             self.set_timeframe(tf)
 
+    def key_combo(self, modifiers, key, code, vk):
+        """Dispatch a modified key (modifiers: Alt=1, Ctrl=2, Meta=4, Shift=8)."""
+        for et in ("keyDown", "keyUp"):
+            self._cmd("Input.dispatchKeyEvent", type=et, modifiers=modifiers,
+                      key=key, code=code, windowsVirtualKeyCode=vk)
+
+    def click_text(self, text, tags="button,[role=button],a,span,div"):
+        """Best-effort: click the first visible element whose trimmed text matches `text`.
+        Returns True if something was clicked. Fragile — TV markup changes."""
+        js = """
+        (function(t, sel){
+          const want = t.trim().toLowerCase();
+          const els = Array.from(document.querySelectorAll(sel));
+          const el = els.find(e => (e.innerText||'').trim().toLowerCase() === want
+                                   || (e.getAttribute&&((e.getAttribute('aria-label')||'').trim().toLowerCase()===want)));
+          if (el) { el.click(); return true; }
+          return false;
+        })(%s, %s)
+        """ % (json.dumps(text), json.dumps(tags))
+        try:
+            return bool(self.evaluate(js))
+        except Exception:
+            return False
+
+    def screenshot_symbol(self, symbol, tf=None, settle=2.5):
+        """Convenience: load a symbol (and optional timeframe) then return PNG bytes."""
+        self.open_chart(symbol, tf)
+        time.sleep(settle)
+        return self.screenshot_bytes()
+
+    # ── best-effort deep actions (WILL break on TV UI updates) ─────────
+    def replay_mode(self):
+        """Toggle TradingView's bar-replay mode (top toolbar button)."""
+        return self.click_text("Replay")
+
+    def open_alert_dialog(self):
+        """Open the Create-Alert dialog (TV shortcut Alt+A)."""
+        try:
+            self.key_combo(1, "a", "KeyA", 65)
+            time.sleep(0.6)
+            return True
+        except Exception:
+            return False
+
+    def open_pine_editor(self):
+        """Open the Pine Editor bottom panel (best-effort: click its tab)."""
+        return self.click_text("Pine Editor") or self.click_text("Pine")
+
+    def write_pine(self, code):
+        """Type Pine code into the focused editor (call open_pine_editor first and
+        click into the editor). Best-effort; clears via Ctrl+A then types."""
+        self.key_combo(2, "a", "KeyA", 65)   # Ctrl+A select all
+        time.sleep(0.2)
+        self.type_text(code, delay=0.005)
+        return True
+
+    def run_pine(self):
+        """Add the current Pine script to the chart / re-run (best-effort button)."""
+        return self.click_text("Add to chart") or self.click_text("Update on chart")
+
+    def read_strategy_tester(self):
+        """Screen-scrape the Strategy Tester performance summary (best-effort).
+        Returns a dict of label->value from the overview, or {}."""
+        js = """
+        (function(){
+          const out={};
+          const nodes=document.querySelectorAll('[class*="report"] [class*="value"], [data-name*="performance"] *');
+          // generic fallback: grab visible 'Title: value' pairs in the bottom panel
+          const items=Array.from(document.querySelectorAll('[class*="value"],[class*="title"]'))
+                          .map(e=>(e.innerText||'').trim()).filter(Boolean);
+          return items.slice(0,40);
+        })()
+        """
+        try:
+            return self.evaluate(js) or []
+        except Exception:
+            return []
+
     def health(self):
         """Connection + target health report."""
         out = {"chrome_up": False, "attached": bool(self.ws), "port": self.port}
