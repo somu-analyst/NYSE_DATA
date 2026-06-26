@@ -17603,6 +17603,80 @@ if page == "📺 TradingView":
     else:
         st.info("Enter a symbol and hit **Capture** (after launching the bridge & logging in).")
 
+# ── Macro Dashboard data (keyless BLS + market yields + optional AlphaVantage) ──
+@st.cache_data(ttl=21600, show_spinner=False)
+def _macro_bls_full():
+    """BLS monthly series (oldest→newest) for CPI, Core CPI, Unemployment, Nonfarm Payrolls.
+    Keyless; cached 6h."""
+    import urllib.request as _u, json as _j, datetime as _dt
+    names = {"CUUR0000SA0": "CPI", "CUUR0000SA0L1E": "Core CPI",
+             "LNS14000000": "Unemployment", "CES0000000001": "Nonfarm Payrolls"}
+    yr = _dt.datetime.now().year
+    body = _j.dumps({"seriesid": list(names), "startyear": str(yr - 3), "endyear": str(yr)}).encode()
+    req = _u.Request("https://api.bls.gov/publicAPI/v1/timeseries/data/", data=body,
+                     headers={"Content-Type": "application/json", "User-Agent": "nyse-data/1.0"})
+    raw = _j.load(_u.urlopen(req, timeout=20))
+    out = {}
+    for s in raw.get("Results", {}).get("series", []):
+        pts = []
+        for d in s.get("data", []):
+            if str(d.get("period", "")).startswith("M"):
+                try:
+                    pts.append((int(d["year"]), int(d["period"][1:]), float(d["value"])))
+                except Exception:
+                    pass
+        pts.sort()
+        out[names[s["seriesID"]]] = pts
+    return out
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _macro_yields_full():
+    """Current yields + 1-month history for the curve chart. Keyless (yfinance)."""
+    import yfinance as _yf
+    out = {}
+    for sym, name in [("^IRX", "3M"), ("^FVX", "5Y"), ("^TNX", "10Y"), ("^TYX", "30Y")]:
+        try:
+            h = _yf.Ticker(sym).history(period="1mo")["Close"].dropna()
+            if len(h):
+                out[name] = {"last": float(h.iloc[-1]),
+                             "prev": float(h.iloc[-2]) if len(h) > 1 else float(h.iloc[-1])}
+        except Exception:
+            pass
+    return out
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _macro_av_full():
+    """AlphaVantage economic indicators (latest + prev + year-ago). Daily-cached to respect the
+    free tier (25/day, 1/sec). Returns {name: {latest,date,prev,yago,unit}}."""
+    key = os.environ.get("ALPHAVANTAGE_KEY", "")
+    if not key:
+        return {}
+    import urllib.request as _u, json as _j, time as _t
+    out = {}
+    series = [("REAL_GDP", "Real GDP", "&interval=quarterly", "$B", 4),
+              ("INFLATION", "Inflation (annual)", "", "%", 1),
+              ("RETAIL_SALES", "Retail Sales", "", "$M", 12),
+              ("DURABLES", "Durable Goods", "", "$M", 12),
+              ("FEDERAL_FUNDS_RATE", "Fed Funds", "&interval=monthly", "%", 12)]
+    for fn, name, extra, unit, step in series:
+        try:
+            url = f"https://www.alphavantage.co/query?function={fn}&apikey={key}{extra}"
+            d = _j.loads(_u.urlopen(url, timeout=12).read().decode())
+            data = d.get("data", [])
+            if data:
+                latest = float(data[0]["value"])
+                prev = float(data[1]["value"]) if len(data) > 1 else latest
+                yago = float(data[step]["value"]) if len(data) > step else None
+                out[name] = {"latest": latest, "date": data[0]["date"], "prev": prev,
+                             "yago": yago, "unit": unit}
+            _t.sleep(1.3)
+        except Exception:
+            continue
+    return out
+
+
 if page == "📡 Macro/Event Hub":
     _page_header("📡 Macro / Event Hub")
     try:
@@ -17788,12 +17862,104 @@ if page == "📡 Macro/Event Hub":
                 st.error(f"Journal error: {e}")
 
         with _tb_mac:
-            st.caption("Live macro — keyless BLS prints (CPI/Core/Unemployment/Payrolls) + market "
-                       "yields. Add FRED_API_KEY for the full FRED series, ALPHAVANTAGE_KEY for news sentiment.")
+            st.markdown("#### 📊 Macro Dashboard")
+            st.caption("Keyless BLS prints + market yields with MoM/YoY, charts and a market-expectations "
+                       "read. AlphaVantage indicators show when ALPHAVANTAGE_KEY is set.")
+            _MON = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+            _bls = {}
+            # ── BLS table: Latest / MoM / YoY ──
             try:
-                _render_tg(_tbmod._fmt_macro_report())
+                _bls = _macro_bls_full()
+                _rb = []
+                for _nm, _pts in _bls.items():
+                    if len(_pts) < 13:
+                        continue
+                    _lt, _pv, _ya = _pts[-1], _pts[-2], _pts[-13]
+                    _asof = f"{_MON[_lt[1]]} {_lt[0]}"
+                    if _nm in ("CPI", "Core CPI"):
+                        _rb.append({"Indicator": _nm, "Latest": f"{_lt[2]:.1f}",
+                                    "MoM": f"{(_lt[2]/_pv[2]-1)*100:+.2f}%",
+                                    "YoY": f"{(_lt[2]/_ya[2]-1)*100:+.1f}%", "As of": _asof})
+                    elif _nm == "Unemployment":
+                        _rb.append({"Indicator": _nm, "Latest": f"{_lt[2]:.1f}%",
+                                    "MoM": f"{_lt[2]-_pv[2]:+.1f}pp", "YoY": f"{_lt[2]-_ya[2]:+.1f}pp",
+                                    "As of": _asof})
+                    else:  # Nonfarm Payrolls level (thousands)
+                        _rb.append({"Indicator": _nm + " (k)", "Latest": f"{_lt[2]:,.0f}",
+                                    "MoM": f"{_lt[2]-_pv[2]:+,.0f}", "YoY": f"{_lt[2]-_ya[2]:+,.0f}",
+                                    "As of": _asof})
+                if _rb:
+                    st.dataframe(pd.DataFrame(_rb), hide_index=True, use_container_width=True)
+                _cpi = _bls.get("CPI", [])
+                if len(_cpi) > 13:
+                    _ser = [{"Month": f"{_cpi[i][0]}-{_cpi[i][1]:02d}",
+                             "CPI YoY %": (_cpi[i][2] / _cpi[i - 12][2] - 1) * 100}
+                            for i in range(12, len(_cpi))]
+                    st.markdown("**CPI inflation (YoY %) — last 24 months**")
+                    st.line_chart(pd.DataFrame(_ser).tail(24).set_index("Month"), height=200)
             except Exception as e:
-                st.error(f"Macro error: {e}")
+                st.caption(f"BLS data unavailable: {e}")
+            # ── Yield curve: table + chart + expectations ──
+            try:
+                _y = _macro_yields_full()
+                if _y:
+                    _order = [k for k in ("3M", "5Y", "10Y", "30Y") if k in _y]
+                    _yc1, _yc2 = st.columns([1, 1])
+                    with _yc1:
+                        st.markdown("**Treasury yields**")
+                        st.dataframe(pd.DataFrame([
+                            {"Tenor": k, "Yield": f"{_y[k]['last']:.2f}%",
+                             "1d": f"{(_y[k]['last']-_y[k]['prev'])*100:+.0f}bp"} for k in _order]),
+                            hide_index=True, use_container_width=True)
+                    with _yc2:
+                        st.markdown("**Curve**")
+                        st.line_chart(pd.DataFrame({"Tenor": _order,
+                                                    "Yield %": [_y[k]["last"] for k in _order]}).set_index("Tenor"),
+                                      height=200)
+                    if "10Y" in _y and "3M" in _y:
+                        _slope = (_y["10Y"]["last"] - _y["3M"]["last"]) * 100
+                        if _slope < -10:
+                            _exp = (f"🔴 **Curve inverted** (10Y−3M = {_slope:+.0f}bp) — market is pricing a "
+                                    "slowdown and eventual Fed rate cuts.")
+                        elif _slope < 25:
+                            _exp = (f"🟡 **Curve flat** (10Y−3M = {_slope:+.0f}bp) — late-cycle; market expects "
+                                    "the Fed roughly on hold.")
+                        else:
+                            _exp = (f"🟢 **Curve steep** (10Y−3M = {_slope:+.0f}bp) — market pricing growth and "
+                                    "higher rates ahead.")
+                        st.info("📈 **Market expectations** — " + _exp)
+            except Exception as e:
+                st.caption(f"Yields unavailable: {e}")
+            # ── inflation-trend read ──
+            try:
+                _cpi = _bls.get("CPI", [])
+                if len(_cpi) > 16:
+                    _now = (_cpi[-1][2] / _cpi[-13][2] - 1) * 100
+                    _ago = (_cpi[-4][2] / _cpi[-16][2] - 1) * 100
+                    _tr = ("cooling 🟢" if _now < _ago - 0.1 else
+                           "heating 🔴" if _now > _ago + 0.1 else "steady 🟡")
+                    st.caption(f"Inflation trend: CPI YoY **{_now:.1f}%** vs **{_ago:.1f}%** three months ago → **{_tr}**.")
+            except Exception:
+                pass
+            # ── AlphaVantage indicators (period chg / YoY) ──
+            try:
+                _av = _macro_av_full()
+                if _av:
+                    _ra = []
+                    for _nm, _d in _av.items():
+                        _chg = f"{(_d['latest']/_d['prev']-1)*100:+.2f}%" if _d.get("prev") else "—"
+                        _yoy = f"{(_d['latest']/_d['yago']-1)*100:+.1f}%" if _d.get("yago") else "—"
+                        _ra.append({"Indicator": _nm, "Latest": f"{_d['latest']:,.1f} {_d['unit']}",
+                                    "Chg": _chg, "YoY": _yoy, "As of": _d["date"]})
+                    st.markdown("**🏦 AlphaVantage indicators**")
+                    st.dataframe(pd.DataFrame(_ra), hide_index=True, use_container_width=True)
+            except Exception as e:
+                st.caption(f"AlphaVantage indicators unavailable: {e}")
+            with st.expander("📰 News sentiment & raw report", expanded=False):
+                try:
+                    _render_tg(_tbmod._fmt_macro_report())
+                except Exception as e:
+                    st.caption(f"(raw report unavailable: {e})")
 
         try:
             _hub_conn.close()
