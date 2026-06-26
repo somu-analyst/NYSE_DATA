@@ -17736,7 +17736,8 @@ if page == "📡 Macro/Event Hub":
                 st.error(f"Journal error: {e}")
 
         with _tb_mac:
-            st.caption("FRED macro indicators + AlphaVantage news sentiment (set keys to enable).")
+            st.caption("Live macro — keyless BLS prints (CPI/Core/Unemployment/Payrolls) + market "
+                       "yields. Add FRED_API_KEY for the full FRED series, ALPHAVANTAGE_KEY for news sentiment.")
             try:
                 _render_tg(_tbmod._fmt_macro_report())
             except Exception as e:

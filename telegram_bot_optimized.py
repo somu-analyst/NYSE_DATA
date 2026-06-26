@@ -21833,11 +21833,73 @@ def _av_sentiment(tickers="SPY,QQQ", api_key=None):
     except Exception:
         return None
 
+def _macro_keyless():
+    """Free, keyless macro snapshot — BLS (CPI/Core/Unemployment/Payrolls) + market yields
+    (yfinance). Returns display rows so the macro dashboard works without any API key."""
+    rows = []
+    try:
+        import urllib.request as _u, json as _j, datetime as _dt
+        yr = _dt.datetime.now().year
+        body = _j.dumps({"seriesid": ["CUUR0000SA0", "CUUR0000SA0L1E", "LNS14000000", "CES0000000001"],
+                         "startyear": str(yr - 2), "endyear": str(yr)}).encode()
+        req = _u.Request("https://api.bls.gov/publicAPI/v1/timeseries/data/", data=body,
+                         headers={"Content-Type": "application/json", "User-Agent": "nyse-data/1.0"})
+        j = _j.load(_u.urlopen(req, timeout=15))
+        S = {}
+        for s in j.get("Results", {}).get("series", []):
+            pts = []
+            for d in s.get("data", []):
+                if str(d.get("period", "")).startswith("M"):
+                    try:
+                        pts.append((int(d["year"]), d["period"], float(d["value"])))
+                    except Exception:
+                        pass
+            S[s["seriesID"]] = pts
+
+        def _yoy(sid):
+            p = S.get(sid, [])
+            if len(p) < 13:
+                return None
+            latest = p[0]
+            prior = next((x for x in p if x[1] == latest[1] and x[0] == latest[0] - 1), None)
+            return (latest[2] / prior[2] - 1) * 100 if (prior and prior[2]) else None
+
+        c = _yoy("CUUR0000SA0"); cc = _yoy("CUUR0000SA0L1E")
+        if c is not None:
+            rows.append(f"CPI YoY   {c:>6.1f}%")
+        if cc is not None:
+            rows.append(f"Core CPI  {cc:>6.1f}%")
+        un = S.get("LNS14000000", [])
+        if un:
+            rows.append(f"Unemploy  {un[0][2]:>6.1f}%")
+        nfp = S.get("CES0000000001", [])
+        if len(nfp) >= 2:
+            rows.append(f"NFP chg  {(nfp[0][2] - nfp[1][2]):>+6.0f}k")
+    except Exception:
+        pass
+    try:
+        for sym, name in [("^IRX", "3M yld"), ("^FVX", "5Y yld"), ("^TNX", "10Y yld"), ("^TYX", "30Y yld")]:
+            try:
+                h = yf.Ticker(sym).history(period="5d")["Close"].dropna()
+                if len(h):
+                    rows.append(f"{name:<9}{float(h.iloc[-1]):>6.2f}%")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return rows
+
+
 def _fmt_macro_report():
     lines = ["📊 <b>MACRO DASHBOARD</b>", ""]
     if not os.environ.get("FRED_API_KEY"):
-        lines.append("<i>No FRED_API_KEY set. Free key at fred.stlouisfed.org/docs/api/api_key.html "
-                     "→ set env FRED_API_KEY for live macro.</i>")
+        rows = _macro_keyless()
+        if rows:
+            lines.append("<pre>" + "\n".join(rows) + "</pre>")
+            lines.append("<i>Free keyless data (BLS prints + market yields). "
+                         "Set FRED_API_KEY for the full FRED series.</i>")
+        else:
+            lines.append("<i>Macro data unavailable right now — try again shortly.</i>")
     else:
         rows = []
         for sid, name, unit in _FRED_SERIES:
