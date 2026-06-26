@@ -23,22 +23,74 @@ import warnings, sys, os
 warnings.filterwarnings("ignore")
 
 
+def _keyvault_key(salt):
+    """Derive a 64-byte key, machine/user-bound (or KEYVAULT_PASSPHRASE if set)."""
+    import hashlib, getpass, platform
+    secret = os.environ.get("KEYVAULT_PASSPHRASE") or f"{getpass.getuser()}|{platform.node()}|nyse-data-keyvault-v1"
+    return hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, 200000, dklen=64)
+
+
+def _keyvault_encrypt(plaintext):
+    """Encrypt with an HMAC-SHA256 keystream (CTR) + encrypt-then-MAC. Stdlib only."""
+    import hmac, hashlib, base64
+    salt = os.urandom(16); nonce = os.urandom(16)
+    k = _keyvault_key(salt); enc_key, mac_key = k[:32], k[32:]
+    data = plaintext.encode("utf-8")
+    ks = bytearray(); ctr = 0
+    while len(ks) < len(data):
+        ks.extend(hmac.new(enc_key, nonce + ctr.to_bytes(8, "big"), hashlib.sha256).digest()); ctr += 1
+    ct = bytes(a ^ b for a, b in zip(data, ks[:len(data)]))
+    tag = hmac.new(mac_key, salt + nonce + ct, hashlib.sha256).digest()
+    return base64.b64encode(b"NVK1" + salt + nonce + ct + tag).decode("ascii")
+
+
+def _keyvault_decrypt(blob):
+    import hmac, hashlib, base64
+    raw = base64.b64decode(blob)
+    if raw[:4] != b"NVK1":
+        raise ValueError("bad vault format")
+    salt, nonce, tag, ct = raw[4:20], raw[20:36], raw[-32:], raw[36:-32]
+    k = _keyvault_key(salt); enc_key, mac_key = k[:32], k[32:]
+    if not hmac.compare_digest(tag, hmac.new(mac_key, salt + nonce + ct, hashlib.sha256).digest()):
+        raise ValueError("vault integrity check failed (wrong machine/passphrase?)")
+    ks = bytearray(); ctr = 0
+    while len(ks) < len(ct):
+        ks.extend(hmac.new(enc_key, nonce + ctr.to_bytes(8, "big"), hashlib.sha256).digest()); ctr += 1
+    return bytes(a ^ b for a, b in zip(ct, ks[:len(ct)])).decode("utf-8")
+
+
 def _load_api_keys():
-    """Load KEY=VALUE lines from api_keys.env (beside this file) into os.environ for any
-    key not already set — keeps all secrets in one local, git-ignored file (the 'api file')."""
+    """Load API keys into os.environ from the encrypted vault api_keys.enc (machine-bound).
+    If only the plaintext api_keys.env exists, load it, encrypt it to api_keys.enc, and delete
+    the plaintext — so keys live encrypted at rest."""
     try:
-        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_keys.env")
-        if not os.path.exists(_p):
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        _enc = os.path.join(_dir, "api_keys.enc")
+        _plain = os.path.join(_dir, "api_keys.env")
+        text = None
+        if os.path.exists(_enc):
+            try:
+                text = _keyvault_decrypt(open(_enc, encoding="utf-8").read())
+            except Exception:
+                text = None
+        if text is None and os.path.exists(_plain):
+            text = open(_plain, encoding="utf-8").read()
+            try:
+                with open(_enc, "w", encoding="utf-8") as _f:
+                    _f.write(_keyvault_encrypt(text))
+                os.remove(_plain)
+            except Exception:
+                pass
+        if not text:
             return
-        with open(_p, encoding="utf-8") as _f:
-            for _ln in _f:
-                _ln = _ln.strip()
-                if not _ln or _ln.startswith("#") or "=" not in _ln:
-                    continue
-                _k, _v = _ln.split("=", 1)
-                _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
-                if _k and _v and not os.environ.get(_k):
-                    os.environ[_k] = _v
+        for _ln in text.splitlines():
+            _ln = _ln.strip()
+            if not _ln or _ln.startswith("#") or "=" not in _ln:
+                continue
+            _k, _v = _ln.split("=", 1)
+            _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
+            if _k and _v and not os.environ.get(_k):
+                os.environ[_k] = _v
     except Exception:
         pass
 

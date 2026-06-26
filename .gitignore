@@ -1,5 +1,7 @@
 # Secrets — local API keys (never commit)
 api_keys.env
+api_keys.enc
+.av_macro_cache.json
 token.txt
 us_bot_token.txt
 us_bot_id.txt

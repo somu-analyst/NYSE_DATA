@@ -224,22 +224,74 @@ import logging
 import sqlite3
 
 
+def _keyvault_key(salt):
+    """Derive a 64-byte key, machine/user-bound (or KEYVAULT_PASSPHRASE if set)."""
+    import hashlib, getpass, platform
+    secret = os.environ.get("KEYVAULT_PASSPHRASE") or f"{getpass.getuser()}|{platform.node()}|nyse-data-keyvault-v1"
+    return hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, 200000, dklen=64)
+
+
+def _keyvault_encrypt(plaintext):
+    """Encrypt with an HMAC-SHA256 keystream (CTR) + encrypt-then-MAC. Stdlib only."""
+    import hmac, hashlib, base64
+    salt = os.urandom(16); nonce = os.urandom(16)
+    k = _keyvault_key(salt); enc_key, mac_key = k[:32], k[32:]
+    data = plaintext.encode("utf-8")
+    ks = bytearray(); ctr = 0
+    while len(ks) < len(data):
+        ks.extend(hmac.new(enc_key, nonce + ctr.to_bytes(8, "big"), hashlib.sha256).digest()); ctr += 1
+    ct = bytes(a ^ b for a, b in zip(data, ks[:len(data)]))
+    tag = hmac.new(mac_key, salt + nonce + ct, hashlib.sha256).digest()
+    return base64.b64encode(b"NVK1" + salt + nonce + ct + tag).decode("ascii")
+
+
+def _keyvault_decrypt(blob):
+    import hmac, hashlib, base64
+    raw = base64.b64decode(blob)
+    if raw[:4] != b"NVK1":
+        raise ValueError("bad vault format")
+    salt, nonce, tag, ct = raw[4:20], raw[20:36], raw[-32:], raw[36:-32]
+    k = _keyvault_key(salt); enc_key, mac_key = k[:32], k[32:]
+    if not hmac.compare_digest(tag, hmac.new(mac_key, salt + nonce + ct, hashlib.sha256).digest()):
+        raise ValueError("vault integrity check failed (wrong machine/passphrase?)")
+    ks = bytearray(); ctr = 0
+    while len(ks) < len(ct):
+        ks.extend(hmac.new(enc_key, nonce + ctr.to_bytes(8, "big"), hashlib.sha256).digest()); ctr += 1
+    return bytes(a ^ b for a, b in zip(ct, ks[:len(ct)])).decode("utf-8")
+
+
 def _load_api_keys():
-    """Load KEY=VALUE lines from api_keys.env (beside this file) into os.environ for any
-    key not already set — keeps all secrets in one local, git-ignored file (the 'api file')."""
+    """Load API keys into os.environ from the encrypted vault api_keys.enc (machine-bound).
+    If only the plaintext api_keys.env exists, load it, encrypt it to api_keys.enc, and delete
+    the plaintext — so keys live encrypted at rest."""
     try:
-        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_keys.env")
-        if not os.path.exists(_p):
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        _enc = os.path.join(_dir, "api_keys.enc")
+        _plain = os.path.join(_dir, "api_keys.env")
+        text = None
+        if os.path.exists(_enc):
+            try:
+                text = _keyvault_decrypt(open(_enc, encoding="utf-8").read())
+            except Exception:
+                text = None
+        if text is None and os.path.exists(_plain):
+            text = open(_plain, encoding="utf-8").read()
+            try:
+                with open(_enc, "w", encoding="utf-8") as _f:
+                    _f.write(_keyvault_encrypt(text))
+                os.remove(_plain)
+            except Exception:
+                pass
+        if not text:
             return
-        with open(_p, encoding="utf-8") as _f:
-            for _ln in _f:
-                _ln = _ln.strip()
-                if not _ln or _ln.startswith("#") or "=" not in _ln:
-                    continue
-                _k, _v = _ln.split("=", 1)
-                _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
-                if _k and _v and not os.environ.get(_k):
-                    os.environ[_k] = _v
+        for _ln in text.splitlines():
+            _ln = _ln.strip()
+            if not _ln or _ln.startswith("#") or "=" not in _ln:
+                continue
+            _k, _v = _ln.split("=", 1)
+            _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
+            if _k and _v and not os.environ.get(_k):
+                os.environ[_k] = _v
     except Exception:
         pass
 
@@ -21890,7 +21942,61 @@ def _macro_keyless():
     return rows
 
 
+_AV_MACRO_SERIES = [
+    ("REAL_GDP", "Real GDP", "&interval=annual", "$B"),
+    ("INFLATION", "Inflation", "", "%"),
+    ("RETAIL_SALES", "Retail Sales", "", "$M"),
+    ("DURABLES", "Durables", "", "$M"),
+    ("FEDERAL_FUNDS_RATE", "Fed Funds", "&interval=monthly", "%"),
+]
+_AV_MACRO_CACHE = {"day": None, "rows": None}
+
+
+def _av_macro():
+    """Alpha Vantage economic indicators. Free tier = 25 req/day & 1/sec, so fetched at most once
+    per calendar day (spaced) and cached to a file that survives restarts."""
+    key = os.environ.get("ALPHAVANTAGE_KEY", "")
+    if not key:
+        return []
+    import time as _t, json as _j, datetime as _dt, urllib.request as _u
+    today = _dt.date.today().isoformat()
+    if _AV_MACRO_CACHE["rows"] is not None and _AV_MACRO_CACHE["day"] == today:
+        return _AV_MACRO_CACHE["rows"]
+    cache_f = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".av_macro_cache.json")
+    try:
+        if os.path.exists(cache_f):
+            c = _j.load(open(cache_f, encoding="utf-8"))
+            if c.get("day") == today and c.get("rows"):
+                _AV_MACRO_CACHE.update(day=today, rows=c["rows"]); return c["rows"]
+    except Exception:
+        pass
+    rows = []; ok = False
+    for fn, name, extra, unit in _AV_MACRO_SERIES:
+        try:
+            url = f"https://www.alphavantage.co/query?function={fn}&apikey={key}{extra}"
+            d = _j.loads(_u.urlopen(url, timeout=12).read().decode())
+            data = d.get("data", [])
+            if data:
+                rows.append(f"{name:<13}{float(data[0]['value']):>12,.1f} {unit}"); ok = True
+            _t.sleep(1.3)
+        except Exception:
+            continue
+    if ok:
+        _AV_MACRO_CACHE.update(day=today, rows=rows)
+        try:
+            _j.dump({"day": today, "rows": rows}, open(cache_f, "w", encoding="utf-8"))
+        except Exception:
+            pass
+    return rows
+
+
+_MACRO_REPORT_CACHE = {"ts": 0.0, "txt": None}
+
+
 def _fmt_macro_report():
+    import time as _t
+    if _MACRO_REPORT_CACHE["txt"] is not None and _t.time() - _MACRO_REPORT_CACHE["ts"] < 21600:
+        return _MACRO_REPORT_CACHE["txt"]   # 6h cache — protects free-tier API quotas
     lines = ["📊 <b>MACRO DASHBOARD</b>", ""]
     if not os.environ.get("FRED_API_KEY"):
         rows = _macro_keyless()
@@ -21913,12 +22019,17 @@ def _fmt_macro_report():
             lines.append("<pre>" + "\n".join(rows) + "</pre>")
         else:
             lines.append("Could not fetch FRED data.")
+    av = _av_macro()
+    if av:
+        lines += ["", "🏦 <b>AlphaVantage indicators:</b>", "<pre>" + "\n".join(av) + "</pre>"]
     sent = _av_sentiment("SPY,QQQ")
     if sent:
         lines += ["", f"📰 <b>News sentiment:</b> {sent['label']} ({sent['avg']:+.2f}, {sent['n']} articles)"]
     elif not os.environ.get("ALPHAVANTAGE_KEY"):
         lines += ["", "<i>Set ALPHAVANTAGE_KEY for news-sentiment (free at alphavantage.co).</i>"]
-    return "\n".join(lines)
+    txt = "\n".join(lines)
+    _MACRO_REPORT_CACHE.update(ts=_t.time(), txt=txt)
+    return txt
 
 async def macro_command(update, ctx):
     """/macro - FRED macro indicators + AlphaVantage news sentiment (keys optional)."""
