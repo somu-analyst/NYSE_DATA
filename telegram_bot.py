@@ -16766,13 +16766,16 @@ class TV:
         self.type_text(str(tf)); _tvb_time.sleep(0.4); self.press_enter(); _tvb_time.sleep(0.6)
 
     def open_chart(self, symbol, tf=None):
-        self.navigate(f"https://www.tradingview.com/chart/?symbol={symbol}", wait=3.0)
+        url = f"https://www.tradingview.com/chart/?symbol={symbol}"
         if tf:
-            self.set_timeframe(tf)
+            url += f"&interval={tf}"          # set interval via URL — avoids the typed-interval popup
+        self.navigate(url, wait=3.0)
 
     def screenshot_symbol(self, symbol, tf=None, settle=4.5):
         self.open_chart(symbol, tf)
         try:
+            self._key("keyDown", key="Escape", code="Escape", vk=27)    # dismiss any stray popup
+            self._key("keyUp", key="Escape", code="Escape", vk=27)
             self.evaluate("window.dispatchEvent(new Event('resize'))")  # nudge TV to repaint
         except Exception:
             pass
