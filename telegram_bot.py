@@ -15715,6 +15715,9 @@ def _kb_plan(conn=None):
             btns = [InlineKeyboardButton(f"📈 {t}", callback_data=f"plan_chart_{t}") for t in tks[:9]]
             for i in range(0, len(btns), 3):
                 rows.append(btns[i:i + 3])
+            tvbtns = [InlineKeyboardButton(f"📺 {t}", callback_data=f"tvc_{t}") for t in tks[:9]]
+            for i in range(0, len(tvbtns), 3):
+                rows.append(tvbtns[i:i + 3])
             if tks:
                 rows.append([InlineKeyboardButton("📊 Portfolio chart", callback_data="plan_port_chart")])
         except Exception:
