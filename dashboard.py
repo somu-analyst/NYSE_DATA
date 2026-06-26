@@ -17630,19 +17630,40 @@ def _macro_bls_full():
     return out
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _macro_yields_full():
-    """Current yields + 1-month history for the curve chart. Keyless (yfinance)."""
-    import yfinance as _yf
+    """Full Treasury par yield curve (keyless, official) incl. 2Y for the 2s10s spread.
+    Returns {tenor: {last, prev}} (+ '_date'); yfinance fallback if Treasury is unreachable."""
+    import urllib.request as _u, csv as _csv, io as _io, datetime as _dt
+    want = [("3 Mo", "3M"), ("2 Yr", "2Y"), ("5 Yr", "5Y"), ("10 Yr", "10Y"), ("30 Yr", "30Y")]
     out = {}
-    for sym, name in [("^IRX", "3M"), ("^FVX", "5Y"), ("^TNX", "10Y"), ("^TYX", "30Y")]:
-        try:
-            h = _yf.Ticker(sym).history(period="1mo")["Close"].dropna()
-            if len(h):
-                out[name] = {"last": float(h.iloc[-1]),
-                             "prev": float(h.iloc[-2]) if len(h) > 1 else float(h.iloc[-1])}
-        except Exception:
-            pass
+    try:
+        yr = _dt.datetime.now().year
+        url = (f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+               f"daily-treasury-rates.csv/{yr}/all?type=daily_treasury_yield_curve"
+               f"&field_tdr_date_value={yr}&page&_format=csv")
+        req = _u.Request(url, headers={"User-Agent": "Mozilla/5.0 nyse-data/1.0"})
+        rows = list(_csv.DictReader(_io.StringIO(_u.urlopen(req, timeout=20).read().decode("utf-8", "ignore"))))
+        if rows:
+            cur = rows[0]; prev = rows[1] if len(rows) > 1 else rows[0]
+            for col, label in want:
+                try:
+                    out[label] = {"last": float(cur[col]), "prev": float(prev[col])}
+                except Exception:
+                    pass
+            out["_date"] = cur.get("Date")
+    except Exception:
+        out = {}
+    if not any(k for k in out if k != "_date"):   # fallback: yfinance (no 2Y)
+        import yfinance as _yf
+        for sym, name in [("^IRX", "3M"), ("^FVX", "5Y"), ("^TNX", "10Y"), ("^TYX", "30Y")]:
+            try:
+                h = _yf.Ticker(sym).history(period="1mo")["Close"].dropna()
+                if len(h):
+                    out[name] = {"last": float(h.iloc[-1]),
+                                 "prev": float(h.iloc[-2]) if len(h) > 1 else float(h.iloc[-1])}
+            except Exception:
+                pass
     return out
 
 
@@ -17903,7 +17924,7 @@ if page == "📡 Macro/Event Hub":
             try:
                 _y = _macro_yields_full()
                 if _y:
-                    _order = [k for k in ("3M", "5Y", "10Y", "30Y") if k in _y]
+                    _order = [k for k in ("3M", "2Y", "5Y", "10Y", "30Y") if k in _y]
                     _yc1, _yc2 = st.columns([1, 1])
                     with _yc1:
                         st.markdown("**Treasury yields**")
@@ -17916,18 +17937,17 @@ if page == "📡 Macro/Event Hub":
                         st.line_chart(pd.DataFrame({"Tenor": _order,
                                                     "Yield %": [_y[k]["last"] for k in _order]}).set_index("Tenor"),
                                       height=200)
+                    _exp = []
+                    if "10Y" in _y and "2Y" in _y:
+                        _s2 = (_y["10Y"]["last"] - _y["2Y"]["last"]) * 100
+                        _lab = ("🔴 inverted — recession signal, rate cuts priced" if _s2 < 0 else
+                                "🟡 flat — late-cycle, Fed near a pause" if _s2 < 25 else
+                                "🟢 positive — expansion / higher-for-longer priced")
+                        _exp.append(f"**2s10s** {_s2:+.0f}bp · {_lab}")
                     if "10Y" in _y and "3M" in _y:
-                        _slope = (_y["10Y"]["last"] - _y["3M"]["last"]) * 100
-                        if _slope < -10:
-                            _exp = (f"🔴 **Curve inverted** (10Y−3M = {_slope:+.0f}bp) — market is pricing a "
-                                    "slowdown and eventual Fed rate cuts.")
-                        elif _slope < 25:
-                            _exp = (f"🟡 **Curve flat** (10Y−3M = {_slope:+.0f}bp) — late-cycle; market expects "
-                                    "the Fed roughly on hold.")
-                        else:
-                            _exp = (f"🟢 **Curve steep** (10Y−3M = {_slope:+.0f}bp) — market pricing growth and "
-                                    "higher rates ahead.")
-                        st.info("📈 **Market expectations** — " + _exp)
+                        _exp.append(f"**10Y−3M** {(_y['10Y']['last']-_y['3M']['last'])*100:+.0f}bp")
+                    if _exp:
+                        st.info("📈 **Market expectations** — " + "  ·  ".join(_exp))
             except Exception as e:
                 st.caption(f"Yields unavailable: {e}")
             # ── inflation-trend read ──
