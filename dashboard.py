@@ -23,6 +23,29 @@ import warnings, sys, os
 warnings.filterwarnings("ignore")
 
 
+def _load_api_keys():
+    """Load KEY=VALUE lines from api_keys.env (beside this file) into os.environ for any
+    key not already set — keeps all secrets in one local, git-ignored file (the 'api file')."""
+    try:
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_keys.env")
+        if not os.path.exists(_p):
+            return
+        with open(_p, encoding="utf-8") as _f:
+            for _ln in _f:
+                _ln = _ln.strip()
+                if not _ln or _ln.startswith("#") or "=" not in _ln:
+                    continue
+                _k, _v = _ln.split("=", 1)
+                _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
+                if _k and _v and not os.environ.get(_k):
+                    os.environ[_k] = _v
+    except Exception:
+        pass
+
+
+_load_api_keys()
+
+
 def compute_walls(df, spot=None):
     """Identify the call wall (max call-OI strike = resistance) and put wall
     (max put-OI strike = support), with each wall's OI and strength (OI / mean OI).
