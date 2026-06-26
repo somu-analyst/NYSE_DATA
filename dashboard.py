@@ -295,6 +295,108 @@ def _historical_vol(ticker: str, window: int = 30) -> float:
     except Exception:
         return 0.30
 
+# ── Reusable time-range picker for time-series charts ─────────────────────────
+# Brokerage-style ranges. Intraday (DB has no intraday) → yfinance; the rest are
+# DB-first (stock_daily) with a yfinance fallback. Use _chart_range_picker() to
+# render the control and _history_for_range()/_ohlc_for_range() to fetch bars.
+_CHART_RANGES = ["1D", "1W", "1M", "MTD", "YTD", "1Y", "5Y", "ALL"]
+
+
+def _chart_range_picker(key: str, default: str = "1M", options=None, label="Range"):
+    """Render a compact per-chart range selector; return the chosen range key.
+    Selection is remembered per `key` across reruns."""
+    opts = list(options or _CHART_RANGES)
+    cur = st.session_state.get(key, default)
+    if cur not in opts:
+        cur = default if default in opts else opts[0]
+    try:
+        sel = st.segmented_control(label, opts, default=cur, key=f"{key}_sc",
+                                   label_visibility="collapsed")
+    except Exception:
+        sel = st.radio(label, opts, index=opts.index(cur), horizontal=True,
+                       key=f"{key}_rd", label_visibility="collapsed")
+    sel = sel or cur
+    st.session_state[key] = sel
+    return sel
+
+
+def _range_start(rng: str):
+    """Pandas Timestamp for the start of a range, or None for 1D/ALL (no lower bound)."""
+    today = pd.Timestamp(pd.Timestamp.today().date())
+    return {
+        "1W":  today - pd.Timedelta(days=7),
+        "1M":  today - pd.Timedelta(days=31),
+        "MTD": today.replace(day=1),
+        "YTD": today.replace(month=1, day=1),
+        "1Y":  today - pd.Timedelta(days=366),
+        "5Y":  today - pd.Timedelta(days=366 * 5),
+    }.get((rng or "").upper())
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _db_close_history(ticker: str) -> pd.DataFrame:
+    """Full daily Close history from stock_daily — chronological, tz-naive DatetimeIndex."""
+    try:
+        df = _q("SELECT trade_date, close FROM stock_daily WHERE ticker=?", [ticker.upper()])
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df["dt"] = pd.to_datetime(df["trade_date"], format="%m-%d-%Y", errors="coerce")
+    df = df.dropna(subset=["dt"]).sort_values("dt").set_index("dt")
+    return df[["close"]].rename(columns={"close": "Close"})
+
+
+def _history_for_range(ticker: str, rng: str) -> pd.DataFrame:
+    """Close-history (tz-naive DatetimeIndex, 'Close' column) for a range key.
+    Intraday (1D/1W) → yfinance; daily ranges are DB-first with a yfinance fallback."""
+    rng = (rng or "1M").upper()
+    if rng in ("1D", "1W"):
+        per, itv = ("1d", "5m") if rng == "1D" else ("5d", "30m")
+        h = _cached_history(ticker, period=per, interval=itv)
+        return h[["Close"]].dropna() if h is not None and not h.empty else pd.DataFrame()
+
+    start = _range_start(rng)
+    db = _db_close_history(ticker)
+    if not db.empty:
+        out = db if start is None else db[db.index >= start]
+        if len(out) >= 2:
+            return out
+    # Fallback / supplement from yfinance when the DB lacks this ticker or range
+    yf_period = {"1M": "1mo", "MTD": "2mo", "YTD": "1y",
+                 "1Y": "1y", "5Y": "5y", "ALL": "max"}.get(rng, "1y")
+    h = _cached_history(ticker, period=yf_period, interval="1d")
+    if h is None or h.empty:
+        return db if not db.empty else pd.DataFrame()
+    h = h[["Close"]].dropna()
+    if getattr(h.index, "tz", None) is not None:
+        h.index = h.index.tz_localize(None)
+    if start is not None:
+        h = h[h.index >= start]
+    return h
+
+
+def _ohlc_for_range(ticker: str, rng: str) -> pd.DataFrame:
+    """OHLC bars for a range key (yfinance — stock_daily stores close only, so candles
+    always come from yfinance). tz-naive DatetimeIndex; MTD/YTD are sliced to the range."""
+    rng = (rng or "1M").upper()
+    per, itv = {
+        "1D": ("1d", "5m"), "1W": ("5d", "30m"), "1M": ("1mo", "1d"),
+        "MTD": ("3mo", "1d"), "YTD": ("1y", "1d"), "1Y": ("1y", "1d"),
+        "5Y": ("5y", "1wk"), "ALL": ("max", "1wk"),
+    }.get(rng, ("3mo", "1d"))
+    h = _cached_history(ticker, period=per, interval=itv)
+    if h is None or h.empty:
+        return h if h is not None else pd.DataFrame()
+    if getattr(h.index, "tz", None) is not None:
+        h = h.copy()
+        h.index = h.index.tz_localize(None)
+    if rng in ("MTD", "YTD"):
+        start = _range_start(rng)
+        if start is not None:
+            h = h[h.index >= start]
+    return h
+
 @st.cache_data(ttl=120, show_spinner=False)
 def _fetch_option_mid(ticker: str, expiry_str: str, strike: float, opt_type: str
                       ) -> tuple:
@@ -5045,33 +5147,38 @@ if page == "🌍 Market Overview":
             _stored = load_market_history(_inst_sym)
             if not _stored.empty:
                 _stored["timestamp"] = pd.to_datetime(_stored["timestamp"])
+                if getattr(_stored["timestamp"].dt, "tz", None) is not None:
+                    _stored["timestamp"] = _stored["timestamp"].dt.tz_localize(None)
                 _stored = _stored.sort_values("timestamp")
+                # Range filter on snapshot timestamps (defaults to ALL = full history)
+                _srng = _chart_range_picker("rng_stored_chart", default="ALL")
+                _sstart = pd.Timestamp(pd.Timestamp.today().date()) if _srng == "1D" else _range_start(_srng)
+                _sv = _stored if _sstart is None else _stored[_stored["timestamp"] >= _sstart]
+                if len(_sv) < 2:          # not enough snapshots in range → fall back to all
+                    _sv = _stored
                 _fig_stored = go.Figure()
                 _fig_stored.add_trace(go.Scatter(
-                    x=_stored["timestamp"], y=_stored["price"], mode="lines+markers",
+                    x=_sv["timestamp"], y=_sv["price"], mode="lines+markers",
                     line=dict(color="#0066cc", width=2), marker=dict(size=4),
                     name="Price", hovertemplate="%{x}<br>$%{y:,.2f}<extra></extra>",
                 ))
-                _st_ymin = float(_stored["price"].min()) * 0.997
-                _st_ymax = float(_stored["price"].max()) * 1.003
+                _st_ymin = float(_sv["price"].min()) * 0.997
+                _st_ymax = float(_sv["price"].max()) * 1.003
                 _fig_stored.update_layout(
                     template="plotly_white", height=250,
-                    title=f"{_inst_icon} {_disp_name} — Stored Price History ({len(_stored)} snapshots)",
+                    title=f"{_inst_icon} {_disp_name} — Stored Price History ({len(_sv)} snapshots · {_srng})",
                     xaxis_title="Time", yaxis_title="Price",
                     margin=dict(t=40, b=30, l=50, r=20),
                 )
                 _fig_stored.update_yaxes(range=[_st_ymin, _st_ymax])
                 st.plotly_chart(_fig_stored, use_container_width=True)
-                st.caption(f"📦 {len(_stored)} data points · Earliest: {_stored['timestamp'].iloc[0].strftime('%Y-%m-%d %H:%M')} · Latest: {_stored['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M')}")
+                st.caption(f"📦 {len(_sv)} data points · Earliest: {_sv['timestamp'].iloc[0].strftime('%Y-%m-%d %H:%M')} · Latest: {_sv['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M')}")
 
             with st.spinner(f"Loading {_disp_name} data..."):
                 try:
-                    # Period selector
-                    _per_col1, _per_col2 = st.columns([3, 1])
-                    with _per_col2:
-                        _chart_period = st.selectbox("Chart Period", ["5d", "1mo", "3mo", "6mo", "1y", "2y"], index=2, key="mo_period")
-
-                    _hist = _cached_history(_inst_sym, period=_chart_period)
+                    # Range selector (1D/1W/1M/MTD/YTD/1Y/5Y/ALL)
+                    _rng = _chart_range_picker("rng_inst_chart", default="1M")
+                    _hist = _ohlc_for_range(_inst_sym, _rng)
 
                     if not _hist.empty:
                         # ── Header card ──
@@ -5217,7 +5324,7 @@ if page == "🌍 Market Overview":
                         _total_height = 420 + (_n_subplots - 1) * 160
                         fig_inst.update_layout(
                             template="plotly_white", height=_total_height,
-                            title=f"{_inst_icon} {sel_instrument if not _is_custom else _inst_sym} — {_chart_period.upper()}",
+                            title=f"{_inst_icon} {sel_instrument if not _is_custom else _inst_sym} — {_rng.upper()}",
                             xaxis_rangeslider_visible=False,
                             margin=dict(t=50, b=40, l=60, r=20),
                             legend=dict(orientation="h", y=1.02, x=0),
@@ -5250,8 +5357,8 @@ if page == "🌍 Market Overview":
                         _volatility = float(_daily_returns.std() * np.sqrt(252) * 100) if len(_daily_returns) > 5 else 0
 
                         ks1, ks2, ks3, ks4, ks5, ks6 = st.columns(6)
-                        ks1.metric(f"High ({_chart_period})", f"${_high_period:,.2f}")
-                        ks2.metric(f"Low ({_chart_period})", f"${_low_period:,.2f}")
+                        ks1.metric(f"High ({_rng})", f"${_high_period:,.2f}")
+                        ks2.metric(f"Low ({_rng})", f"${_low_period:,.2f}")
                         ks3.metric("From High", f"{_pct_from_high:+.1f}%")
                         ks4.metric("From Low", f"{_pct_from_low:+.1f}%")
                         ks5.metric("Avg Volume", f"{_avg_vol:,.0f}" if _avg_vol > 0 else "N/A")
@@ -17143,19 +17250,223 @@ if page == "📰 Market Wrap":
         st.caption(f"As of {_F['ts'].strftime('%Y-%m-%d %H:%M')} · index $-cap figures are estimates · "
                    "not investment advice.")
 
+# ── TradingView CDP bridge (inlined; auto-launches Chrome off-screen in background) ──
+import os as _tvb_os, json as _tvb_json, subprocess as _tvb_sub, base64 as _tvb_b64
+import time as _tvb_time, urllib.request as _tvb_url
+
+_TVB_CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+]
+_TVB_PORT = 9222
+_TVB_CHART_URL = "https://www.tradingview.com/chart/"
+
+
+def _tvb_user_data():
+    return _tvb_os.path.join(_tvb_os.environ.get("LOCALAPPDATA", _tvb_os.getcwd()), "tv_bridge_profile")
+
+
+def _tvb_chrome_path():
+    for p in _TVB_CHROME_CANDIDATES:
+        if _tvb_os.path.exists(p):
+            return p
+    raise FileNotFoundError("Chrome/Edge not found in the standard locations.")
+
+
+def launch_chrome(url=_TVB_CHART_URL, port=_TVB_PORT, headless=False):
+    """Start a dedicated Chrome with the CDP debug port open, parked off-screen and
+    detached so the chart canvas renders (headless leaves it blank) without a visible window."""
+    ud = _tvb_user_data()
+    _tvb_os.makedirs(ud, exist_ok=True)
+    args = [_tvb_chrome_path(), f"--remote-debugging-port={port}", f"--user-data-dir={ud}",
+            "--remote-allow-origins=*", "--no-first-run", "--no-default-browser-check",
+            "--window-size=1680,950", "--window-position=-2600,-2600",
+            "--force-device-scale-factor=1",
+            "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling", "--disable-features=CalculateNativeWinOcclusion"]
+    if headless:
+        args += ["--headless=new", "--disable-gpu"]
+    args.append(url)
+    flags = getattr(_tvb_sub, "DETACHED_PROCESS", 0)
+    try:
+        return _tvb_sub.Popen(args, creationflags=flags) if flags else _tvb_sub.Popen(args)
+    except Exception:
+        return _tvb_sub.Popen(args)
+
+
+def _tvb_targets(port=_TVB_PORT):
+    with _tvb_url.urlopen(f"http://127.0.0.1:{port}/json", timeout=5) as r:
+        return _tvb_json.loads(r.read().decode())
+
+
+class TV:
+    """Thin CDP client attached to one Chrome page (the TradingView tab)."""
+
+    def __init__(self, port=_TVB_PORT, match="tradingview.com"):
+        self.port = port; self.match = match; self.ws = None; self._id = 0; self.target = None
+
+    def connect(self, timeout=20):
+        import websocket
+        deadline = _tvb_time.time() + timeout; last = None
+        while _tvb_time.time() < deadline:
+            try:
+                pages = [t for t in _tvb_targets(self.port) if t.get("type") == "page"]
+                tv = [t for t in pages if self.match in (t.get("url") or "")]
+                self.target = (tv or pages or [None])[0]
+                if self.target and self.target.get("webSocketDebuggerUrl"):
+                    self.ws = websocket.create_connection(self.target["webSocketDebuggerUrl"],
+                                                          max_size=None, suppress_origin=True, timeout=15)
+                    for dom in ("Page", "Runtime", "DOM"):
+                        try:
+                            self._cmd(f"{dom}.enable")
+                        except Exception:
+                            pass
+                    return True
+            except Exception as e:
+                last = e
+            _tvb_time.sleep(0.5)
+        raise RuntimeError(f"Could not attach to Chrome on :{self.port} ({last}).")
+
+    def close(self):
+        try:
+            if self.ws:
+                self.ws.close()
+        finally:
+            self.ws = None
+
+    def _cmd(self, method, **params):
+        self._id += 1; mid = self._id
+        self.ws.send(_tvb_json.dumps({"id": mid, "method": method, "params": params}))
+        while True:
+            msg = _tvb_json.loads(self.ws.recv())
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(msg["error"])
+                return msg.get("result", {})
+
+    def evaluate(self, expression, await_promise=False):
+        r = self._cmd("Runtime.evaluate", expression=expression, returnByValue=True, awaitPromise=await_promise)
+        if r.get("exceptionDetails"):
+            raise RuntimeError(r["exceptionDetails"].get("text", "JS error"))
+        return r.get("result", {}).get("value")
+
+    def screenshot_bytes(self):
+        r = self._cmd("Page.captureScreenshot", format="png")
+        return _tvb_b64.b64decode(r["data"])
+
+    def navigate(self, url, wait=2.0):
+        self._cmd("Page.navigate", url=url); _tvb_time.sleep(wait)
+
+    def _key(self, etype, key=None, code=None, vk=None, text=None):
+        p = {"type": etype}
+        if key:
+            p["key"] = key
+        if code:
+            p["code"] = code
+        if vk is not None:
+            p["windowsVirtualKeyCode"] = vk
+        if text is not None:
+            p["text"] = text
+        self._cmd("Input.dispatchKeyEvent", **p)
+
+    def type_text(self, text, delay=0.03):
+        for ch in str(text):
+            self._key("keyDown", text=ch); self._key("keyUp", text=ch); _tvb_time.sleep(delay)
+
+    def press_enter(self):
+        self._key("keyDown", key="Enter", code="Enter", vk=13)
+        self._key("keyUp", key="Enter", code="Enter", vk=13)
+
+    def set_timeframe(self, tf):
+        self.type_text(str(tf)); _tvb_time.sleep(0.4); self.press_enter(); _tvb_time.sleep(0.6)
+
+    def open_chart(self, symbol, tf=None):
+        self.navigate(f"https://www.tradingview.com/chart/?symbol={symbol}", wait=3.0)
+        if tf:
+            self.set_timeframe(tf)
+
+    def screenshot_symbol(self, symbol, tf=None, settle=4.5):
+        self.open_chart(symbol, tf)
+        try:
+            self.evaluate("window.dispatchEvent(new Event('resize'))")
+        except Exception:
+            pass
+        _tvb_time.sleep(settle)
+        return self.screenshot_bytes()
+
+    def health(self):
+        out = {"chrome_up": False, "attached": bool(self.ws), "port": self.port}
+        try:
+            ts = _tvb_targets(self.port)
+            pages = [x for x in ts if x.get("type") == "page"]
+            tv = [x for x in pages if self.match in (x.get("url") or "")]
+            out.update(chrome_up=True, pages=len(pages), tv_pages=len(tv), url=(self.target or {}).get("url"))
+            if self.ws:
+                try:
+                    out["js_ok"] = (self.evaluate("1+1") == 2)
+                    out["title"] = self.evaluate("document.title")
+                except Exception as e:
+                    out["js_ok"] = False; out["js_error"] = str(e)
+        except Exception as e:
+            out["error"] = str(e)
+        return out
+
+
+def _tv_ensure_launched():
+    try:
+        _tvb_targets()
+    except Exception:
+        try:
+            launch_chrome()
+        except Exception:
+            pass
+
+
+def _tv_capture(symbol, tf=None, settle=4.5):
+    """Auto-launch the bridge Chrome (off-screen, background) and capture a chart PNG."""
+    _tv_ensure_launched()
+    tv = None
+    try:
+        tv = TV(); tv.connect(timeout=25)
+        return tv.screenshot_symbol(symbol, tf, settle=settle), None
+    except Exception as e:
+        return None, str(e)
+    finally:
+        try:
+            if tv:
+                tv.close()
+        except Exception:
+            pass
+
+
+def _tv_health():
+    _tv_ensure_launched()
+    tv = None
+    try:
+        tv = TV(); tv.connect(timeout=20); return tv.health()
+    except Exception as e:
+        return {"chrome_up": False, "error": str(e)}
+    finally:
+        try:
+            if tv:
+                tv.close()
+        except Exception:
+            pass
+
+
 if page == "📺 TradingView":
     _page_header("📺 TradingView — live chart via the CDP bridge")
-    st.caption("Captures a TradingView chart through the local Chrome DevTools bridge (tv_bridge.py), "
-               "then pairs it with your computed levels. Unofficial & fragile — it automates the TV web UI.")
-    with st.expander("⚙️ One-time setup — how to connect", expanded=False):
+    st.caption("Captures a TradingView chart through an automatic Chrome DevTools bridge — Chrome is "
+               "launched off-screen in the background on first use (nothing to run, nothing to log into). "
+               "Unofficial & fragile: it automates the TV web UI.")
+    with st.expander("ℹ️ How it works / limits", expanded=False):
         st.markdown(
-            "1. On this machine, run in a terminal: `python tv_bridge.py launch`\n"
-            "2. A dedicated Chrome window opens — **log into TradingView once** (the session persists in "
-            "its own profile).\n"
-            "3. Leave that Chrome open, come back here, and hit **Capture**.\n\n"
-            "_Note:_ programmatic drawings and external Pine backtests aren't possible on **web** "
-            "TradingView (the chart is a private canvas with no public API). This grabs the chart image "
-            "and overlays *our* levels — data TradingView doesn't have.")
+            "- The bridge **auto-starts** a dedicated Chrome off-screen the first time you capture — no "
+            "terminal command and no login (TradingView charts render for anonymous users).\n"
+            "- First capture can take ~10–20s while Chrome warms up; later ones are quick.\n"
+            "- Programmatic drawings & external Pine backtests aren't possible on **web** TradingView "
+            "(private canvas) — so we capture the chart image and overlay *our* computed levels.")
 
     _tv_def = "SPY"
     try:
@@ -17172,25 +17483,16 @@ if page == "📺 TradingView":
     _go = _c3.button("📸 Capture", use_container_width=True)
 
     with st.expander("🔌 Bridge health", expanded=False):
-        try:
-            import tv_bridge as _tvb
-            _tvh = _tvb.TV(); _tvh.connect(timeout=5)
-            st.json(_tvh.health()); _tvh.close()
-        except Exception as _he:
-            st.warning(f"Not connected — run `python tv_bridge.py launch` first. ({_he})")
+        st.json(_tv_health())
 
     if _go and _tv_sym:
-        try:
-            import tv_bridge as _tvb
-            _tv = _tvb.TV(); _tv.connect(timeout=8)
-            with st.spinner(f"Capturing {_tv_sym} from TradingView…"):
-                _png = _tv.screenshot_symbol(_tv_sym, _tv_tf or None)
-            _tv.close()
+        with st.spinner(f"Capturing {_tv_sym} from TradingView (starting the background bridge if needed)…"):
+            _png, _err = _tv_capture(_tv_sym, _tv_tf or None)
+        if _err:
+            st.error(f"📺 Capture failed: {_err}")
+        else:
             st.session_state["_tv_png"] = _png
             st.session_state["_tv_png_sym"] = _tv_sym
-        except Exception as _ce:
-            st.error(f"📺 Capture failed: {_ce}\n\nRun `python tv_bridge.py launch` and log into "
-                     "TradingView once, then retry.")
 
     if st.session_state.get("_tv_png"):
         _psym = st.session_state.get("_tv_png_sym", "")

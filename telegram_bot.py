@@ -16591,34 +16591,265 @@ async def wrap_view(query):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ── TRADINGVIEW BRIDGE (CDP) — capture a TV chart + overlay our levels
-#    Needs the local bridge: `python tv_bridge.py launch` + TV login once.
+# ── TRADINGVIEW BRIDGE (Chrome DevTools Protocol) — inlined, no separate module
+#    Unofficial & fragile: automates the TradingView *web* UI over CDP. Keep the
+#    debug port on localhost. Drawings & external Pine backtests aren't feasible
+#    on web TV (private canvas) — we capture the chart + overlay our levels.
 # ═══════════════════════════════════════════════════════════════════
-def _tv_capture(symbol, tf=None, settle=2.5):
-    """Capture a TradingView chart screenshot via the CDP bridge.
-    Returns (png_bytes, err) — err is a user-facing string when the bridge is down."""
+import os as _tvb_os, json as _tvb_json, subprocess as _tvb_sub, base64 as _tvb_b64
+import time as _tvb_time, urllib.request as _tvb_url
+
+_TVB_CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+]
+_TVB_PORT = 9222
+_TVB_CHART_URL = "https://www.tradingview.com/chart/"
+
+
+def _tvb_user_data():
+    return _tvb_os.path.join(_tvb_os.environ.get("LOCALAPPDATA", _tvb_os.getcwd()), "tv_bridge_profile")
+
+
+def _tvb_chrome_path():
+    for p in _TVB_CHROME_CANDIDATES:
+        if _tvb_os.path.exists(p):
+            return p
+    raise FileNotFoundError("Chrome/Edge not found in the standard locations.")
+
+
+def launch_chrome(url=_TVB_CHART_URL, port=_TVB_PORT, headless=False):
+    """Start a dedicated Chrome with the CDP debug port open, in the background.
+    Default is a NON-headless window parked far off-screen: TradingView's chart
+    canvas renders properly via the real compositor (headless leaves it blank),
+    but you never see the window. Detached so it survives app restarts."""
+    ud = _tvb_user_data()
+    _tvb_os.makedirs(ud, exist_ok=True)
+    args = [_tvb_chrome_path(), f"--remote-debugging-port={port}", f"--user-data-dir={ud}",
+            "--remote-allow-origins=*", "--no-first-run", "--no-default-browser-check",
+            "--window-size=1680,950", "--window-position=-2600,-2600",
+            "--force-device-scale-factor=1",
+            "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling", "--disable-features=CalculateNativeWinOcclusion"]
+    if headless:
+        args += ["--headless=new", "--disable-gpu"]
+    args.append(url)
+    flags = getattr(_tvb_sub, "DETACHED_PROCESS", 0)
     try:
-        import tv_bridge
-    except Exception as e:
-        return None, f"📺 tv_bridge module unavailable: {e}"
-    tv = None
-    try:
-        tv = tv_bridge.TV()
-        tv.connect(timeout=8)
+        return _tvb_sub.Popen(args, creationflags=flags) if flags else _tvb_sub.Popen(args)
     except Exception:
-        return None, ("📺 <b>TradingView bridge not connected.</b>\nOn the host machine run "
-                      "<code>python tv_bridge.py launch</code> and log into TradingView once, then retry.")
-    try:
-        png = tv.screenshot_symbol(symbol, tf, settle=settle) if symbol else tv.screenshot_bytes()
-        return png, None
-    except Exception as e:
-        return None, f"📺 TV capture error: {e}"
-    finally:
+        return _tvb_sub.Popen(args)
+
+
+def _tvb_targets(port=_TVB_PORT):
+    with _tvb_url.urlopen(f"http://127.0.0.1:{port}/json", timeout=5) as r:
+        return _tvb_json.loads(r.read().decode())
+
+
+class TV:
+    """Thin CDP client attached to one Chrome page (the TradingView tab)."""
+
+    def __init__(self, port=_TVB_PORT, match="tradingview.com"):
+        self.port = port; self.match = match; self.ws = None; self._id = 0; self.target = None
+
+    def connect(self, timeout=20):
+        import websocket  # lazy: a missing dep only disables TV, not the whole app
+        deadline = _tvb_time.time() + timeout; last = None
+        while _tvb_time.time() < deadline:
+            try:
+                pages = [t for t in _tvb_targets(self.port) if t.get("type") == "page"]
+                tv = [t for t in pages if self.match in (t.get("url") or "")]
+                self.target = (tv or pages or [None])[0]
+                if self.target and self.target.get("webSocketDebuggerUrl"):
+                    self.ws = websocket.create_connection(self.target["webSocketDebuggerUrl"],
+                                                          max_size=None, suppress_origin=True, timeout=15)
+                    for dom in ("Page", "Runtime", "DOM"):
+                        try:
+                            self._cmd(f"{dom}.enable")
+                        except Exception:
+                            pass
+                    return True
+            except Exception as e:
+                last = e
+            _tvb_time.sleep(0.5)
+        raise RuntimeError(f"Could not attach to Chrome on :{self.port} ({last}).")
+
+    def close(self):
         try:
-            if tv:
-                tv.close()
+            if self.ws:
+                self.ws.close()
+        finally:
+            self.ws = None
+
+    def _cmd(self, method, **params):
+        self._id += 1; mid = self._id
+        self.ws.send(_tvb_json.dumps({"id": mid, "method": method, "params": params}))
+        while True:
+            msg = _tvb_json.loads(self.ws.recv())
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(msg["error"])
+                return msg.get("result", {})
+
+    def evaluate(self, expression, await_promise=False):
+        r = self._cmd("Runtime.evaluate", expression=expression, returnByValue=True, awaitPromise=await_promise)
+        if r.get("exceptionDetails"):
+            raise RuntimeError(r["exceptionDetails"].get("text", "JS error"))
+        return r.get("result", {}).get("value")
+
+    def screenshot_bytes(self):
+        r = self._cmd("Page.captureScreenshot", format="png")
+        return _tvb_b64.b64decode(r["data"])
+
+    def navigate(self, url, wait=2.0):
+        self._cmd("Page.navigate", url=url); _tvb_time.sleep(wait)
+
+    def _key(self, etype, key=None, code=None, vk=None, text=None):
+        p = {"type": etype}
+        if key:
+            p["key"] = key
+        if code:
+            p["code"] = code
+        if vk is not None:
+            p["windowsVirtualKeyCode"] = vk
+        if text is not None:
+            p["text"] = text
+        self._cmd("Input.dispatchKeyEvent", **p)
+
+    def key_combo(self, modifiers, key, code, vk):
+        for et in ("keyDown", "keyUp"):
+            self._cmd("Input.dispatchKeyEvent", type=et, modifiers=modifiers,
+                      key=key, code=code, windowsVirtualKeyCode=vk)
+
+    def type_text(self, text, delay=0.03):
+        for ch in str(text):
+            self._key("keyDown", text=ch); self._key("keyUp", text=ch); _tvb_time.sleep(delay)
+
+    def press_enter(self):
+        self._key("keyDown", key="Enter", code="Enter", vk=13)
+        self._key("keyUp", key="Enter", code="Enter", vk=13)
+
+    def get_symbol(self):
+        try:
+            return (self.evaluate("document.title") or "").split(" ")[0]
+        except Exception:
+            return None
+
+    def set_timeframe(self, tf):
+        self.type_text(str(tf)); _tvb_time.sleep(0.4); self.press_enter(); _tvb_time.sleep(0.6)
+
+    def open_chart(self, symbol, tf=None):
+        self.navigate(f"https://www.tradingview.com/chart/?symbol={symbol}", wait=3.0)
+        if tf:
+            self.set_timeframe(tf)
+
+    def screenshot_symbol(self, symbol, tf=None, settle=4.5):
+        self.open_chart(symbol, tf)
+        try:
+            self.evaluate("window.dispatchEvent(new Event('resize'))")  # nudge TV to repaint
         except Exception:
             pass
+        _tvb_time.sleep(settle)
+        return self.screenshot_bytes()
+
+    def click_text(self, text, tags="button,[role=button],a,span,div"):
+        js = ("(function(t,sel){var w=t.trim().toLowerCase();"
+              "var els=Array.prototype.slice.call(document.querySelectorAll(sel));"
+              "var el=els.find(function(e){return (e.innerText||'').trim().toLowerCase()===w "
+              "||(e.getAttribute&&((e.getAttribute('aria-label')||'').trim().toLowerCase()===w));});"
+              "if(el){el.click();return true;}return false;})(%s,%s)"
+              % (_tvb_json.dumps(text), _tvb_json.dumps(tags)))
+        try:
+            return bool(self.evaluate(js))
+        except Exception:
+            return False
+
+    # best-effort deep actions (WILL break on TV UI updates)
+    def replay_mode(self):
+        return self.click_text("Replay")
+
+    def open_alert_dialog(self):
+        try:
+            self.key_combo(1, "a", "KeyA", 65); _tvb_time.sleep(0.6); return True
+        except Exception:
+            return False
+
+    def open_pine_editor(self):
+        return self.click_text("Pine Editor") or self.click_text("Pine")
+
+    def write_pine(self, code):
+        self.key_combo(2, "a", "KeyA", 65); _tvb_time.sleep(0.2)
+        self.type_text(code, delay=0.005); return True
+
+    def run_pine(self):
+        return self.click_text("Add to chart") or self.click_text("Update on chart")
+
+    def health(self):
+        out = {"chrome_up": False, "attached": bool(self.ws), "port": self.port}
+        try:
+            ts = _tvb_targets(self.port)
+            pages = [x for x in ts if x.get("type") == "page"]
+            tv = [x for x in pages if self.match in (x.get("url") or "")]
+            out.update(chrome_up=True, pages=len(pages), tv_pages=len(tv), url=(self.target or {}).get("url"))
+            if self.ws:
+                try:
+                    out["js_ok"] = (self.evaluate("1+1") == 2)
+                    out["title"] = self.evaluate("document.title")
+                except Exception as e:
+                    out["js_ok"] = False; out["js_error"] = str(e)
+        except Exception as e:
+            out["error"] = str(e)
+        return out
+
+
+_TV_SINGLETON = {"tv": None}
+
+
+def _tv_ensure(timeout=25):
+    """Ensure the bridge Chrome is up (headless, background) and return a live TV.
+    Fully automatic: no terminal command and no login needed for chart screenshots
+    (TradingView charts render for anonymous users). Reuses one persistent connection."""
+    tvobj = _TV_SINGLETON.get("tv")
+    if tvobj is not None and tvobj.ws is not None:
+        try:
+            if tvobj.evaluate("1+1") == 2:
+                return tvobj
+        except Exception:
+            try:
+                tvobj.close()
+            except Exception:
+                pass
+            _TV_SINGLETON["tv"] = None
+    try:
+        _tvb_targets()                       # already running?
+    except Exception:
+        try:
+            launch_chrome()                  # spin it up off-screen in the background
+        except Exception:
+            pass
+    tv = TV()
+    tv.connect(timeout=timeout)
+    _TV_SINGLETON["tv"] = tv
+    return tv
+
+
+def _tv_capture(symbol, tf=None, settle=2.5):
+    """Capture a TradingView chart via the inlined CDP bridge. Returns (png, err).
+    The bridge Chrome is started automatically in the background on first use."""
+    try:
+        tv = _tv_ensure()
+    except Exception as e:
+        return None, f"📺 Couldn't start the TradingView bridge automatically: {e}"
+    try:
+        return (tv.screenshot_symbol(symbol, tf, settle=settle) if symbol else tv.screenshot_bytes()), None
+    except Exception as e:
+        _TV_SINGLETON["tv"] = None           # drop a stale connection so next call reconnects
+        try:
+            tv.close()
+        except Exception:
+            pass
+        return None, f"📺 TV capture error: {e}"
 
 
 def _tv_levels_line(symbol):
