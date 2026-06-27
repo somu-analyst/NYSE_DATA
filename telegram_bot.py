@@ -18083,6 +18083,55 @@ def _av_macro():
     return rows
 
 
+def _fed_soma_line():
+    """Compact Fed balance-sheet line via keyless NY Fed SOMA. Returns (text, direction)."""
+    try:
+        import urllib.request as _u, json as _j
+        s = _j.loads(_u.urlopen(_u.Request("https://markets.newyorkfed.org/api/soma/summary.json",
+                                           headers={"User-Agent": "nyse-data/1.0"}), timeout=15).read().decode())
+        rows = s["soma"]["summary"]
+        tot = float(rows[-1]["total"])
+        chg = tot - float(rows[-14]["total"]) if len(rows) > 14 else 0.0
+        lab = "expanding 🟢" if chg > 25e9 else "QT 🔴" if chg < -50e9 else "flat 🟡"
+        dirn = "expanding" if chg > 25e9 else "qt" if chg < -50e9 else "flat"
+        return f"Fed BS ${tot/1e12:.2f}T ({chg/1e9:+.0f}B/13wk · {lab})", dirn
+    except Exception:
+        return None, None
+
+
+def _jpm_collar_line():
+    """Compact current JPMorgan collar (JHEQX) line from SEC N-PORT (keyless)."""
+    try:
+        import urllib.request as _u, re as _re
+        UA = {"User-Agent": "nyse-data research srinivas.analystsas@gmail.com"}
+
+        def _g(url):
+            return _u.urlopen(_u.Request(url, headers=UA), timeout=20).read().decode("utf-8", "ignore")
+
+        feed = _g("https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=S000043249"
+                  "&type=NPORT-P&count=2&output=atom")
+        acc = _re.findall(r"<accession-number>(.*?)</accession-number>", feed)
+        if not acc:
+            return None
+        x = _g(f"https://www.sec.gov/Archives/edgar/data/1217286/{acc[0].replace('-', '')}/primary_doc.xml")
+        per = _re.search(r"<repPdDate>(.*?)</repPdDate>", x)
+        legs = {}
+        for b in x.split("<invstOrSec>"):
+            if "optionSwaption" not in b or not any(s in b for s in ("S&P 500", "SPX", "S&amp;P 500")):
+                continue
+            pc = _re.search(r"<putOrCall>(.*?)</putOrCall>", b)
+            wp = _re.search(r"<writtenOrPur>(.*?)</writtenOrPur>", b)
+            ep = _re.search(r"<exercisePrice>(.*?)</exercisePrice>", b)
+            if pc and wp and ep:
+                legs[f"{wp.group(1)} {pc.group(1)}"] = round(float(ep.group(1)))
+        if legs.get("Purchased Put") and legs.get("Written Call"):
+            return (f"JPM collar ({per.group(1) if per else '?'}): SPX put {legs['Purchased Put']} / "
+                    f"call {legs['Written Call']} · floor {legs.get('Written Put')}")
+    except Exception:
+        return None
+    return None
+
+
 _MACRO_REPORT_CACHE = {"ts": 0.0, "txt": None}
 
 
@@ -18115,6 +18164,12 @@ def _fmt_macro_report():
     av = _av_macro()
     if av:
         lines += ["", "🏦 <b>AlphaVantage indicators:</b>", "<pre>" + "\n".join(av) + "</pre>"]
+    _fl, _fdir = _fed_soma_line()
+    if _fl:
+        lines += ["", "🏦 " + _fl]
+    _jl = _jpm_collar_line()
+    if _jl:
+        lines += ["🛡️ " + _jl]
     sent = _av_sentiment("SPY,QQQ")
     if sent:
         lines += ["", f"📰 <b>News sentiment:</b> {sent['label']} ({sent['avg']:+.2f}, {sent['n']} articles)"]
