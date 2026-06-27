@@ -18064,10 +18064,17 @@ def _macro_bls_full():
     Keyless; cached 6h."""
     import urllib.request as _u, json as _j, datetime as _dt
     names = {"CUUR0000SA0": "CPI", "CUUR0000SA0L1E": "Core CPI",
-             "LNS14000000": "Unemployment", "CES0000000001": "Nonfarm Payrolls"}
+             "LNS14000000": "Unemployment", "CES0000000001": "Nonfarm Payrolls",
+             "WPSFD49207": "PPI", "CES0500000003": "Avg Hourly Earnings",
+             "JTS000000000000000JOL": "Job Openings"}
     yr = _dt.datetime.now().year
-    body = _j.dumps({"seriesid": list(names), "startyear": str(yr - 3), "endyear": str(yr)}).encode()
-    req = _u.Request("https://api.bls.gov/publicAPI/v1/timeseries/data/", data=body,
+    _payload = {"seriesid": list(names), "startyear": str(yr - 3), "endyear": str(yr)}
+    _key = os.environ.get("BLS_API_KEY", "")
+    if _key:
+        _payload["registrationkey"] = _key   # v2 = 500 requests/day (vs 25 keyless)
+    _ver = "v2" if _key else "v1"
+    body = _j.dumps(_payload).encode()
+    req = _u.Request(f"https://api.bls.gov/publicAPI/{_ver}/timeseries/data/", data=body,
                      headers={"Content-Type": "application/json", "User-Agent": "nyse-data/1.0"})
     raw = _j.load(_u.urlopen(req, timeout=20))
     out = {}
@@ -18493,7 +18500,7 @@ if page == "📡 Macro/Event Hub":
                         continue
                     _lt, _pv, _ya = _pts[-1], _pts[-2], _pts[-13]
                     _asof = f"{_MON[_lt[1]]} {_lt[0]}"
-                    if _nm in ("CPI", "Core CPI"):
+                    if _nm in ("CPI", "Core CPI", "PPI", "Avg Hourly Earnings"):
                         _rb.append({"Indicator": _nm, "Latest": f"{_lt[2]:.1f}",
                                     "MoM": f"{(_lt[2]/_pv[2]-1)*100:+.2f}%",
                                     "YoY": f"{(_lt[2]/_ya[2]-1)*100:+.1f}%", "As of": _asof})
