@@ -18281,6 +18281,41 @@ def _jpm_collar_line():
     return None
 
 
+def _macro_playbook_lines():
+    """Compact regime-driven playbook: curve + Fed liquidity + inflation → trade leans."""
+    import urllib.request as _u, csv as _csv, io as _io, datetime as _dt
+    s2 = None
+    try:
+        yr = _dt.datetime.now().year
+        url = (f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+               f"daily-treasury-rates.csv/{yr}/all?type=daily_treasury_yield_curve&field_tdr_date_value={yr}&page&_format=csv")
+        rows = list(_csv.DictReader(_io.StringIO(_u.urlopen(_u.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+                                                            timeout=12).read().decode("utf-8", "ignore"))))
+        if rows:
+            s2 = (float(rows[0]["10 Yr"]) - float(rows[0]["2 Yr"])) * 100
+    except Exception:
+        pass
+    _fl, fed = _fed_soma_line()
+    cpi = (_wrap_macro() or {}).get("CPI", {}).get("yoy")
+    ideas = []
+    if s2 is not None:
+        if s2 < 0:
+            ideas.append("Curve inverted → defensives (XLP/XLU/XLV), TLT; trim small caps/banks")
+        elif s2 > 40:
+            ideas.append("Curve steep → banks XLF, small caps IWM, industrials XLI")
+    if fed == "expanding":
+        ideas.append("Fed adding liquidity → risk-on: QQQ/SMH, gold, high-beta")
+    elif fed == "qt":
+        ideas.append("QT draining liquidity → de-risk: hedge QQQ/IWM, favor USD/quality")
+    if cpi and cpi > 3:
+        ideas.append("Inflation hot → energy XLE, materials XLB, TIPS; short duration")
+    elif cpi and cpi < 2.3:
+        ideas.append("Inflation cooling → add duration TLT, growth QQQ/SMH")
+    if not ideas:
+        return []
+    return ["", "🧭 <b>Playbook</b>"] + ["• " + i for i in ideas[:4]]
+
+
 _MACRO_REPORT_CACHE = {"ts": 0.0, "txt": None}
 
 
@@ -18319,6 +18354,7 @@ def _fmt_macro_report():
     _jl = _jpm_collar_line()
     if _jl:
         lines += ["🛡️ " + _jl]
+    lines += _macro_playbook_lines()
     sent = _av_sentiment("SPY,QQQ")
     if sent:
         lines += ["", f"📰 <b>News sentiment:</b> {sent['label']} ({sent['avg']:+.2f}, {sent['n']} articles)"]

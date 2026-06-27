@@ -18590,6 +18590,17 @@ if page == "📡 Macro/Event Hub":
                 else:
                     _imp = "🟡 **Roughly flat** — QT has paused/ended; broadly neutral liquidity backdrop."
                 st.info(f"🏦 **Market impact** — {_imp}  _(as of {_fb['date']})_")
+                try:
+                    import urllib.request as _su, json as _sj
+                    _sd = _sj.loads(_su.urlopen(_su.Request(
+                        "https://markets.newyorkfed.org/api/rates/secured/sofr/last/1.json",
+                        headers={"User-Agent": "nyse-data/1.0"}), timeout=10).read().decode())
+                    _rr = _sd["refRates"][0]
+                    st.caption(f"💵 **SOFR** (overnight secured funding): **{_rr['percentRate']:.2f}%** · "
+                               f"${_rr['volumeInBillions']:,}B volume · {_rr['effectiveDate']} — the market cost of "
+                               "overnight cash; sustained spikes vs the Fed funds rate flag funding/liquidity stress.")
+                except Exception:
+                    pass
                 if _fb.get("hist"):
                     _hh = pd.DataFrame(_fb["hist"], columns=["Date", "Total"])
                     _hh["Total ($T)"] = _hh["Total"] / 1e12
