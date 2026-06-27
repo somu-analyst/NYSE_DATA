@@ -4691,6 +4691,7 @@ with st.sidebar:
         ],
         "💡 Trade Ideas": [
             "🎯 High-Prob Options",
+            "🔎 Smart-Money Flow",
             "🎯 Prop Trading Screen",
             "🧠 High-Prob Engine",
             "🧑‍💼 AI Hedge Fund",
@@ -17721,6 +17722,168 @@ def _hiprob_scan(tickers, dte_lo=20, dte_hi=45, min_pop=0.80, r=0.045):
             continue
     out.sort(key=lambda d: (-d["_pop"], -d["_ror"]))
     return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _smartmoney_screen():
+    """Per-ticker option-flow metrics from the latest options_change snapshot:
+    call/put OI & ΔOI, call turnover (speculation), call/put vol ratio, LEAPS call OI (>300 DTE)."""
+    import datetime as _dt
+    sk = "substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2)"
+    with get_conn() as c:
+        row = c.execute(f"SELECT trade_date_now FROM options_change ORDER BY {sk} DESC LIMIT 1").fetchone()
+        if not row:
+            return {}
+        d0 = row[0]
+        df = pd.read_sql("SELECT ticker,expiry_date,openInt_Call_now,change_OI_Call,vol_Call_now,"
+                         "openInt_Put_now,vol_Put_now,change_OI_Put FROM options_change WHERE trade_date_now=?",
+                         c, params=(d0,))
+    if df.empty:
+        return {}
+    df = df[~df["ticker"].astype(str).str.startswith("^")]
+    for col in df.columns:
+        if col not in ("ticker", "expiry_date"):
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    def _dte(e):
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+            try:
+                return (_dt.datetime.strptime(str(e), fmt).date() - _dt.date.today()).days
+            except Exception:
+                pass
+        return None
+
+    df["dte"] = df["expiry_date"].map(_dte)
+    g = df.groupby("ticker")
+    agg = g.agg(call_oi=("openInt_Call_now", "sum"), put_oi=("openInt_Put_now", "sum"),
+                call_chg=("change_OI_Call", "sum"), put_chg=("change_OI_Put", "sum"),
+                call_vol=("vol_Call_now", "sum"), put_vol=("vol_Put_now", "sum")).reset_index()
+    agg["pcr_oi"] = agg["put_oi"] / agg["call_oi"].replace(0, np.nan)
+    agg["call_turnover"] = agg["call_vol"] / agg["call_oi"].replace(0, np.nan)
+    agg["cpv"] = agg["call_vol"] / agg["put_vol"].replace(0, np.nan)
+    leaps = df[df["dte"] > 300].groupby("ticker")["openInt_Call_now"].sum().reset_index()
+    leaps.columns = ["ticker", "leaps_call_oi"]
+    agg = agg.merge(leaps, on="ticker", how="left")
+    agg["leaps_call_oi"] = agg["leaps_call_oi"].fillna(0)
+    return {"date": d0, "agg": agg}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _accumulation_screen():
+    """Delivery-style accumulation proxy from stock_daily: latest volume vs 20d avg + 5d/20d return."""
+    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    rows = []
+    with get_conn() as c:
+        tks = [r[0] for r in c.execute("SELECT DISTINCT ticker FROM stock_daily").fetchall()]
+        for t in tks:
+            try:
+                df = pd.read_sql(f"SELECT close,volume FROM stock_daily WHERE ticker=? ORDER BY {sk} DESC LIMIT 25",
+                                 c, params=(t,))
+                cl = pd.to_numeric(df["close"], errors="coerce").dropna()
+                vol = pd.to_numeric(df["volume"], errors="coerce").dropna()
+                if len(cl) < 10 or len(vol) < 10:
+                    continue
+                vavg = vol.iloc[1:21].mean()
+                if not vavg:
+                    continue
+                rows.append({"ticker": t, "vol_x": vol.iloc[0] / vavg,
+                             "r5": (cl.iloc[0] / cl.iloc[4] - 1) * 100 if len(cl) > 4 else 0.0,
+                             "r20": (cl.iloc[0] / cl.iloc[-1] - 1) * 100})
+            except Exception:
+                continue
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _leaps_screen(tickers):
+    """Long-dated call positioning pulled live from yfinance (your OI snapshot only keeps near-term)."""
+    import datetime as _dt
+    out = []
+    for tk in tickers:
+        try:
+            t = yf.Ticker(tk)
+            best = None; bdte = 0
+            for e in (t.options or []):
+                try:
+                    d = (_dt.datetime.strptime(e, "%Y-%m-%d").date() - _dt.date.today()).days
+                except Exception:
+                    continue
+                if d > bdte:
+                    bdte, best = d, e
+            if not best or bdte < 200:
+                continue
+            calls = t.option_chain(best).calls
+            coi = float(pd.to_numeric(calls["openInterest"], errors="coerce").fillna(0).sum())
+            cvol = float(pd.to_numeric(calls["volume"], errors="coerce").fillna(0).sum())
+            out.append({"Ticker": tk, "Longest expiry": best, "DTE": bdte,
+                        "LEAPS call OI": int(coi), "Call vol": int(cvol)})
+        except Exception:
+            continue
+    return pd.DataFrame(out).sort_values("LEAPS call OI", ascending=False) if out else pd.DataFrame()
+
+
+if page == "🔎 Smart-Money Flow":
+    _page_header("🔎 Smart-Money Flow — longs · LEAPS · accumulation · speculation")
+    st.caption("Where the conviction is: long-dated call buildup (LEAPS), volume-backed accumulation "
+               "(delivery-style buying), options speculation (call turnover) and upside candidates — "
+               "from your latest OI snapshot + daily volume. Educational, not advice.")
+    _sm = _smartmoney_screen()
+    if not _sm:
+        st.warning("No options snapshot available.")
+    else:
+        _ag = _sm["agg"]
+        st.caption(f"OI snapshot: {_sm['date']} · {len(_ag)} tickers")
+        _t1, _t2, _t3, _t4 = st.tabs(["🚀 Upside (call buildup)", "📅 LEAPS / long-dated",
+                                      "🎰 Speculation", "🛒 Accumulation"])
+        with _t1:
+            _u = _ag[(_ag["call_chg"] > 0)].copy()
+            _u["upside_score"] = (_u["call_chg"].rank() + (1 / _u["pcr_oi"]).rank() + _u["cpv"].rank())
+            _u = _u.sort_values("upside_score", ascending=False).head(20)
+            st.markdown("**Most bullish positioning — call OI building, low PCR, calls over puts**")
+            st.dataframe(_u[["ticker", "call_chg", "call_oi", "pcr_oi", "cpv"]].rename(columns={
+                "call_chg": "Call ΔOI", "call_oi": "Call OI", "pcr_oi": "PCR", "cpv": "Call/Put vol"}),
+                hide_index=True, use_container_width=True,
+                column_config={"PCR": st.column_config.NumberColumn(format="%.2f"),
+                               "Call/Put vol": st.column_config.NumberColumn(format="%.1f")})
+        with _t2:
+            st.markdown("**Long-dated bets — biggest call OI in LEAPS expiries (pulled live from chains)**")
+            _lt = list(_ag.sort_values("call_oi", ascending=False)["ticker"].head(15))
+            try:
+                with get_conn() as _lc:
+                    _lt = list(dict.fromkeys([r[0].upper() for r in _lc.execute(
+                        "SELECT DISTINCT ticker FROM trades WHERE status='OPEN'").fetchall()] + _lt))
+            except Exception:
+                pass
+            with st.spinner("Fetching long-dated option chains…"):
+                _ldf = _leaps_screen(tuple(_lt[:18]))
+            if _ldf is not None and not _ldf.empty:
+                st.dataframe(_ldf, hide_index=True, use_container_width=True)
+            else:
+                st.caption("No LEAPS chains found right now (this pulls live since the OI snapshot stores only ≤~35 DTE).")
+        with _t3:
+            _s = _ag[(_ag["call_oi"] > 500)].sort_values("call_turnover", ascending=False).head(20)
+            st.markdown("**Hot speculation — highest call volume / open-interest turnover (fresh, aggressive)**")
+            st.dataframe(_s[["ticker", "call_turnover", "cpv", "call_vol"]].rename(columns={
+                "call_turnover": "Call turnover×", "cpv": "Call/Put vol", "call_vol": "Call vol"}),
+                hide_index=True, use_container_width=True,
+                column_config={"Call turnover×": st.column_config.NumberColumn(format="%.2f"),
+                               "Call/Put vol": st.column_config.NumberColumn(format="%.1f")})
+        with _t4:
+            _acc = _accumulation_screen()
+            if _acc is not None and not _acc.empty:
+                _a = _acc[(_acc["vol_x"] > 1.3) & (_acc["r5"] > 0) & (_acc["r20"] > 0)].sort_values(
+                    "vol_x", ascending=False).head(20)
+                st.markdown("**Volume-backed accumulation — above-average volume + rising price (real buying)**")
+                st.dataframe(_a.rename(columns={"ticker": "Ticker", "vol_x": "Vol vs 20d×",
+                                                "r5": "5d %", "r20": "20d %"}),
+                             hide_index=True, use_container_width=True,
+                             column_config={"Vol vs 20d×": st.column_config.NumberColumn(format="%.2f"),
+                                            "5d %": st.column_config.NumberColumn(format="%.1f%%"),
+                                            "20d %": st.column_config.NumberColumn(format="%.1f%%")})
+            else:
+                st.caption("No accumulation data.")
+        st.caption("⚠️ OI/volume reflect positioning, not certainty of direction. LEAPS need ≥300 DTE in the "
+                   "chain; accumulation is a volume+price proxy (US has no delivery %). Not investment advice.")
 
 
 if page == "🎯 High-Prob Options":
