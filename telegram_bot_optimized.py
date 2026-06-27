@@ -20256,11 +20256,40 @@ def _wrap_macro():
         return None
 
 
+def _wrap_regime(F):
+    """One-line macro regime: yield curve (2s10s) + Fed liquidity + inflation. Keyless."""
+    import urllib.request as _u, json as _j, csv as _csv, io as _io, datetime as _dt
+    bits = []
+    try:
+        yr = _dt.datetime.now().year
+        url = (f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+               f"daily-treasury-rates.csv/{yr}/all?type=daily_treasury_yield_curve&field_tdr_date_value={yr}&page&_format=csv")
+        rows = list(_csv.DictReader(_io.StringIO(_u.urlopen(_u.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+                                                            timeout=12).read().decode("utf-8", "ignore"))))
+        if rows:
+            s2 = (float(rows[0]["10 Yr"]) - float(rows[0]["2 Yr"])) * 100
+            bits.append("curve " + ("inverted 🔴" if s2 < 0 else "flat 🟡" if s2 < 25 else "steep 🟢") + f" (2s10s {s2:+.0f}bp)")
+    except Exception:
+        pass
+    try:
+        s = _j.loads(_u.urlopen(_u.Request("https://markets.newyorkfed.org/api/soma/summary.json",
+                                           headers={"User-Agent": "nyse-data/1.0"}), timeout=12).read().decode())
+        rws = s["soma"]["summary"]
+        chg = float(rws[-1]["total"]) - float(rws[-14]["total"]) if len(rws) > 14 else 0
+        bits.append("Fed " + ("adding liquidity 🟢" if chg > 25e9 else "in QT 🔴" if chg < -50e9 else "on hold 🟡"))
+    except Exception:
+        pass
+    m = F.get("macro") or {}
+    if "CPI" in m:
+        bits.append(f"CPI {m['CPI']['yoy']:.1f}% YoY")
+    return " · ".join(bits) if bits else None
+
+
 def wrap_facts(conn, universe_cap=120):
     """Compute the structured fact pack for the market wrap."""
     F = {"ts": datetime.now(), "indices": [], "lead": None, "shape": None,
          "vix": None, "cross": [], "lev": [], "movers_up": [], "movers_dn": [],
-         "breadth": None, "options": None, "book": None, "catalyst": None, "macro": None}
+         "breadth": None, "options": None, "book": None, "catalyst": None, "macro": None, "regime": None}
 
     for sym, name, cap in _WRAP_IDX:
         q = _wrap_quote(sym)
@@ -20279,6 +20308,7 @@ def wrap_facts(conn, universe_cap=120):
         F["vix"] = vq
 
     F["macro"] = _wrap_macro()
+    F["regime"] = _wrap_regime(F)
 
     for sym, name, kind in _WRAP_CROSS:
         q = _wrap_quote(sym)
@@ -20447,6 +20477,9 @@ def wrap_narrative(F, html=True):
             vs = "well above" if hot >= 3 else "above" if hot > 2.3 else "near"
             L.append("\n📅 " + b("MACRO BACKDROP") + "\n"
                      f"Inflation backdrop: {', '.join(bits)} — {vs} the Fed's 2% target.")
+
+    if F.get("regime"):
+        L.append("\n🧭 " + b("MACRO REGIME") + "\n" + F["regime"] + ".")
 
     if F["cross"]:
         parts = []
