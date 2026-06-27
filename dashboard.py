@@ -17698,6 +17698,76 @@ def _macro_av_full():
     return out
 
 
+@st.cache_data(ttl=43200, show_spinner=False)
+def _fed_soma():
+    """Fed balance sheet via the keyless NY Fed SOMA API (securities holdings = asset side that
+    drives system liquidity). Returns total, Treasuries, MBS + 4wk/13wk/1yr change."""
+    import urllib.request as _u, json as _j
+    UA = {"User-Agent": "Mozilla/5.0 nyse-data/1.0"}
+    s = _j.loads(_u.urlopen(_u.Request("https://markets.newyorkfed.org/api/soma/summary.json",
+                                       headers=UA), timeout=20).read().decode())
+    rows = s["soma"]["summary"]
+
+    def _f(r, k):
+        try:
+            return float(r.get(k, 0) or 0)
+        except Exception:
+            return 0.0
+
+    cur = rows[-1]
+    out = {"date": cur["asOfDate"], "total": float(cur["total"]),
+           "mbs": _f(cur, "mbs") + _f(cur, "cmbs"),
+           "treasuries": _f(cur, "notesbonds") + _f(cur, "bills") + _f(cur, "tips") + _f(cur, "frn"),
+           "chg": {}}
+    n = len(rows)
+    for back, lbl in [(4, "4wk"), (13, "13wk"), (52, "1yr")]:
+        if n > back:
+            out["chg"][lbl] = float(rows[-1]["total"]) - float(rows[-1 - back]["total"])
+    return out
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _jpm_collar(n=4):
+    """JPMorgan Hedged Equity Fund (JHEQX) quarterly SPX collar from SEC N-PORT filings.
+    Returns newest-first list of {period, short_put, long_put, short_call}. Keyless.
+    Reported quarterly with a ~60-day lag — newest row is the latest disclosed collar."""
+    import urllib.request as _u, re as _re, time as _t
+    UA = {"User-Agent": "nyse-data research srinivas.analystsas@gmail.com"}
+
+    def _g(url):
+        return _u.urlopen(_u.Request(url, headers=UA), timeout=30).read().decode("utf-8", "ignore")
+
+    out = []
+    try:
+        feed = _g("https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=S000043249"
+                  "&type=NPORT-P&count=8&output=atom")
+        accs = _re.findall(r"<accession-number>(.*?)</accession-number>", feed)[:n]
+        for acc in accs:
+            try:
+                x = _g(f"https://www.sec.gov/Archives/edgar/data/1217286/{acc.replace('-', '')}/primary_doc.xml")
+            except Exception:
+                continue
+            per = _re.search(r"<repPdDate>(.*?)</repPdDate>", x)
+            legs = {}
+            for b in x.split("<invstOrSec>"):
+                if "optionSwaption" not in b or not any(s in b for s in ("S&P 500", "SPX", "S&amp;P 500")):
+                    continue
+                pc = _re.search(r"<putOrCall>(.*?)</putOrCall>", b)
+                wp = _re.search(r"<writtenOrPur>(.*?)</writtenOrPur>", b)
+                ep = _re.search(r"<exercisePrice>(.*?)</exercisePrice>", b)
+                if pc and wp and ep:
+                    legs[f"{wp.group(1)} {pc.group(1)}"] = round(float(ep.group(1)))
+            if legs:
+                out.append({"period": per.group(1) if per else "?",
+                            "short_put": legs.get("Written Put"),
+                            "long_put": legs.get("Purchased Put"),
+                            "short_call": legs.get("Written Call")})
+            _t.sleep(0.3)
+    except Exception:
+        pass
+    return out
+
+
 if page == "📡 Macro/Event Hub":
     _page_header("📡 Macro / Event Hub")
     try:
@@ -17975,6 +18045,66 @@ if page == "📡 Macro/Event Hub":
                     st.dataframe(pd.DataFrame(_ra), hide_index=True, use_container_width=True)
             except Exception as e:
                 st.caption(f"AlphaVantage indicators unavailable: {e}")
+            # ── JPMorgan collar (JHEQX) — quarterly SPX hedge, watched as support/resistance ──
+            try:
+                _jc = _jpm_collar()
+                if _jc:
+                    st.markdown("**🛡️ JPMorgan collar (JHEQX) — quarterly SPX hedge, watched as support/resistance**")
+                    st.dataframe(pd.DataFrame([
+                        {"Quarter (period end)": q["period"],
+                         "Put floor (short put)": q["short_put"],
+                         "Protection (long put)": q["long_put"],
+                         "Upside cap (short call)": q["short_call"]} for q in _jc]),
+                        hide_index=True, use_container_width=True)
+                    _spx = None
+                    try:
+                        _hh = _cached_history("^GSPC", "5d")["Close"].dropna()
+                        _spx = float(_hh.iloc[-1]) if len(_hh) else None
+                    except Exception:
+                        pass
+                    _cur = _jc[0]
+                    if _spx and _cur.get("long_put") and _cur.get("short_call"):
+                        _lp, _scl, _spt = _cur["long_put"], _cur["short_call"], _cur.get("short_put")
+                        if _spx >= _scl:
+                            _msg = (f"🔴 SPX **{_spx:,.0f}** is at/above the call cap **{_scl:,}** — fund upside is "
+                                    "capped here; often acts as resistance / pins into quarter-end.")
+                        elif _spx <= _lp:
+                            _msg = (f"🟢 SPX **{_spx:,.0f}** is below the put protection **{_lp:,}** — the hedge is "
+                                    f"in-the-money; **{_spt:,}–{_lp:,}** is the protected zone.")
+                        else:
+                            _pp = (_spx - _lp) / (_scl - _lp) * 100
+                            _msg = (f"🟡 SPX **{_spx:,.0f}** sits inside the collar (**{_lp:,}–{_scl:,}**), ~{_pp:.0f}% "
+                                    f"up the band. **{_lp:,}** = key support, **{_scl:,}** = key resistance.")
+                        st.info("🛡️ **JPM collar read** — " + _msg)
+                    st.caption("Source: SEC N-PORT (JHEQX). Long put / short call bracket the fund's hedged range; "
+                               "the short put is the lower bound of its put spread. Newest row = latest disclosed quarter.")
+            except Exception as e:
+                st.caption(f"JPM collar unavailable: {e}")
+            # ── Fed balance sheet (NY Fed SOMA, keyless) + market impact ──
+            try:
+                _fb = _fed_soma()
+                st.markdown("**🏦 Fed balance sheet — SOMA securities holdings**")
+                _fm = st.columns(4)
+                _fm[0].metric("Total holdings", f"${_fb['total']/1e12:.2f}T",
+                              f"{_fb['chg'].get('4wk', 0)/1e9:+.0f}B / 4wk",
+                              delta_color="normal" if _fb['chg'].get('4wk', 0) >= 0 else "inverse")
+                _fm[1].metric("Treasuries", f"${_fb['treasuries']/1e12:.2f}T")
+                _fm[2].metric("MBS", f"${_fb['mbs']/1e12:.2f}T")
+                _fm[3].metric("13-wk change", f"${_fb['chg'].get('13wk', 0)/1e9:+.0f}B")
+                _q = _fb['chg'].get('13wk', 0)
+                if _q < -50e9:
+                    _imp = (f"🔴 **QT in progress** — the Fed is draining liquidity (~${abs(_q)/1e9:.0f}B/quarter). "
+                            "Headwind for risk assets; tends to pressure valuations and widen credit spreads.")
+                elif _q > 25e9:
+                    _imp = (f"🟢 **Balance sheet expanding** (~+${_q/1e9:.0f}B/quarter) — net liquidity tailwind "
+                            "for risk assets (QE/reinvestment).")
+                else:
+                    _imp = "🟡 **Roughly flat** — QT has paused/ended; broadly neutral liquidity backdrop."
+                st.info(f"🏦 **Market impact** — {_imp}  _(as of {_fb['date']})_")
+                st.caption("Source: NY Fed SOMA (keyless). SOMA is the Fed's securities portfolio — the asset side "
+                           "that drives system liquidity. Growing = tailwind for stocks; shrinking (QT) = headwind.")
+            except Exception as e:
+                st.caption(f"Fed balance sheet unavailable: {e}")
             with st.expander("📰 News sentiment & raw report", expanded=False):
                 try:
                     _render_tg(_tbmod._fmt_macro_report())
