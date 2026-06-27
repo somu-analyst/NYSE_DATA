@@ -2558,6 +2558,36 @@ def _stocktwits_sentiment(ticker):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
+def _finnhub_insider_recs(ticker):
+    """Finnhub analyst recommendation trend + insider-transaction sentiment (free endpoints).
+    Returns {recs, insider} or None."""
+    import os as _os, urllib.request as _u, json as _j, datetime as _dt
+    key = _os.environ.get("FINNHUB_API_KEY") or _os.environ.get("FINNHUB_KEY")
+    if not key:
+        return None
+    out = {"recs": None, "insider": None}
+    try:
+        d = _j.loads(_u.urlopen(f"https://finnhub.io/api/v1/stock/recommendation?symbol={ticker}&token={key}",
+                                timeout=12).read().decode())
+        if d:
+            out["recs"] = d[0]
+    except Exception:
+        pass
+    try:
+        frm = (_dt.date.today() - _dt.timedelta(days=180)).isoformat(); to = _dt.date.today().isoformat()
+        d = _j.loads(_u.urlopen(
+            f"https://finnhub.io/api/v1/stock/insider-sentiment?symbol={ticker}&from={frm}&to={to}&token={key}",
+            timeout=12).read().decode())
+        rows = d.get("data", [])
+        if rows:
+            out["insider"] = {"net": sum(r.get("change", 0) for r in rows),
+                              "mspr": sum(r.get("mspr", 0) for r in rows) / len(rows), "months": len(rows)}
+    except Exception:
+        pass
+    return out if (out["recs"] or out["insider"]) else None
+
+
 def _finnhub_sentiment(ticker):
     """Finnhub sentiment. Tries the news-sentiment endpoint (premium on some plans); if that's
     gated, falls back to the free company-news endpoint and scores the headlines locally.
@@ -9745,6 +9775,33 @@ elif page == "\U0001f9e0 Smart Money Hub":
         _td2 = _td2_row[0] if _td2_row else _td
         st.caption(f"📅 Data as of: **{_td}**")
         signals = []   # list of (label, score, max_score)
+
+        # ── 0. Insider activity & analyst recommendations (Finnhub) ──
+        with st.expander("🧑‍💼 0. Insider activity & analyst recommendations (Finnhub)", expanded=False):
+            st.caption("💡 What insiders (Form-4) and Wall-St analysts are doing on a name. Insider **buying** + "
+                       "rising **buy** ratings is the strongest confirmation; insider selling alone is noisy.")
+            if not (os.environ.get("FINNHUB_API_KEY") or os.environ.get("FINNHUB_KEY")):
+                st.caption("Set FINNHUB_API_KEY in api_keys.enc to enable.")
+            else:
+                _ft = st.text_input("Ticker", value="NVDA", key="fh_ir_tk").strip().upper()
+                if _ft:
+                    _ir = _finnhub_insider_recs(_ft)
+                    if not _ir:
+                        st.caption("No Finnhub insider/analyst data for this ticker.")
+                    else:
+                        if _ir.get("recs"):
+                            _r = _ir["recs"]
+                            _tot = (_r["strongBuy"] + _r["buy"] + _r["hold"] + _r["sell"] + _r["strongSell"]) or 1
+                            _bull = (_r["strongBuy"] + _r["buy"]) / _tot * 100
+                            st.markdown(f"**📊 Analysts ({_r['period']}):** {_r['strongBuy']} strong-buy · {_r['buy']} buy · "
+                                        f"{_r['hold']} hold · {_r['sell']} sell · {_r['strongSell']} strong-sell → "
+                                        f"**{_bull:.0f}% bullish**")
+                        if _ir.get("insider"):
+                            _ins = _ir["insider"]
+                            _tone = ("🟢 net buying" if _ins["net"] > 0 else "🔴 net selling" if _ins["net"] < 0 else "⚪ flat")
+                            st.markdown(f"**👔 Insiders (last {_ins['months']}m):** {_tone} · net "
+                                        f"{_ins['net']:+,.0f} shares · avg MSPR {_ins['mspr']:+.0f}")
+                            st.caption("MSPR = monthly share-purchase ratio (−100 heavy selling … +100 heavy buying).")
 
         # ── 1. UNUSUAL OPTIONS ACTIVITY ─────────────────────────────────────
         with st.expander("\U0001f4ca 1. Unusual Options Activity (UOA)", expanded=True):
