@@ -17883,6 +17883,7 @@ def _fed_soma():
     for back, lbl in [(4, "4wk"), (13, "13wk"), (52, "1yr")]:
         if n > back:
             out["chg"][lbl] = float(rows[-1]["total"]) - float(rows[-1 - back]["total"])
+    out["hist"] = [(r["asOfDate"], float(r["total"])) for r in rows[-156:]]   # ~3y weekly for the chart
     return out
 
 
@@ -18249,6 +18250,19 @@ if page == "📡 Macro/Event Hub":
                         _exp.append(f"**10Y−3M** {(_y['10Y']['last']-_y['3M']['last'])*100:+.0f}bp")
                     if _exp:
                         st.info("📈 **Market expectations** — " + "  ·  ".join(_exp))
+                    # yield change vs prior session (bp) + impact writeup
+                    st.markdown("**Yield change vs prior session (bp)**")
+                    st.bar_chart(pd.DataFrame([{"Tenor": k, "Δbp": round((_y[k]["last"] - _y[k]["prev"]) * 100, 1)}
+                                               for k in _order]).set_index("Tenor"), height=180)
+                    _10 = _y.get("10Y", {})
+                    _d10 = (_10.get("last", 0) - _10.get("prev", 0)) * 100 if _10 else 0
+                    if abs(_d10) >= 1:
+                        _imp = ("🔴 Yields **rising** — pressures long-duration / growth (tech, TLT, REITs, utilities, "
+                                "gold); tailwind for banks & insurers. Higher discount rate compresses equity multiples."
+                                if _d10 > 0 else
+                                "🟢 Yields **falling** — tailwind for growth/tech (QQQ, SMH), TLT, gold, REITs, utilities; "
+                                "headwind for bank net-interest margins. Lower discount rate supports multiples.")
+                        st.caption(f"10Y {_d10:+.0f}bp d/d — {_imp}")
             except Exception as e:
                 st.caption(f"Yields unavailable: {e}")
             # ── inflation-trend read ──
@@ -18287,6 +18301,13 @@ if page == "📡 Macro/Event Hub":
                          "Protection (long put)": q["long_put"],
                          "Upside cap (short call)": q["short_call"]} for q in _jc]),
                         hide_index=True, use_container_width=True)
+                    _cc = list(reversed(_jc))   # oldest → newest for the chart
+                    st.markdown("**Collar strike migration (SPX)**")
+                    st.line_chart(pd.DataFrame({
+                        "Quarter": [q["period"] for q in _cc],
+                        "Short put (floor)": [q["short_put"] for q in _cc],
+                        "Long put (protect)": [q["long_put"] for q in _cc],
+                        "Short call (cap)": [q["short_call"] for q in _cc]}).set_index("Quarter"), height=220)
                     _spx = None
                     try:
                         _hh = _cached_history("^GSPC", "5d")["Close"].dropna()
@@ -18332,6 +18353,30 @@ if page == "📡 Macro/Event Hub":
                 else:
                     _imp = "🟡 **Roughly flat** — QT has paused/ended; broadly neutral liquidity backdrop."
                 st.info(f"🏦 **Market impact** — {_imp}  _(as of {_fb['date']})_")
+                if _fb.get("hist"):
+                    _hh = pd.DataFrame(_fb["hist"], columns=["Date", "Total"])
+                    _hh["Total ($T)"] = _hh["Total"] / 1e12
+                    st.markdown("**Fed balance-sheet trend (SOMA, $T · ~3y)**")
+                    st.line_chart(_hh.set_index("Date")["Total ($T)"], height=200)
+                _expanding = _q > 25e9
+                _qt = _q < -50e9
+                if _expanding:
+                    _win = "Growth/tech (QQQ, SMH, NVDA), high-beta & crypto (COIN, MSTR, IBIT), gold GLD, long bonds TLT, small caps IWM, REITs"
+                    _los = "US dollar (UUP) and cash; defensive value lags on a relative basis"
+                    _idea = "Liquidity tailwind → favor long calls / call spreads on QQQ-SMH, own TLT & GLD, sell put spreads on dips."
+                elif _qt:
+                    _win = "US dollar (UUP), cash, quality/low-vol (USMV), defensives (XLP, XLU)"
+                    _los = "High-beta growth, small caps IWM, crypto, long-duration TLT, unprofitable tech"
+                    _idea = "Liquidity headwind → tighten risk, favor put spreads / hedges on QQQ-IWM, raise cash, shorten duration."
+                else:
+                    _win = "Neutral — a stock-pickers' tape; quality & free-cash-flow names"
+                    _los = "Highly leveraged / speculative names most sensitive to liquidity swings"
+                    _idea = "Neutral liquidity → range strategies (iron condors), be selective on direction."
+                st.markdown("**📊 Stock-market impact — winners / losers / trade idea**")
+                st.dataframe(pd.DataFrame([
+                    {"Read": "🟢 Beneficiaries", "Detail": _win},
+                    {"Read": "🔴 Pressured", "Detail": _los},
+                    {"Read": "🎯 Trade idea", "Detail": _idea}]), hide_index=True, use_container_width=True)
                 st.caption("Source: NY Fed SOMA (keyless). SOMA is the Fed's securities portfolio — the asset side "
                            "that drives system liquidity. Growing = tailwind for stocks; shrinking (QT) = headwind.")
             except Exception as e:
