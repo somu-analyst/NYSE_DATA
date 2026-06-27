@@ -17768,6 +17768,77 @@ def _jpm_collar(n=4):
     return out
 
 
+def _macro_playbook(slope2s10s, infl_dir, fed_dir):
+    """Rule-based macro regime → events to watch + impacted assets + trade leans.
+    Driven by the live readings (curve, inflation trend, Fed liquidity). Educational, not advice."""
+    import datetime as _dt
+    today = _dt.date.today()
+
+    def _next_wd(wd):
+        d = today + _dt.timedelta(days=1)
+        while d.weekday() != wd:
+            d += _dt.timedelta(days=1)
+        return d
+
+    def _first_fri(y, m):
+        d = _dt.date(y, m, 1)
+        while d.weekday() != 4:
+            d += _dt.timedelta(days=1)
+        return d
+
+    nfp = _first_fri(today.year, today.month)
+    if nfp < today:
+        ny, nm = (today.year + (today.month == 12), 1 if today.month == 12 else today.month + 1)
+        nfp = _first_fri(ny, nm)
+    events = [
+        {"Event": "Jobs report / NFP", "When": nfp.strftime("%b %d"), "Moves": "rates, USD, SPX, gold",
+         "Why": "labor strength sets the Fed path"},
+        {"Event": "CPI inflation", "When": "~10th–13th, monthly", "Moves": "bonds, gold, USD, rate-sensitive",
+         "Why": "core driver of Fed policy"},
+        {"Event": "PCE (Fed's gauge)", "When": "~end of month", "Moves": "rates, growth stocks",
+         "Why": "Fed's preferred inflation metric"},
+        {"Event": "FOMC decision", "When": "8×/yr (~6–7 wks apart)", "Moves": "everything",
+         "Why": "rate path + QT/QE guidance"},
+        {"Event": "Jobless claims", "When": _next_wd(3).strftime("%b %d") + " (weekly)", "Moves": "short-term risk tone",
+         "Why": "high-frequency labor read"},
+        {"Event": "ISM PMIs", "When": "~1st–3rd business day", "Moves": "cyclicals, commodities",
+         "Why": "growth pulse"},
+        {"Event": "Retail sales", "When": "~15th–17th, monthly", "Moves": "consumer / discretionary",
+         "Why": "consumer health"},
+    ]
+    ideas = []
+    if slope2s10s is not None:
+        if slope2s10s < 0:
+            ideas.append({"Theme": "Inverted curve / late-cycle", "Tailwind": "Defensives XLP/XLU/XLV, quality, TLT",
+                          "Headwind": "Small caps IWM, banks XLF, cyclicals", "Lean": "Defensive tilt + recession hedges"})
+        elif slope2s10s > 40:
+            ideas.append({"Theme": "Steep curve / re-steepening", "Tailwind": "Banks XLF, small caps IWM, industrials XLI",
+                          "Headwind": "Long-duration bonds TLT", "Lean": "Cyclical / value tilt"})
+        else:
+            ideas.append({"Theme": "Flat curve", "Tailwind": "Quality large-cap", "Headwind": "Leveraged cyclicals",
+                          "Lean": "Neutral / stock-pick"})
+    if infl_dir == "hot":
+        ideas.append({"Theme": "Inflation re-accelerating", "Tailwind": "Energy XLE, commodities (oil/DBC), TIPS, materials XLB",
+                      "Headwind": "Long bonds TLT, growth/tech, utilities", "Lean": "Real assets / value, short duration"})
+    elif infl_dir == "cooling":
+        ideas.append({"Theme": "Inflation cooling", "Tailwind": "Growth/tech QQQ, semis SMH, long bonds TLT, gold",
+                      "Headwind": "Energy, cash", "Lean": "Add duration & growth"})
+    if fed_dir == "expanding":
+        ideas.append({"Theme": "Fed adding liquidity (no QT)", "Tailwind": "Risk-on: QQQ, semis, gold, crypto, high-beta",
+                      "Headwind": "USD", "Lean": "Risk-on, buy dips"})
+    elif fed_dir == "qt":
+        ideas.append({"Theme": "QT draining liquidity", "Tailwind": "USD, cash, quality",
+                      "Headwind": "High-beta, small caps, crypto, long duration", "Lean": "De-risk / hedge"})
+    bits = []
+    if slope2s10s is not None:
+        bits.append("curve " + ("inverted" if slope2s10s < 0 else "steep" if slope2s10s > 40 else "flat"))
+    if infl_dir:
+        bits.append("inflation " + infl_dir)
+    if fed_dir:
+        bits.append("Fed " + {"expanding": "adding liquidity", "qt": "in QT", "flat": "on hold"}.get(fed_dir, fed_dir))
+    return " · ".join(bits), events, ideas
+
+
 if page == "📡 Macro/Event Hub":
     _page_header("📡 Macro / Event Hub")
     try:
@@ -18105,6 +18176,46 @@ if page == "📡 Macro/Event Hub":
                            "that drives system liquidity. Growing = tailwind for stocks; shrinking (QT) = headwind.")
             except Exception as e:
                 st.caption(f"Fed balance sheet unavailable: {e}")
+            # ── Macro Playbook: regime → events + impacted assets + trade leans ──
+            try:
+                _y2 = _macro_yields_full()
+                _sl = ((_y2["10Y"]["last"] - _y2["2Y"]["last"]) * 100) if ("10Y" in _y2 and "2Y" in _y2) else None
+                _infl = None
+                _cpi2 = (_bls or {}).get("CPI", [])
+                if len(_cpi2) > 16:
+                    _n = (_cpi2[-1][2] / _cpi2[-13][2] - 1) * 100
+                    _a = (_cpi2[-4][2] / _cpi2[-16][2] - 1) * 100
+                    _infl = "cooling" if _n < _a - 0.1 else "hot" if _n > _a + 0.1 else "steady"
+                _fed = None
+                try:
+                    _q2 = _fed_soma()["chg"].get("13wk", 0)
+                    _fed = "qt" if _q2 < -50e9 else "expanding" if _q2 > 25e9 else "flat"
+                except Exception:
+                    pass
+                _regime, _ev, _ideas = _macro_playbook(_sl, _infl, _fed)
+                st.markdown("#### 🧭 Macro Playbook — events, impacted assets & trade ideas")
+                if _regime:
+                    st.success(f"**Current regime:** {_regime}.")
+                st.markdown("**📅 Key macro events to watch**")
+                st.dataframe(pd.DataFrame(_ev), hide_index=True, use_container_width=True)
+                if _ideas:
+                    st.markdown("**🎯 Impacted assets & leans** _(educational — not investment advice)_")
+                    st.dataframe(pd.DataFrame(_ideas), hide_index=True, use_container_width=True)
+                # flag the user's open-position tickers that sit in impacted ETFs/sectors
+                try:
+                    with get_conn() as _pc:
+                        _open = [r[0].upper() for r in _pc.execute(
+                            "SELECT DISTINCT ticker FROM trades WHERE status='OPEN'").fetchall()]
+                    _hot = " ".join(i["Tailwind"] + " " + i["Headwind"] for i in _ideas).upper()
+                    _hits = [t for t in _open if t in _hot]
+                    if _hits:
+                        st.caption("📌 Your open names referenced above: " + ", ".join(_hits))
+                except Exception:
+                    pass
+                st.caption("Regime read is computed from the live curve, inflation trend and Fed liquidity; "
+                           "event dates are typical windows. Mapping is rule-based — not investment advice.")
+            except Exception as e:
+                st.caption(f"Playbook unavailable: {e}")
             with st.expander("📰 News sentiment & raw report", expanded=False):
                 try:
                     _render_tg(_tbmod._fmt_macro_report())
