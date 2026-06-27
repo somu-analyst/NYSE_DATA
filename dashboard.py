@@ -4690,6 +4690,7 @@ with st.sidebar:
             "🔥 OI Analytics & Prediction",
         ],
         "💡 Trade Ideas": [
+            "🎯 High-Prob Options",
             "🎯 Prop Trading Screen",
             "🧠 High-Prob Engine",
             "🧑‍💼 AI Hedge Fund",
@@ -17602,6 +17603,165 @@ if page == "📺 TradingView":
             st.info("📐 Our computed levels: " + " · ".join(_lv))
     else:
         st.info("Enter a symbol and hit **Capture** (after launching the bridge & logging in).")
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _hiprob_scan(tickers, dte_lo=20, dte_hi=45, min_pop=0.80, r=0.045):
+    """Scan live option chains for >=min_pop probability-of-profit setups: premium selling
+    (cash-secured puts, put/call credit spreads) + deep-ITM call debit spreads (buying).
+    POP from the IV-implied lognormal at expiry. Returns trades sorted by POP then return-on-risk."""
+    import datetime as _dt
+    out = []
+
+    def _pa(S, X, T, iv):  # P(S_T > X) lognormal
+        if min(S, X, T, iv) <= 0:
+            return None
+        d2 = (np.log(S / X) + (r - 0.5 * iv * iv) * T) / (iv * np.sqrt(T))
+        return float(norm.cdf(d2))
+
+    for tk in tickers:
+        tk = str(tk).strip().upper()
+        if not tk:
+            continue
+        try:
+            spot = _spot(tk) or _cached_price(tk)
+            if not spot:
+                continue
+            try:
+                exps = list(yf.Ticker(tk).options)
+            except Exception:
+                exps = []
+            exp = dte = None
+            for e in exps:
+                try:
+                    d = (_dt.datetime.strptime(e, "%Y-%m-%d").date() - _dt.date.today()).days
+                except Exception:
+                    continue
+                if dte_lo <= d <= dte_hi:
+                    exp, dte = e, d
+                    break
+            if not exp:
+                continue
+            T = max(dte, 1) / 365.0
+            ch = _cached_option_chain(tk, exp)
+            if ch is None:
+                continue
+            puts = ch.puts.copy(); calls = ch.calls.copy()
+            for df in (puts, calls):
+                df["mid"] = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2).where(
+                    (df["bid"] > 0) & (df["ask"] > 0), df["lastPrice"])
+
+            # ── cash-secured put (sell) ──
+            pl = puts[(puts["strike"] < spot) & (puts["mid"] > 0.05)].sort_values("strike", ascending=False).reset_index(drop=True)
+            for i in range(len(pl)):
+                K = float(pl.loc[i, "strike"]); cr = float(pl.loc[i, "mid"]); iv = float(pl.loc[i, "impliedVolatility"] or 0)
+                if iv <= 0:
+                    continue
+                pop = _pa(spot, K - cr, T, iv)
+                if pop is None or pop < min_pop:
+                    continue
+                ror = cr / max(K - cr, 0.01) * 100
+                out.append({"Ticker": tk, "Strategy": "Cash-secured put (sell)", "DTE": dte,
+                            "Legs": f"Sell {K:g}P", "POP %": round(pop * 100, 1), "Credit/Debit": f"+${cr:.2f}",
+                            "Max profit": f"${cr*100:,.0f}", "Max loss": f"${(K-cr)*100:,.0f}",
+                            "Ret/risk": f"{ror:.1f}%", "Breakeven": f"${K-cr:.2f}", "_pop": pop, "_ror": ror})
+                # put credit spread off the same short strike
+                if i + 2 < len(pl):
+                    Kl = float(pl.loc[i + 2, "strike"]); cl = float(pl.loc[i + 2, "mid"])
+                    net = cr - cl; width = K - Kl
+                    if net > 0.03 and width > 0:
+                        ror2 = net / max(width - net, 0.01) * 100
+                        out.append({"Ticker": tk, "Strategy": "Put credit spread (sell)", "DTE": dte,
+                                    "Legs": f"Sell {K:g}P / Buy {Kl:g}P", "POP %": round(pop * 100, 1),
+                                    "Credit/Debit": f"+${net:.2f}", "Max profit": f"${net*100:,.0f}",
+                                    "Max loss": f"${(width-net)*100:,.0f}", "Ret/risk": f"{ror2:.1f}%",
+                                    "Breakeven": f"${K-net:.2f}", "_pop": pop, "_ror": ror2})
+                break
+
+            # ── call credit spread (sell) ──
+            cu = calls[(calls["strike"] > spot) & (calls["mid"] > 0.05)].sort_values("strike").reset_index(drop=True)
+            for i in range(len(cu)):
+                K = float(cu.loc[i, "strike"]); cr = float(cu.loc[i, "mid"]); iv = float(cu.loc[i, "impliedVolatility"] or 0)
+                if iv <= 0:
+                    continue
+                pa = _pa(spot, K + cr, T, iv)
+                if pa is None:
+                    continue
+                pop = 1 - pa
+                if pop < min_pop:
+                    continue
+                if i + 2 < len(cu):
+                    Kl = float(cu.loc[i + 2, "strike"]); cl = float(cu.loc[i + 2, "mid"])
+                    net = cr - cl; width = Kl - K
+                    if net > 0.03 and width > 0:
+                        ror = net / max(width - net, 0.01) * 100
+                        out.append({"Ticker": tk, "Strategy": "Call credit spread (sell)", "DTE": dte,
+                                    "Legs": f"Sell {K:g}C / Buy {Kl:g}C", "POP %": round(pop * 100, 1),
+                                    "Credit/Debit": f"+${net:.2f}", "Max profit": f"${net*100:,.0f}",
+                                    "Max loss": f"${(width-net)*100:,.0f}", "Ret/risk": f"{ror:.1f}%",
+                                    "Breakeven": f"${K+net:.2f}", "_pop": pop, "_ror": ror})
+                break
+
+            # ── deep-ITM call debit spread (buying, high POP) ──
+            ci = calls[(calls["strike"] < spot) & (calls["mid"] > 0.05)].sort_values("strike", ascending=False).reset_index(drop=True)
+            co = calls[(calls["strike"] > spot) & (calls["mid"] > 0.05)].sort_values("strike").reset_index(drop=True)
+            if len(ci) > 2 and len(co) > 2:
+                Kb = float(ci.loc[2, "strike"]); db = float(ci.loc[2, "mid"]); iv = float(ci.loc[2, "impliedVolatility"] or 0)
+                Ks = float(co.loc[2, "strike"]); cs = float(co.loc[2, "mid"])
+                net = db - cs; width = Ks - Kb
+                if iv > 0 and net > 0 and width > net:
+                    be = Kb + net; pop = _pa(spot, be, T, iv)
+                    if pop and pop >= min_pop:
+                        ror = (width - net) / net * 100
+                        out.append({"Ticker": tk, "Strategy": "ITM call debit spread (buy)", "DTE": dte,
+                                    "Legs": f"Buy {Kb:g}C / Sell {Ks:g}C", "POP %": round(pop * 100, 1),
+                                    "Credit/Debit": f"-${net:.2f}", "Max profit": f"${(width-net)*100:,.0f}",
+                                    "Max loss": f"${net*100:,.0f}", "Ret/risk": f"{ror:.1f}%",
+                                    "Breakeven": f"${be:.2f}", "_pop": pop, "_ror": ror})
+        except Exception:
+            continue
+    out.sort(key=lambda d: (-d["_pop"], -d["_ror"]))
+    return out
+
+
+if page == "🎯 High-Prob Options":
+    _page_header("🎯 High-Probability Options — ≥80% win-rate setups")
+    st.caption("Scans live option chains for high probability-of-profit trades — mostly premium selling "
+               "(cash-secured puts, credit spreads) plus deep-ITM debit spreads for buying. POP is from the "
+               "IV-implied lognormal at expiry. Educational, not investment advice.")
+    _defu = ["SPY", "QQQ", "IWM"]
+    try:
+        with get_conn() as _c:
+            _op = [r[0].upper() for r in _c.execute("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'").fetchall()]
+        _defu = list(dict.fromkeys(_op + _defu)) if _op else _defu
+    except Exception:
+        pass
+    _hc1, _hc2, _hc3 = st.columns([3, 1, 1])
+    _tks = _hc1.text_input("Tickers (comma-separated)", value=", ".join(_defu)).upper()
+    _minpop = _hc2.slider("Min POP %", 70, 95, 80, 1)
+    _dtew = _hc3.select_slider("Target DTE", options=["7-21", "20-45", "30-60", "45-90"], value="20-45")
+    _lo, _hi = (int(x) for x in _dtew.split("-"))
+    if st.button("🔎 Scan for setups", type="primary"):
+        _tickers = tuple([t.strip() for t in _tks.split(",") if t.strip()][:12])
+        with st.spinner("Scanning option chains…"):
+            _res = _hiprob_scan(_tickers, _lo, _hi, _minpop / 100.0)
+        st.session_state["_hiprob_res"] = _res
+        st.session_state["_hiprob_meta"] = (_minpop, _dtew)
+    _res = st.session_state.get("_hiprob_res")
+    if _res is not None:
+        if not _res:
+            st.warning("No setups met the filter — try lowering Min POP, widening DTE, or adding liquid tickers (SPY/QQQ).")
+        else:
+            _mp, _dw = st.session_state.get("_hiprob_meta", (_minpop, _dtew))
+            _df = pd.DataFrame([{k: v for k, v in d.items() if not k.startswith("_")} for d in _res])
+            st.dataframe(_df, hide_index=True, use_container_width=True,
+                         column_config={"POP %": st.column_config.NumberColumn(format="%.1f%%")})
+            st.success(f"**{len(_res)} setups ≥{_mp}% POP.** Sells collect premium (high win-rate, defined/"
+                       "cash-secured risk); the ITM debit spread is a directional buy with a built-in cushion.")
+            st.caption("⚠️ Verify bid/ask liquidity and event risk (earnings) before trading. POP = chance the "
+                       "trade is profitable at expiry under the IV-implied distribution; it is not a guarantee.")
+    else:
+        st.info("Pick tickers + min POP, then **Scan for setups**.")
+
 
 # ── Macro Dashboard data (keyless BLS + market yields + optional AlphaVantage) ──
 @st.cache_data(ttl=21600, show_spinner=False)
