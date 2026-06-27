@@ -3840,6 +3840,22 @@ _GLOBAL_THEMES = {
     "🤖 Robotics/Automation": ("BOTZ", "Automation + physical AI / humanoids", "robotics automation humanoid investment"),
     "🥇 Gold & Miners": ("GDX", "Central-bank buying, debasement hedge", "gold central bank buying investment"),
     "₿ Crypto/Bitcoin": ("IBIT", "Institutional adoption via spot ETFs", "bitcoin crypto institutional ETF investment"),
+    "🧠 AI Semis": ("SMH", "AI accelerators + the memory/HBM supercycle (the SOXX/SMH/DRAM trade)", "AI semiconductor memory HBM DRAM investment"),
+    "💾 Memory/Storage": ("MU", "DRAM/NAND/HBM upcycle — AI memory demand + tight supply", "DRAM NAND HBM memory chip shortage investment"),
+}
+
+# Key liquid constituents per theme/region proxy — for "top stocks where inflow is going"
+_THEME_STOCKS = {
+    "DBA": ["ADM", "BG", "MOS", "NTR", "CTVA"], "MOO": ["DE", "NTR", "CTVA", "CF", "MOS"],
+    "LAND": ["LAND", "FPI"], "URA": ["CCJ", "NXE", "UEC", "LEU", "DNN"],
+    "GRID": ["GEV", "VST", "CEG", "ETN", "PWR"], "COPX": ["FCX", "SCCO", "TECK", "IVN"],
+    "ITA": ["LMT", "RTX", "GD", "NOC", "PLTR"], "PHO": ["XYL", "AWK", "ECL", "WTRG"],
+    "PAVE": ["ETN", "PWR", "VMC", "MLM", "URI"], "CIBR": ["PANW", "CRWD", "ZS", "FTNT", "NET"],
+    "BOTZ": ["ISRG", "ABB", "NVDA", "KEYS", "TER"], "GDX": ["NEM", "GOLD", "AEM", "FNV", "WPM"],
+    "IBIT": ["COIN", "MSTR", "MARA", "RIOT"], "SMH": ["NVDA", "AVGO", "AMD", "TSM", "MU", "LRCX"],
+    "MU": ["MU", "WDC", "STX", "SNDK"],
+    "EWZ": ["VALE", "ITUB", "PBR", "NU"], "INDA": ["INFY", "IBN", "HDB", "WIT"],
+    "EWT": ["TSM", "UMC", "ASX"], "FXI": ["BABA", "PDD", "JD", "BIDU"], "EWW": ["AMX", "FMX"],
 }
 _COUNTRY_SECTORS = {
     "🇺🇸 USA — future sectors": [("AI Semis", "SMH"), ("Power & Nuclear", "URA"), ("Reshoring/Infra", "PAVE"),
@@ -3897,6 +3913,31 @@ def _flow_signal(tk, prices):
             + (1 if near > 90 else (-1 if near < 75 else 0))
     label = "🟢 Inflow" if score >= 2 else "🔴 Outflow" if score <= -2 else "🟡 Neutral"
     return {"px": px, "r1": r1, "r3": r3, "r6": r6, "rs": rs, "near": near, "label": label, "score": score}
+
+
+def _inflow_stage(sig):
+    """Classify where a flow is in its cycle — early innings vs established vs extended."""
+    if not sig:
+        return None
+    r1, r3, r6, rs, near = sig["r1"], sig["r3"], sig["r6"], sig["rs"], sig["near"]
+    if near >= 97 and r6 > 40:
+        return "⚠️ Extended"
+    if r1 > 0 and rs > 0 and near < 90 and r6 < 30:
+        return "🌱 Early"
+    if r1 > 3 and r1 > r3 / 2 and rs > 0:
+        return "🚀 Accelerating"
+    if sig["score"] >= 2 and near >= 90:
+        return "🔥 Established"
+    if sig["score"] <= -2:
+        return "🔴 Outflow"
+    return "🟡 Building" if r3 > 0 else "⚪ Base"
+
+
+def _early_score(sig):
+    """Higher = earlier + more room (turning up, leading SPY, below highs, not yet extended)."""
+    if not sig:
+        return -99
+    return sig["rs"] + sig["r1"] + (100 - sig["near"]) / 5 - max(0, sig["r6"] - 30) / 5
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -18637,6 +18678,44 @@ if page == "🌍 Global Opportunities":
                 _render_global_card(_lbl, _px, _desc, _q, _gp)
 
         with _gt2:
+            # ── EARLY-STAGE INFLOWS — get in before it's obvious (SOXX/SMH/DRAM early days) ──
+            st.markdown("#### 🌱 Early-stage inflows — get in before it's obvious")
+            st.caption("Themes & regions where money is just *starting* to flow: momentum turning up and leading "
+                       "SPY, still below 52-week highs (room to run) and not yet extended — like the early days of "
+                       "SOXX / SMH / DRAM.")
+            _allf = []
+            for _k, (_p, _d, _q) in {**_GLOBAL_THEMES, **_GLOBAL_REGIONS}.items():
+                _sg = _flow_signal(_p, _gp)
+                if not _sg:
+                    continue
+                _allf.append({"Theme": _k, "Proxy": _p, "Stage": _inflow_stage(_sg),
+                              "1m %": round(_sg["r1"]), "3m %": round(_sg["r3"]), "vs SPY": round(_sg["rs"]),
+                              "%52w hi": round(_sg["near"]),
+                              "Top stocks": ", ".join(_THEME_STOCKS.get(_p, [])[:4]) or "—",
+                              "_e": _early_score(_sg), "_thesis": _d, "_q": _q, "_sig": _sg})
+            _earlies = sorted([x for x in _allf if x["Stage"] in ("🌱 Early", "🚀 Accelerating", "🟡 Building")],
+                              key=lambda x: -x["_e"])
+            if _earlies:
+                st.dataframe(pd.DataFrame([{k: v for k, v in x.items() if not k.startswith("_")}
+                                           for x in _earlies[:12]]), hide_index=True, use_container_width=True,
+                             column_config={c: st.column_config.NumberColumn(format="%d%%")
+                                            for c in ["1m %", "3m %", "vs SPY", "%52w hi"]})
+                st.markdown("**🧠 What the market & buyers are thinking — top early themes**")
+                for x in _earlies[:3]:
+                    _s = x["_sig"]
+                    with st.expander(f"{x['Theme']} ({x['Proxy']}) · {x['Stage']} · {x['1m %']:+d}% 1m", expanded=False):
+                        st.markdown(
+                            f"Flows are turning up (**{_s['r1']:+.0f}%** in 1m, **leading SPY by {_s['rs']:+.0f}%** "
+                            f"over 3m) while still **{100-_s['near']:.0f}% below the 52-week high** — early-innings "
+                            f"accumulation with room to run. Buyers are positioning for: *{x['_thesis']}*.")
+                        if _THEME_STOCKS.get(x["Proxy"]):
+                            st.caption("Where the inflow concentrates: " + ", ".join(_THEME_STOCKS[x["Proxy"]]))
+                        for it in _theme_news(x["_q"], n=3):
+                            e = "🟢" if it["tone"] > 0 else ("🔴" if it["tone"] < 0 else "⚪")
+                            st.markdown(f"- {e} [{it['title']}]({it['link']}) · _{it['when']}_")
+            else:
+                st.caption("No clean early-stage setups right now — see the full leaderboard below.")
+            st.markdown("---")
             _flow_leaderboard(_GLOBAL_THEMES, "Themes")
             st.markdown("---")
             _ordered = sorted(_GLOBAL_THEMES.items(),
