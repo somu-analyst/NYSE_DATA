@@ -1990,6 +1990,7 @@ MAIN_MENU_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("📡 Macro/Event Hub", callback_data="hub_menu"),
      InlineKeyboardButton("📰 Market Wrap", callback_data="wrap_view"),
      InlineKeyboardButton("📺 TradingView", callback_data="tv_view")],
+    [InlineKeyboardButton("🎯 Hi-Prob Options (≥80%)", callback_data="hiprob_view")],
     # ── AI + SETTINGS ────────────────────────────────────────────
     [InlineKeyboardButton("━━  AI & TOOLS  ━━━━━━━━━━━━", callback_data="noop")],
     [InlineKeyboardButton("🤖 Ask AI",     callback_data="menu_ai_chat"),
@@ -10687,6 +10688,8 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await wrap_view(query)
         elif data == "tv_view":
             await tv_view(query)
+        elif data == "hiprob_view":
+            await hiprob_view(query)
         elif data.startswith("tvc_"):
             await tv_view(query, data.split("tvc_", 1)[1])
         elif data == "plan_port_chart":
@@ -16999,6 +17002,119 @@ async def tv_view(query, symbol=None):
                                     parse_mode=H, reply_markup=_kb_tv(symbol))
 
 
+def _hiprob_scan(tickers, dte_lo=20, dte_hi=45, min_pop=0.80, r=0.045):
+    """Scan option chains for >=min_pop POP setups (CSP, credit spreads). Returns compact text rows."""
+    import datetime as _dt
+    from scipy.stats import norm as _nm
+    out = []
+
+    def _pa(S, X, T, iv):
+        if min(S, X, T, iv) <= 0:
+            return None
+        return float(_nm.cdf((np.log(S / X) + (r - 0.5 * iv * iv) * T) / (iv * np.sqrt(T))))
+
+    for tk in tickers:
+        tk = str(tk).strip().upper()
+        if not tk:
+            continue
+        try:
+            t = yf.Ticker(tk)
+            spot = _last_price(tk) or float(t.history(period="1d")["Close"].iloc[-1])
+            if not spot:
+                continue
+            exp = dte = None
+            for e in (t.options or []):
+                try:
+                    d = (_dt.datetime.strptime(e, "%Y-%m-%d").date() - _dt.date.today()).days
+                except Exception:
+                    continue
+                if dte_lo <= d <= dte_hi:
+                    exp, dte = e, d
+                    break
+            if not exp:
+                continue
+            T = max(dte, 1) / 365.0
+            ch = t.option_chain(exp)
+            puts = ch.puts.copy(); calls = ch.calls.copy()
+            for df in (puts, calls):
+                df["mid"] = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2).where(
+                    (df["bid"] > 0) & (df["ask"] > 0), df["lastPrice"])
+            pl = puts[(puts["strike"] < spot) & (puts["mid"] > 0.05)].sort_values("strike", ascending=False).reset_index(drop=True)
+            for i in range(len(pl)):
+                K = float(pl.loc[i, "strike"]); cr = float(pl.loc[i, "mid"]); iv = float(pl.loc[i, "impliedVolatility"] or 0)
+                if iv <= 0:
+                    continue
+                pop = _pa(spot, K - cr, T, iv)
+                if pop is None or pop < min_pop:
+                    continue
+                out.append((pop, cr / max(K - cr, 0.01) * 100,
+                            f"{tk} SELL {K:g}P · {dte}d · POP {pop*100:.0f}% · +${cr:.2f} · BE {K-cr:.0f}"))
+                if i + 2 < len(pl):
+                    Kl = float(pl.loc[i + 2, "strike"]); cl = float(pl.loc[i + 2, "mid"]); net = cr - cl; width = K - Kl
+                    if net > 0.03 and width > 0:
+                        out.append((pop, net / max(width - net, 0.01) * 100,
+                                    f"{tk} put-spread {K:g}/{Kl:g} · {dte}d · POP {pop*100:.0f}% · +${net:.2f} · risk ${(width-net)*100:.0f}"))
+                break
+            cu = calls[(calls["strike"] > spot) & (calls["mid"] > 0.05)].sort_values("strike").reset_index(drop=True)
+            for i in range(len(cu)):
+                K = float(cu.loc[i, "strike"]); cr = float(cu.loc[i, "mid"]); iv = float(cu.loc[i, "impliedVolatility"] or 0)
+                if iv <= 0:
+                    continue
+                pa = _pa(spot, K + cr, T, iv)
+                if pa is None:
+                    continue
+                pop = 1 - pa
+                if pop < min_pop:
+                    continue
+                if i + 2 < len(cu):
+                    Kl = float(cu.loc[i + 2, "strike"]); cl = float(cu.loc[i + 2, "mid"]); net = cr - cl; width = Kl - K
+                    if net > 0.03 and width > 0:
+                        out.append((pop, net / max(width - net, 0.01) * 100,
+                                    f"{tk} call-spread {K:g}/{Kl:g} · {dte}d · POP {pop*100:.0f}% · +${net:.2f} · risk ${(width-net)*100:.0f}"))
+                break
+        except Exception:
+            continue
+    out.sort(key=lambda z: (-z[0], -z[1]))
+    return [s for _, _, s in out]
+
+
+def _hiprob_default_tickers():
+    conn = get_conn()
+    try:
+        tks = [r[0] for r in conn.execute("SELECT DISTINCT UPPER(ticker) FROM trades WHERE status='OPEN'").fetchall()]
+    finally:
+        conn.close()
+    return list(dict.fromkeys(tks + ["SPY", "QQQ", "IWM"]))
+
+
+async def hiprob_command(update, ctx):
+    """/hiprob [TICKERS] — high-probability (>=80% POP) option setups: premium selling + spreads."""
+    args = list(getattr(ctx, "args", []) or [])
+    tks = [a.upper() for a in args] if args else _hiprob_default_tickers()
+    await update.message.reply_text("🎯 Scanning for ≥80% POP option setups…", parse_mode=H)
+    rows = _hiprob_scan(tuple(tks[:10]))
+    if not rows:
+        await update.message.reply_text("No ≥80% POP setups right now. Try <code>/hiprob SPY QQQ IWM</code>.", parse_mode=H)
+        return
+    txt = ("🎯 <b>High-Prob Options (≥80% POP)</b>\n<i>sells = collect premium, defined/cash-secured risk · "
+           "not advice</i>\n\n" + "\n".join("• " + r for r in rows[:15]))
+    await update.message.reply_text(txt[:4000], parse_mode=H,
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="hiprob_view"),
+                                                                        InlineKeyboardButton("⬅️ Menu", callback_data="menu_main")]]))
+
+
+async def hiprob_view(query):
+    rows = _hiprob_scan(tuple(_hiprob_default_tickers()[:10]))
+    if not rows:
+        await query.message.reply_text("No ≥80% POP setups right now. Try /hiprob SPY QQQ IWM.", parse_mode=H)
+        return
+    txt = ("🎯 <b>High-Prob Options (≥80% POP)</b>\n<i>sells = collect premium, defined/cash-secured risk · "
+           "not advice</i>\n\n" + "\n".join("• " + r for r in rows[:15]))
+    await query.message.reply_text(txt[:4000], parse_mode=H,
+                                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="hiprob_view"),
+                                                                       InlineKeyboardButton("⬅️ Menu", callback_data="menu_main")]]))
+
+
 async def plan_command(update, ctx):
     """/plan - condensed next-day game plan for your open positions."""
     conn = get_conn()
@@ -19024,6 +19140,7 @@ def main():
     app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("wrap", wrap_command))
     app.add_handler(CommandHandler("tv", tv_command))
+    app.add_handler(CommandHandler("hiprob", hiprob_command))
     app.add_handler(CommandHandler("journal", journal_command))
     app.add_handler(CommandHandler("logevent", logevent_command))
     app.add_handler(CommandHandler("bookmarks", bookmarks_command))
