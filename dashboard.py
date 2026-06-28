@@ -4777,6 +4777,10 @@ _PAGE_HELP = {
     "🚀 Live Momentum Scanner":  "Intraday momentum scanner. Screens for tickers with unusual volume, OI spikes, or RSI extremes in real time — find the next big mover.",
     "🧑‍💼 AI Hedge Fund":        "A committee of 12 famous-investor agents (Buffett, Graham, Wood, Lynch, Burry, Druckenmiller, Damodaran, Ackman, Fisher, Munger, Taleb, Pabrai) plus a Valuation / Fundamentals / Technicals / Sentiment desk and a Risk Manager all vote on a ticker from free yfinance fundamentals. A Portfolio Manager aggregates into BUY / HOLD / AVOID with a suggested position size. Inspired by virattt/ai-hedge-fund — deterministic, no LLM keys, no paid data.",
     "🎯 Signal Accuracy":        "Validation lab: replays each signal (OI bias, PCR, momentum, RSI, SMA) across stored history and scores its hit-rate + directional edge vs the forward N-day move. Also surfaces the 24-model ensemble's forward-tracked accuracy. Answers: do my signals actually work?",
+    "📐 Spreads Scanner":        "Bull Call, Bear Call, and Bear Put vertical spreads across your tickers, ranked by a composite Score (POP, reward/risk, breakeven cushion, leg liquidity). Defined risk on every spread; built from live chains + Black-Scholes.",
+    "🎡 Wheel / CSP":            "Wheel-strategy screener: cash-secured puts ranked by annualized yield vs assignment risk (POP), plus covered-call candidates for shares you hold. The premium/yield/breakeven math is done for you.",
+    "📊 GEX Profile":            "Dealer Gamma Exposure by strike (calls +, puts −) with the zero-gamma flip price and call/put walls. Positive total GEX = dealers dampen moves (range-bound); negative = dealers amplify moves (trending).",
+    "🏁 Spread Backtest":        "Model-based vertical-spread backtest: replays ATM spreads across stock_daily history (BS-priced, trailing realized vol), exiting at a profit target or loss threshold, and reports how often each strategy hit target vs stop.",
 }
 
 with st.sidebar:
@@ -4795,6 +4799,10 @@ with st.sidebar:
         ],
         "💡 Trade Ideas": [
             "🎯 High-Prob Options",
+            "📐 Spreads Scanner",
+            "🎡 Wheel / CSP",
+            "📊 GEX Profile",
+            "🏁 Spread Backtest",
             "🔎 Smart-Money Flow",
             "🎯 Prop Trading Screen",
             "🧠 High-Prob Engine",
@@ -17855,6 +17863,372 @@ def _hiprob_scan(tickers, dte_lo=20, dte_hi=45, min_pop=0.80, r=0.045):
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Spreads scanner · Wheel/CSP screener · Signed GEX · Spread backtest
+# Inspired by BigDipper-style positioning + spread dashboards, but built entirely
+# from your own DB + yfinance + the Black-Scholes engine above (no paid feeds).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _pop_above(S, X, T, iv, r=0.045):
+    """P(S_T > X) under the IV-implied lognormal at expiry."""
+    if None in (S, X, T, iv) or min(S, X, T, iv) <= 0:
+        return None
+    d2 = (np.log(S / X) + (r - 0.5 * iv * iv) * T) / (iv * np.sqrt(T))
+    return float(norm.cdf(d2))
+
+
+def _pick_expiry(tk, dte_lo, dte_hi):
+    """First listed expiry inside [dte_lo, dte_hi]; else the nearest expiry at/after dte_lo."""
+    import datetime as _dt
+    try:
+        exps = list(yf.Ticker(tk).options)
+    except Exception:
+        return None, None
+    best = None
+    for e in exps:
+        try:
+            d = (_dt.datetime.strptime(e, "%Y-%m-%d").date() - _dt.date.today()).days
+        except Exception:
+            continue
+        if dte_lo <= d <= dte_hi:
+            return e, d
+        if d >= dte_lo and (best is None or d < best[1]):
+            best = (e, d)
+    return best if best else (None, None)
+
+
+def _chain_prep(tk, exp):
+    """Return (calls, puts) DataFrames with a robust 'mid' and 'oi' column, or (None, None)."""
+    ch = _cached_option_chain(tk, exp)
+    if ch is None:
+        return None, None
+    calls = ch.calls.copy(); puts = ch.puts.copy()
+    for df in (calls, puts):
+        df["mid"] = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2).where(
+            (df["bid"] > 0) & (df["ask"] > 0), df["lastPrice"])
+        df["oi"] = df["openInterest"].fillna(0) if "openInterest" in df.columns else 0
+    return calls, puts
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _spreads_scan(tickers, dte_lo=20, dte_hi=45, r=0.045, top_per=6):
+    """Bull Call (debit), Bear Call (credit), Bear Put (debit) candidates, ranked by a
+    composite score from POP, reward/risk, breakeven cushion, and leg liquidity."""
+    out = []
+    for tk in tickers:
+        tk = str(tk).strip().upper()
+        if not tk:
+            continue
+        try:
+            spot = _spot(tk) or _cached_price(tk)
+            if not spot:
+                continue
+            exp, dte = _pick_expiry(tk, dte_lo, dte_hi)
+            if not exp:
+                continue
+            T = max(dte, 1) / 365.0
+            calls, puts = _chain_prep(tk, exp)
+            if calls is None:
+                continue
+
+            def _near(df):
+                d = df[(df["mid"] > 0.02) & (df["strike"] >= spot * 0.85) & (df["strike"] <= spot * 1.15)]
+                return d.sort_values("strike").reset_index(drop=True).to_dict("records")
+            C = _near(calls); P = _near(puts)
+            cand = []
+
+            def add(strat, legs, net, width, be, pop, oi_min, direction):
+                if net is None or net <= 0 or width <= 0 or pop is None or not (0 < pop < 1):
+                    return
+                maxp, maxl = (width - net, net) if direction == "debit" else (net, width - net)
+                if maxp <= 0.05 or maxl <= 0.05:   # drop worthless far-OTM / zero-payoff legs
+                    return
+                if direction == "credit" and net / width < 0.05:   # collect >=5% of width
+                    return
+                rr = maxp / maxl
+                if rr < 0.10:   # drop near-zero-reward degenerate spreads
+                    return
+                cushion = abs(be - spot) / spot
+                score = 100 * (0.40 * pop + 0.25 * min(rr, 2) / 2
+                               + 0.20 * min(cushion, 0.10) / 0.10
+                               + 0.15 * min(oi_min, 500) / 500)
+                cand.append({"Ticker": tk, "Strategy": strat, "DTE": dte, "Legs": legs,
+                             "Score": round(score, 1), "POP %": round(pop * 100, 1),
+                             "Net": (f"-${net:.2f}" if direction == "debit" else f"+${net:.2f}"),
+                             "Max profit": f"${maxp*100:,.0f}", "Max loss": f"${maxl*100:,.0f}",
+                             "R/R": f"{rr:.2f}", "Breakeven": f"${be:.2f}", "Width": f"{width:g}",
+                             "OI": int(oi_min), "_score": score, "_strat": strat})
+
+            for i in range(len(C)):
+                for j in range(i + 1, min(i + 5, len(C))):
+                    a, b = C[i], C[j]
+                    width = b["strike"] - a["strike"]
+                    iv_a = float(a.get("impliedVolatility") or 0)
+                    oi_min = min(a["oi"] or 0, b["oi"] or 0)
+                    # Bull Call (debit): buy lower, sell higher
+                    net = a["mid"] - b["mid"]; be = a["strike"] + net
+                    add("Bull Call", f"Buy {a['strike']:g}C / Sell {b['strike']:g}C",
+                        net, width, be, _pop_above(spot, be, T, iv_a), oi_min, "debit")
+                    # Bear Call (credit): sell lower, buy higher
+                    pa = _pop_above(spot, be, T, iv_a)
+                    add("Bear Call", f"Sell {a['strike']:g}C / Buy {b['strike']:g}C",
+                        net, width, be, (None if pa is None else 1 - pa), oi_min, "credit")
+            for i in range(len(P)):
+                for j in range(i + 1, min(i + 5, len(P))):
+                    a, b = P[i], P[j]  # a = lower strike, b = higher strike
+                    width = b["strike"] - a["strike"]
+                    iv_b = float(b.get("impliedVolatility") or 0)
+                    oi_min = min(a["oi"] or 0, b["oi"] or 0)
+                    # Bear Put (debit): buy higher, sell lower
+                    net = b["mid"] - a["mid"]; be = b["strike"] - net
+                    pa = _pop_above(spot, be, T, iv_b)
+                    add("Bear Put", f"Buy {b['strike']:g}P / Sell {a['strike']:g}P",
+                        net, width, be, (None if pa is None else 1 - pa), oi_min, "debit")
+
+            cand.sort(key=lambda d: -d["_score"])
+            seen = {}
+            for c in cand:
+                seen.setdefault(c["_strat"], 0)
+                if seen[c["_strat"]] < top_per:
+                    out.append(c); seen[c["_strat"]] += 1
+        except Exception:
+            continue
+    out.sort(key=lambda d: -d["_score"])
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _wheel_scan(tickers, dte_lo=20, dte_hi=45, r=0.045, otm_max=0.18):
+    """Cash-secured puts ranked by annualized yield vs assignment risk (POP)."""
+    out = []
+    for tk in tickers:
+        tk = str(tk).strip().upper()
+        if not tk:
+            continue
+        try:
+            spot = _spot(tk) or _cached_price(tk)
+            if not spot:
+                continue
+            exp, dte = _pick_expiry(tk, dte_lo, dte_hi)
+            if not exp:
+                continue
+            T = max(dte, 1) / 365.0
+            calls, puts = _chain_prep(tk, exp)
+            if puts is None:
+                continue
+            pl = puts[(puts["strike"] < spot) & (puts["strike"] >= spot * (1 - otm_max)) & (puts["mid"] > 0.03)]
+            for _, row in pl.iterrows():
+                K = float(row["strike"]); cr = float(row["mid"]); iv = float(row.get("impliedVolatility") or 0)
+                if not (iv > 0):
+                    continue
+                pop = _pop_above(spot, K, T, iv)   # P(S_T > K) = keep premium, no assignment
+                if pop is None:
+                    continue
+                p_assign = 1 - pop
+                yld = cr / K
+                ann = yld * (365.0 / max(dte, 1))
+                be = K - cr
+                score = 100 * (0.45 * pop + 0.35 * min(ann, 1.0) + 0.20 * min(cr / spot, 0.05) / 0.05)
+                out.append({"Ticker": tk, "DTE": dte, "Strike": f"{K:g}", "Premium": f"${cr:.2f}",
+                            "Yield": f"{yld*100:.2f}%", "Annualized": f"{ann*100:.0f}%",
+                            "POP %": round(pop * 100, 1), "P(assign) %": round(p_assign * 100, 1),
+                            "Breakeven": f"${be:.2f}", "Discount": f"{(spot-be)/spot*100:.1f}%",
+                            "Capital": f"${K*100:,.0f}", "Score": round(score, 1), "_score": score})
+        except Exception:
+            continue
+    out.sort(key=lambda d: -d["_score"])
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _covered_call_scan(tickers, dte_lo=20, dte_hi=45, r=0.045, otm_max=0.18):
+    """Covered calls (assume 100 shares held) ranked by annualized yield + upside-if-called."""
+    out = []
+    for tk in tickers:
+        tk = str(tk).strip().upper()
+        if not tk:
+            continue
+        try:
+            spot = _spot(tk) or _cached_price(tk)
+            if not spot:
+                continue
+            exp, dte = _pick_expiry(tk, dte_lo, dte_hi)
+            if not exp:
+                continue
+            T = max(dte, 1) / 365.0
+            calls, puts = _chain_prep(tk, exp)
+            if calls is None:
+                continue
+            cu = calls[(calls["strike"] > spot) & (calls["strike"] <= spot * (1 + otm_max)) & (calls["mid"] > 0.03)]
+            for _, row in cu.iterrows():
+                K = float(row["strike"]); cr = float(row["mid"]); iv = float(row.get("impliedVolatility") or 0)
+                if not (iv > 0):
+                    continue
+                pa = _pop_above(spot, K, T, iv)   # P(S_T > K) = called away
+                if pa is None:
+                    continue
+                pop_keep = 1 - pa
+                yld = cr / spot
+                ann = yld * (365.0 / max(dte, 1))
+                upside = (K - spot + cr) / spot   # total return if called away
+                score = 100 * (0.40 * pop_keep + 0.35 * min(ann, 1.0) + 0.25 * min(upside, 0.12) / 0.12)
+                out.append({"Ticker": tk, "DTE": dte, "Strike": f"{K:g}", "Premium": f"${cr:.2f}",
+                            "Yield": f"{yld*100:.2f}%", "Annualized": f"{ann*100:.0f}%",
+                            "P(keep shares) %": round(pop_keep * 100, 1),
+                            "Upside if called": f"{upside*100:.1f}%", "Score": round(score, 1), "_score": score})
+        except Exception:
+            continue
+    out.sort(key=lambda d: -d["_score"])
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _gex_profile(ticker, dte_lo=0, dte_hi=45, r=0.045):
+    """Signed dealer gamma exposure (GEX) by strike across near-term expiries + zero-gamma flip.
+    Convention: dealers long calls / short puts -> call gamma adds (+), put gamma subtracts (-).
+    GEX per strike ≈ sign * gamma * OI * 100 * spot^2 * 0.01 (≈ $ gamma per 1% move)."""
+    import datetime as _dt, collections
+    tk = str(ticker).strip().upper()
+    spot = _spot(tk) or _cached_price(tk)
+    if not spot:
+        return None
+    try:
+        exps = list(yf.Ticker(tk).options)
+    except Exception:
+        exps = []
+    by = collections.defaultdict(float)
+    by_c = collections.defaultdict(float); by_p = collections.defaultdict(float)
+    legs = []
+    for e in exps:
+        try:
+            d = (_dt.datetime.strptime(e, "%Y-%m-%d").date() - _dt.date.today()).days
+        except Exception:
+            continue
+        if not (dte_lo <= d <= dte_hi):
+            continue
+        T = max(d, 1) / 365.0
+        calls, puts = _chain_prep(tk, e)
+        if calls is None:
+            continue
+        for df, sign, opt in ((calls, +1, "call"), (puts, -1, "put")):
+            for _, row in df.iterrows():
+                K = float(row["strike"]); oi = float(row.get("oi") or 0); iv = float(row.get("impliedVolatility") or 0)
+                if not (oi > 0) or not (iv > 0) or K <= 0 or not (spot * 0.7 <= K <= spot * 1.3):
+                    continue
+                g = bs_greeks(spot, K, T, r, iv, opt)["gamma"]
+                gex = sign * g * oi * 100 * spot * spot * 0.01
+                by[K] += gex
+                (by_c if sign > 0 else by_p)[K] += gex
+                legs.append((K, T, iv, oi, sign, opt))
+    if not by:
+        return None
+    strikes = sorted(by)
+    profile = [(k, by[k]) for k in strikes]
+    total = sum(by.values())
+    # zero-gamma flip: scan candidate spot levels, interpolate first sign change
+    flip = None; prev = None
+    for S in np.linspace(spot * 0.85, spot * 1.15, 61):
+        tot = 0.0
+        for K, T, iv, oi, sign, opt in legs:
+            tot += sign * bs_greeks(S, K, T, r, iv, opt)["gamma"] * oi * 100 * S * S * 0.01
+        if prev is not None and (prev[1] < 0) != (tot < 0):
+            S0, t0 = prev
+            flip = S0 + (S - S0) * (0 - t0) / (tot - t0) if (tot - t0) else S
+            break
+        prev = (S, tot)
+    call_wall = max(by_c.items(), key=lambda kv: kv[1], default=(None, 0))[0] if by_c else None
+    put_wall = min(by_p.items(), key=lambda kv: kv[1], default=(None, 0))[0] if by_p else None
+    return {"ticker": tk, "spot": spot, "profile": profile, "total": total,
+            "flip": flip, "call_wall": call_wall, "put_wall": put_wall}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _spread_backtest(ticker, dte=30, width_pct=0.04, profit_target=0.30, loss_threshold=0.50,
+                     lookback_days=180, r=0.045):
+    """Model-based vertical-spread backtest on stock_daily closes (BS-priced with trailing
+    realized vol). For each historical entry it tracks the spread to expiry and records whether
+    it hit the profit target or the loss threshold first. NOT live fills — a model estimate."""
+    import datetime as _dt
+    try:
+        with get_conn() as c:
+            rows = c.execute(
+                "SELECT trade_date, close FROM stock_daily WHERE ticker=? "
+                "ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)",
+                (ticker.upper(),)).fetchall()
+    except Exception:
+        return None
+    if not rows or len(rows) < dte + 25:
+        return None
+    dates = [str(rt[0]) for rt in rows]
+    closes = np.array([float(rt[1]) for rt in rows], dtype=float)
+    # trailing 20d realized vol per index
+    logret = np.diff(np.log(closes))
+    n = len(closes)
+    start = max(25, n - lookback_days - dte)
+    strategies = ["Bull Call", "Bear Call", "Bear Put"]
+    stats = {s: {"trades": 0, "tp": 0, "sl": 0} for s in strategies}
+
+    def _spread_value(strat, S, T, iv, S0):
+        if strat == "Bull Call":
+            k1, k2 = S0, S0 * (1 + width_pct)
+            return bs_greeks(S, k1, T, r, iv, "call")["price"] - bs_greeks(S, k2, T, r, iv, "call")["price"]
+        if strat == "Bear Call":
+            k1, k2 = S0 * (1 + 0.005), S0 * (1 + 0.005 + width_pct)
+            return bs_greeks(S, k1, T, r, iv, "call")["price"] - bs_greeks(S, k2, T, r, iv, "call")["price"]
+        # Bear Put
+        k2, k1 = S0, S0 * (1 - width_pct)
+        return bs_greeks(S, k2, T, r, iv, "put")["price"] - bs_greeks(S, k1, T, r, iv, "put")["price"]
+
+    for i in range(start, n - dte):
+        if i < 21:
+            continue
+        iv = float(np.std(logret[i - 20:i]) * np.sqrt(252))
+        if not np.isfinite(iv) or iv <= 0.01:
+            continue
+        S0 = closes[i]
+        for strat in strategies:
+            credit = strat == "Bear Call"
+            try:
+                v0 = _spread_value(strat, S0, dte / 365.0, iv, S0)
+            except Exception:
+                continue
+            if v0 <= 0.02:
+                continue
+            stats[strat]["trades"] += 1
+            hit = None
+            for d in range(1, dte + 1):
+                S = closes[i + d]; T = max(dte - d, 0) / 365.0
+                try:
+                    v = _spread_value(strat, S, max(T, 1e-6), iv, S0)
+                except Exception:
+                    continue
+                if credit:   # want value to fall
+                    if v <= v0 * (1 - profit_target):
+                        hit = "tp"; break
+                    if v >= v0 * (1 + loss_threshold):
+                        hit = "sl"; break
+                else:        # debit: want value to rise
+                    if v >= v0 * (1 + profit_target):
+                        hit = "tp"; break
+                    if v <= v0 * (1 - loss_threshold):
+                        hit = "sl"; break
+            if hit == "tp":
+                stats[strat]["tp"] += 1
+            elif hit == "sl":
+                stats[strat]["sl"] += 1
+    res = []
+    for s in strategies:
+        t = stats[s]["trades"]
+        if t == 0:
+            continue
+        res.append({"Strategy": s, "Trades": t,
+                    "TP hit %": round(stats[s]["tp"] / t * 100, 1),
+                    "SL hit %": round(stats[s]["sl"] / t * 100, 1),
+                    "Neither %": round((t - stats[s]["tp"] - stats[s]["sl"]) / t * 100, 1)})
+    return {"ticker": ticker.upper(), "dte": dte, "pt": profit_target, "lt": loss_threshold,
+            "from": dates[start], "to": dates[min(n - dte - 1, n - 1)], "rows": res}
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def _smartmoney_screen():
     """Per-ticker option-flow metrics from the latest options_change snapshot:
@@ -18055,6 +18429,176 @@ if page == "🎯 High-Prob Options":
                        "trade is profitable at expiry under the IV-implied distribution; it is not a guarantee.")
     else:
         st.info("Pick tickers + min POP, then **Scan for setups**.")
+
+
+def _spread_default_tickers():
+    _d = ["SPY", "QQQ", "IWM"]
+    try:
+        with get_conn() as _c:
+            _op = [r[0].upper() for r in _c.execute("SELECT DISTINCT ticker FROM trades WHERE status='OPEN'").fetchall()]
+        return list(dict.fromkeys(_op + _d)) if _op else _d
+    except Exception:
+        return _d
+
+
+if page == "📐 Spreads Scanner":
+    _page_header("📐 Spreads Scanner — Bull Call · Bear Call · Bear Put")
+    st.caption("Surfaces vertical-spread setups already ranked by a composite **Score** "
+               "(POP · reward/risk · breakeven cushion · leg liquidity). Defined-risk on every spread. "
+               "Inspired by spread-dashboard tools, computed from your DB + live chains + Black-Scholes. "
+               "Educational, not investment advice.")
+    _c1, _c2, _c3, _c4 = st.columns([3, 1, 1, 1])
+    _tks = _c1.text_input("Tickers (comma-separated)", value=", ".join(_spread_default_tickers()), key="spr_tk").upper()
+    _strat = _c2.selectbox("Strategy", ["All", "Bull Call", "Bear Call", "Bear Put"], key="spr_strat")
+    _dtew = _c3.select_slider("Target DTE", options=["7-21", "20-45", "30-60", "45-90"], value="20-45", key="spr_dte")
+    _minsc = _c4.slider("Min score", 0, 90, 50, 5, key="spr_sc")
+    _lo, _hi = (int(x) for x in _dtew.split("-"))
+    if st.button("🔎 Scan spreads", type="primary", key="spr_btn"):
+        _tickers = tuple([t.strip() for t in _tks.split(",") if t.strip()][:14])
+        with st.spinner("Scanning option chains…"):
+            st.session_state["_spr_res"] = _spreads_scan(_tickers, _lo, _hi)
+    _res = st.session_state.get("_spr_res")
+    if _res is not None:
+        if _strat != "All":
+            _res = [d for d in _res if d["_strat"] == _strat]
+        _res = [d for d in _res if d["_score"] >= _minsc]
+        if not _res:
+            st.warning("No spreads met the filters — lower Min score, change strategy, or widen DTE.")
+        else:
+            for _s in ["Bull Call", "Bear Call", "Bear Put"]:
+                if _strat not in ("All", _s):
+                    continue
+                _sub = [d for d in _res if d["_strat"] == _s]
+                if not _sub:
+                    continue
+                _emoji = {"Bull Call": "🟢", "Bear Call": "🔴", "Bear Put": "🟣"}[_s]
+                _kind = {"Bull Call": "debit · bullish", "Bear Call": "credit · bearish/neutral", "Bear Put": "debit · bearish"}[_s]
+                st.markdown(f"#### {_emoji} {_s} spreads  \n*{_kind}*")
+                _df = pd.DataFrame([{k: v for k, v in d.items() if not k.startswith("_")} for d in _sub])
+                st.dataframe(_df, hide_index=True, use_container_width=True,
+                             column_config={"Score": st.column_config.ProgressColumn(format="%.0f", min_value=0, max_value=100),
+                                            "POP %": st.column_config.NumberColumn(format="%.1f%%")})
+            st.caption("⚠️ Score blends probability, payoff, cushion and liquidity — it is not a guarantee. "
+                       "Verify bid/ask spreads and earnings dates before trading.")
+    else:
+        st.info("Pick tickers + strategy, then **Scan spreads**.")
+
+
+if page == "🎡 Wheel / CSP":
+    _page_header("🎡 Wheel — Cash-Secured Puts & Covered Calls")
+    st.caption("CSP candidates ranked by **annualized yield vs assignment risk**, plus covered-call "
+               "candidates for shares you hold. The math (premium, yield, POP, breakeven discount) done for you.")
+    _c1, _c2, _c3 = st.columns([3, 1, 1])
+    _tks = _c1.text_input("Tickers (comma-separated)", value=", ".join(_spread_default_tickers()), key="wh_tk").upper()
+    _dtew = _c2.select_slider("Target DTE", options=["7-21", "20-45", "30-60", "45-90"], value="20-45", key="wh_dte")
+    _minpop = _c3.slider("Min POP %", 60, 90, 70, 5, key="wh_pop")
+    _lo, _hi = (int(x) for x in _dtew.split("-"))
+    if st.button("🔎 Scan wheel setups", type="primary", key="wh_btn"):
+        _tickers = tuple([t.strip() for t in _tks.split(",") if t.strip()][:14])
+        with st.spinner("Scanning option chains…"):
+            st.session_state["_wh_csp"] = _wheel_scan(_tickers, _lo, _hi)
+            st.session_state["_wh_cc"] = _covered_call_scan(_tickers, _lo, _hi)
+    _csp = st.session_state.get("_wh_csp")
+    if _csp is not None:
+        _csp = [d for d in _csp if d["POP %"] >= _minpop]
+        st.markdown("#### 💰 Cash-secured puts  \n*get paid to wait — assigned = buy the stock at a discount*")
+        if _csp:
+            _df = pd.DataFrame([{k: v for k, v in d.items() if not k.startswith("_")} for d in _csp])
+            st.dataframe(_df, hide_index=True, use_container_width=True,
+                         column_config={"Score": st.column_config.ProgressColumn(format="%.0f", min_value=0, max_value=100),
+                                        "POP %": st.column_config.NumberColumn(format="%.1f%%"),
+                                        "P(assign) %": st.column_config.NumberColumn(format="%.1f%%")})
+        else:
+            st.warning("No CSPs met the POP filter — lower Min POP or widen DTE.")
+        _cc = st.session_state.get("_wh_cc") or []
+        _cc = [d for d in _cc if d["P(keep shares) %"] >= _minpop]
+        st.markdown("#### 📞 Covered calls  \n*assumes 100 shares held — income + capped upside*")
+        if _cc:
+            _df2 = pd.DataFrame([{k: v for k, v in d.items() if not k.startswith("_")} for d in _cc])
+            st.dataframe(_df2, hide_index=True, use_container_width=True,
+                         column_config={"Score": st.column_config.ProgressColumn(format="%.0f", min_value=0, max_value=100),
+                                        "P(keep shares) %": st.column_config.NumberColumn(format="%.1f%%")})
+        else:
+            st.caption("No covered-call candidates at this POP threshold.")
+        st.caption("⚠️ CSP requires cash to buy 100 shares at the strike if assigned. POP = chance you keep the "
+                   "premium without assignment under the IV-implied distribution.")
+    else:
+        st.info("Pick tickers, then **Scan wheel setups**.")
+
+
+if page == "📊 GEX Profile":
+    _page_header("📊 GEX Profile — Dealer Gamma Exposure")
+    st.caption("Signed dealer gamma by strike (calls **+**, puts **−**), the **zero-gamma flip** price, and "
+               "call/put walls. Positive total GEX → dealers dampen moves (mean-reverting); negative → dealers "
+               "amplify moves (trending). Computed from OI × Black-Scholes gamma on your live chain.")
+    _c1, _c2 = st.columns([3, 1])
+    _tk = _c1.text_input("Ticker", value="SPY", key="gex_tk").strip().upper()
+    _dtew = _c2.select_slider("Expiries within DTE", options=["0-7", "0-21", "0-45", "0-90"], value="0-45", key="gex_dte")
+    _lo, _hi = (int(x) for x in _dtew.split("-"))
+    if st.button("🔎 Build GEX profile", type="primary", key="gex_btn"):
+        with st.spinner("Computing gamma exposure…"):
+            st.session_state["_gex"] = _gex_profile(_tk, _lo, _hi)
+    _g = st.session_state.get("_gex")
+    if _g is not None:
+        if not _g:
+            st.warning("No GEX data — illiquid chain or no OI in range. Try a liquid name (SPY/QQQ/NVDA).")
+        else:
+            _m1, _m2, _m3, _m4 = st.columns(4)
+            _m1.metric("Spot", f"${_g['spot']:,.2f}")
+            _tot = _g["total"]
+            _m2.metric("Total GEX", f"{_tot/1e6:+,.1f}M", "stabilizing" if _tot > 0 else "destabilizing")
+            _m3.metric("Zero-gamma flip", f"${_g['flip']:,.2f}" if _g["flip"] else "n/a")
+            _m4.metric("Call / Put wall", f"{_g['call_wall']:g} / {_g['put_wall']:g}" if _g["call_wall"] and _g["put_wall"] else "n/a")
+            _pdf = pd.DataFrame(_g["profile"], columns=["strike", "GEX"]).set_index("strike")
+            st.bar_chart(_pdf, height=320)
+            _regime = ("🟢 **Positive gamma** — dealers sell rallies / buy dips, so moves get *dampened*; "
+                       "expect range-bound, mean-reverting action while spot stays above the flip."
+                       if _tot > 0 else
+                       "🔴 **Negative gamma** — dealers buy rallies / sell dips, so moves get *amplified*; "
+                       "expect trending, higher-volatility action while spot stays below the flip.")
+            st.markdown(_regime)
+            if _g["flip"]:
+                _rel = "above" if _g["spot"] > _g["flip"] else "below"
+                st.markdown(f"Spot is **{_rel}** the zero-gamma flip (${_g['flip']:,.2f}). "
+                            f"Crossing it flips the dealer-hedging regime — a key intraday level. "
+                            f"Call wall **{_g['call_wall']:g}** acts as resistance/pin; put wall **{_g['put_wall']:g}** as support.")
+        st.caption("⚠️ GEX is a positioning model from public OI, not dealer books. Sign convention: dealers long "
+                   "calls / short puts. Use as context, not a trade trigger.")
+    else:
+        st.info("Enter a ticker, then **Build GEX profile**.")
+
+
+if page == "🏁 Spread Backtest":
+    _page_header("🏁 Spread Backtest — model-based win rates")
+    st.caption("Replays ATM vertical spreads across your **stock_daily** history, Black-Scholes-priced with "
+               "trailing realized vol, exiting at a profit target or loss threshold. Reports how often each "
+               "strategy hit the target vs the stop. **Model estimate, not live fills.**")
+    _c1, _c2, _c3, _c4 = st.columns([2, 1, 1, 1])
+    _tk = _c1.text_input("Ticker", value="SPY", key="bt_tk").strip().upper()
+    _dte = _c2.slider("DTE", 14, 60, 30, 1, key="bt_dte")
+    _pt = _c3.slider("Profit target %", 20, 80, 30, 5, key="bt_pt")
+    _lt = _c4.slider("Loss threshold %", 20, 100, 50, 5, key="bt_lt")
+    _lb = st.slider("Lookback (trading days)", 60, 500, 180, 20, key="bt_lb")
+    if st.button("🏁 Run backtest", type="primary", key="bt_btn"):
+        with st.spinner("Replaying spreads…"):
+            st.session_state["_bt"] = _spread_backtest(_tk, _dte, 0.04, _pt / 100.0, _lt / 100.0, _lb)
+    _bt = st.session_state.get("_bt")
+    if _bt is not None:
+        if not _bt or not _bt.get("rows"):
+            st.warning("Not enough stock_daily history for this ticker/DTE. Try SPY/QQQ or a shorter DTE.")
+        else:
+            st.markdown(f"**{_bt['ticker']}** · {_bt['dte']}-day spreads · target {int(_bt['pt']*100)}% / "
+                        f"stop {int(_bt['lt']*100)}% · {_bt['from']} → {_bt['to']}")
+            _df = pd.DataFrame(_bt["rows"])
+            st.dataframe(_df, hide_index=True, use_container_width=True,
+                         column_config={"TP hit %": st.column_config.NumberColumn(format="%.1f%%"),
+                                        "SL hit %": st.column_config.NumberColumn(format="%.1f%%"),
+                                        "Neither %": st.column_config.NumberColumn(format="%.1f%%")})
+            st.bar_chart(_df.set_index("Strategy")[["TP hit %", "SL hit %"]], height=300)
+            st.caption("⚠️ Strikes are ATM with a fixed 4% width and IV = trailing 20-day realized vol — a "
+                       "simplification. Real fills, bid/ask, and IV changes will differ. Directional guide only.")
+    else:
+        st.info("Pick a ticker + targets, then **Run backtest**.")
 
 
 # ── Macro Dashboard data (keyless BLS + market yields + optional AlphaVantage) ──

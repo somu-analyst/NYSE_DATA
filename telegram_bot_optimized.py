@@ -96,7 +96,6 @@ async def group_stock_detail(query, ticker):
             advice = "👁 MONITOR — No urgent action, check OI flow"
             priority = 3
 
-        leg_advice.append((priority, pnl, advice, tid, ot, st, entry, exp, qty, cur, pnl_pct, dte, side_s, em))
 
     leg_advice.sort(key=lambda x: x[0])
 
@@ -2180,7 +2179,9 @@ MAIN_MENU_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("📡 Macro/Event Hub", callback_data="hub_menu"),
      InlineKeyboardButton("📰 Market Wrap", callback_data="wrap_view"),
      InlineKeyboardButton("📺 TradingView", callback_data="tv_view")],
-    [InlineKeyboardButton("🎯 Hi-Prob Options (≥80%)", callback_data="hiprob_view")],
+    [InlineKeyboardButton("🎯 Hi-Prob (≥80%)", callback_data="hiprob_view"),
+     InlineKeyboardButton("📐 Spreads", callback_data="spreads_view"),
+     InlineKeyboardButton("🎡 Wheel/CSP", callback_data="wheel_view")],
     # ── AI + SETTINGS ────────────────────────────────────────────
     [InlineKeyboardButton("━━  AI & TOOLS  ━━━━━━━━━━━━", callback_data="noop")],
     [InlineKeyboardButton("🤖 Ask AI",     callback_data="menu_ai_chat"),
@@ -10881,6 +10882,10 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await tv_view(query)
         elif data == "hiprob_view":
             await hiprob_view(query)
+        elif data == "spreads_view":
+            await spreads_view(query)
+        elif data == "wheel_view":
+            await wheel_view(query)
         elif data.startswith("tvc_"):
             await tv_view(query, data.split("tvc_", 1)[1])
         elif data == "plan_port_chart":
@@ -21055,6 +21060,200 @@ async def hiprob_view(query):
                                                                        InlineKeyboardButton("⬅️ Menu", callback_data="menu_main")]]))
 
 
+# ── Spreads scanner (Bull Call · Bear Call · Bear Put), composite-scored ──────
+def _spreads_scan_bot(tickers, dte_lo=20, dte_hi=45, r=0.045, top_per=4):
+    """Ranked vertical spreads. Returns list of compact mobile lines."""
+    import datetime as _dt
+    from scipy.stats import norm as _nm
+
+    def _pa(S, X, T, iv):
+        if min(S, X, T, iv) <= 0:
+            return None
+        return float(_nm.cdf((np.log(S / X) + (r - 0.5 * iv * iv) * T) / (iv * np.sqrt(T))))
+
+    rows = []
+    for tk in tickers:
+        tk = str(tk).strip().upper()
+        if not tk:
+            continue
+        try:
+            t = yf.Ticker(tk)
+            spot = _last_price(tk) or float(t.history(period="1d")["Close"].iloc[-1])
+            if not spot:
+                continue
+            exp = dte = None
+            for e in (t.options or []):
+                try:
+                    d = (_dt.datetime.strptime(e, "%Y-%m-%d").date() - _dt.date.today()).days
+                except Exception:
+                    continue
+                if dte_lo <= d <= dte_hi:
+                    exp, dte = e, d
+                    break
+            if not exp:
+                continue
+            T = max(dte, 1) / 365.0
+            ch = t.option_chain(exp)
+            calls = ch.calls.copy(); puts = ch.puts.copy()
+            for df in (calls, puts):
+                df["mid"] = ((df["bid"].fillna(0) + df["ask"].fillna(0)) / 2).where(
+                    (df["bid"] > 0) & (df["ask"] > 0), df["lastPrice"])
+                df["oi"] = df["openInterest"].fillna(0) if "openInterest" in df.columns else 0
+
+            def _near(df):
+                d = df[(df["mid"] > 0.02) & (df["strike"] >= spot * 0.85) & (df["strike"] <= spot * 1.15)]
+                return d.sort_values("strike").reset_index(drop=True).to_dict("records")
+            C = _near(calls); P = _near(puts)
+            cand = []
+
+            def add(strat, emoji, legs, net, width, be, pop, oi_min, direction):
+                if net is None or net <= 0 or width <= 0 or pop is None or not (0 < pop < 1):
+                    return
+                maxp, maxl = (width - net, net) if direction == "debit" else (net, width - net)
+                if maxp <= 0.05 or maxl <= 0.05:   # drop worthless far-OTM / zero-payoff legs
+                    return
+                if direction == "credit" and net / width < 0.05:   # collect >=5% of width
+                    return
+                rr = maxp / maxl
+                if rr < 0.10:   # drop near-zero-reward degenerate spreads
+                    return
+                cushion = abs(be - spot) / spot
+                sc = 100 * (0.40 * pop + 0.25 * min(rr, 2) / 2 + 0.20 * min(cushion, 0.10) / 0.10 + 0.15 * min(oi_min, 500) / 500)
+                sign = "-$" if direction == "debit" else "+$"
+                cand.append((sc, strat, f"{emoji} {tk} {legs} · {dte}d · POP {pop*100:.0f}% · R/R {rr:.1f} · {sign}{net:.2f} · sc{sc:.0f}"))
+
+            for i in range(len(C)):
+                for j in range(i + 1, min(i + 5, len(C))):
+                    a, b = C[i], C[j]
+                    width = b["strike"] - a["strike"]; iv_a = float(a.get("impliedVolatility") or 0)
+                    oi_min = min(a["oi"] or 0, b["oi"] or 0); net = a["mid"] - b["mid"]; be = a["strike"] + net
+                    add("Bull Call", "🟢", f"{a['strike']:g}/{b['strike']:g}C", net, width, be, _pa(spot, be, T, iv_a), oi_min, "debit")
+                    pa = _pa(spot, be, T, iv_a)
+                    add("Bear Call", "🔴", f"{a['strike']:g}/{b['strike']:g}C", net, width, be, (None if pa is None else 1 - pa), oi_min, "credit")
+            for i in range(len(P)):
+                for j in range(i + 1, min(i + 5, len(P))):
+                    a, b = P[i], P[j]
+                    width = b["strike"] - a["strike"]; iv_b = float(b.get("impliedVolatility") or 0)
+                    oi_min = min(a["oi"] or 0, b["oi"] or 0); net = b["mid"] - a["mid"]; be = b["strike"] - net
+                    pa = _pa(spot, be, T, iv_b)
+                    add("Bear Put", "🟣", f"{b['strike']:g}/{a['strike']:g}P", net, width, be, (None if pa is None else 1 - pa), oi_min, "debit")
+
+            cand.sort(key=lambda z: -z[0])
+            seen = {}
+            for sc, strat, line in cand:
+                seen.setdefault(strat, 0)
+                if seen[strat] < top_per:
+                    rows.append((sc, line)); seen[strat] += 1
+        except Exception:
+            continue
+    rows.sort(key=lambda z: -z[0])
+    return [ln for _, ln in rows]
+
+
+async def spreads_command(update, ctx):
+    """/spreads [TICKERS] — Bull Call / Bear Call / Bear Put setups ranked by composite score."""
+    args = list(getattr(ctx, "args", []) or [])
+    tks = [a.upper() for a in args] if args else _hiprob_default_tickers()
+    await update.message.reply_text("📐 Scanning vertical spreads…", parse_mode=H)
+    rows = _spreads_scan_bot(tuple(tks[:8]))
+    await _send_spreads(update.message, rows)
+
+
+async def spreads_view(query):
+    rows = _spreads_scan_bot(tuple(_hiprob_default_tickers()[:8]))
+    await _send_spreads(query.message, rows)
+
+
+async def _send_spreads(msg, rows):
+    if not rows:
+        await msg.reply_text("No spreads passed the filters. Try <code>/spreads SPY QQQ NVDA</code>.", parse_mode=H)
+        return
+    txt = ("📐 <b>Spreads Scanner</b>\n<i>🟢 Bull Call · 🔴 Bear Call · 🟣 Bear Put · score = POP·R/R·cushion·liquidity · "
+           "not advice</i>\n\n" + "\n".join("• " + r for r in rows[:16]))
+    await msg.reply_text(txt[:4000], parse_mode=H,
+                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="spreads_view"),
+                                                             InlineKeyboardButton("⬅️ Menu", callback_data="menu_main")]]))
+
+
+# ── Wheel / CSP screener (annualized yield vs assignment risk) ────────────────
+def _wheel_scan_bot(tickers, dte_lo=20, dte_hi=45, r=0.045, otm_max=0.18):
+    import datetime as _dt
+    from scipy.stats import norm as _nm
+
+    def _pa(S, X, T, iv):
+        if min(S, X, T, iv) <= 0:
+            return None
+        return float(_nm.cdf((np.log(S / X) + (r - 0.5 * iv * iv) * T) / (iv * np.sqrt(T))))
+
+    rows = []
+    for tk in tickers:
+        tk = str(tk).strip().upper()
+        if not tk:
+            continue
+        try:
+            t = yf.Ticker(tk)
+            spot = _last_price(tk) or float(t.history(period="1d")["Close"].iloc[-1])
+            if not spot:
+                continue
+            exp = dte = None
+            for e in (t.options or []):
+                try:
+                    d = (_dt.datetime.strptime(e, "%Y-%m-%d").date() - _dt.date.today()).days
+                except Exception:
+                    continue
+                if dte_lo <= d <= dte_hi:
+                    exp, dte = e, d
+                    break
+            if not exp:
+                continue
+            T = max(dte, 1) / 365.0
+            ch = t.option_chain(exp)
+            puts = ch.puts.copy()
+            puts["mid"] = ((puts["bid"].fillna(0) + puts["ask"].fillna(0)) / 2).where(
+                (puts["bid"] > 0) & (puts["ask"] > 0), puts["lastPrice"])
+            pl = puts[(puts["strike"] < spot) & (puts["strike"] >= spot * (1 - otm_max)) & (puts["mid"] > 0.03)]
+            for _, row in pl.iterrows():
+                K = float(row["strike"]); cr = float(row["mid"]); iv = float(row.get("impliedVolatility") or 0)
+                if not (iv > 0):
+                    continue
+                pop = _pa(spot, K, T, iv)
+                if pop is None:
+                    continue
+                ann = (cr / K) * (365.0 / max(dte, 1))
+                be = K - cr
+                sc = 100 * (0.45 * pop + 0.35 * min(ann, 1.0) + 0.20 * min(cr / spot, 0.05) / 0.05)
+                rows.append((sc, f"{tk} SELL {K:g}P · {dte}d · {ann*100:.0f}%/yr · POP {pop*100:.0f}% · BE ${be:.0f} ({(spot-be)/spot*100:.1f}%) · sc{sc:.0f}"))
+        except Exception:
+            continue
+    rows.sort(key=lambda z: -z[0])
+    return [ln for _, ln in rows]
+
+
+async def wheel_command(update, ctx):
+    """/wheel [TICKERS] — cash-secured puts ranked by annualized yield vs assignment risk."""
+    args = list(getattr(ctx, "args", []) or [])
+    tks = [a.upper() for a in args] if args else _hiprob_default_tickers()
+    await update.message.reply_text("🎡 Scanning cash-secured puts…", parse_mode=H)
+    rows = _wheel_scan_bot(tuple(tks[:8]))
+    await _send_wheel(update.message, rows)
+
+
+async def wheel_view(query):
+    rows = _wheel_scan_bot(tuple(_hiprob_default_tickers()[:8]))
+    await _send_wheel(query.message, rows)
+
+
+async def _send_wheel(msg, rows):
+    if not rows:
+        await msg.reply_text("No CSPs passed the filters. Try <code>/wheel SPY QQQ NVDA</code>.", parse_mode=H)
+        return
+    txt = ("🎡 <b>Wheel — Cash-Secured Puts</b>\n<i>get paid to wait; assigned = buy at a discount · "
+           "annualized yield vs assignment risk · not advice</i>\n\n" + "\n".join("• " + r for r in rows[:16]))
+    await msg.reply_text(txt[:4000], parse_mode=H,
+                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="wheel_view"),
+                                                             InlineKeyboardButton("⬅️ Menu", callback_data="menu_main")]]))
+
+
 async def plan_command(update, ctx):
     """/plan - condensed next-day game plan for your open positions."""
     conn = get_conn()
@@ -22958,6 +23157,8 @@ def main():
     app.add_handler(CommandHandler("wrap", wrap_command))
     app.add_handler(CommandHandler("tv", tv_command))
     app.add_handler(CommandHandler("hiprob", hiprob_command))
+    app.add_handler(CommandHandler("spreads", spreads_command))
+    app.add_handler(CommandHandler("wheel", wheel_command))
     app.add_handler(CommandHandler("journal", journal_command))
     app.add_handler(CommandHandler("logevent", logevent_command))
     app.add_handler(CommandHandler("bookmarks", bookmarks_command))
