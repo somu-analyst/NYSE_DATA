@@ -1,0 +1,16 @@
+# Core runtime (bot + dashboard + data pipeline)
+streamlit
+python-telegram-bot
+pandas
+numpy
+scipy
+plotly
+yfinance
+curl_cffi
+pandas_market_calendars
+pytz
+requests
+openpyxl
+
+# Optional (event writeups / LLM narratives)
+anthropic

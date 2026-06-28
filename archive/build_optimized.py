@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build telegram_bot_optimized.py from the duplicate-laden telegram_bot.py"""
+"""Build telegram_bot_optimized.py from the duplicate-laden telegram_bot.py.
+
+ARCHIVED — ORIGINAL BUILDER (not in the runtime path). This generated the
+production bot from telegram_bot.py. The runtime bot (telegram_bot_optimized.py)
+is now edited directly, so this rebuild path is retired and kept for reference.
+"""
 import re
 
 SRC = '/mnt/c/Users/srini/Options_chain_data/NYSE_DATA/telegram_bot.py'

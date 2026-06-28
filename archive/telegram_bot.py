@@ -1,3 +1,11 @@
+# =============================================================================
+# ARCHIVED — ORIGINAL BUILD SOURCE (not in the runtime path)
+# -----------------------------------------------------------------------------
+# This is the ORIGINAL, duplicate-laden bot source. The production bot,
+# telegram_bot_optimized.py, was generated from this file by build_optimized.py.
+# The runtime is telegram_bot_optimized.py — edit THAT directly.
+# Kept here for history/reference only (also imported by archive/tests/).
+# =============================================================================
 async def group_stock_detail(query, ticker):
     """Show all open option positions for a stock with per-leg advice (close vs keep)."""
     conn = get_conn()

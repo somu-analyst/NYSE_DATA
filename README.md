@@ -1,8 +1,28 @@
 # 📊 NYSE_DATA — Options Intelligence Terminal
 
+![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-web%20terminal-FF4B4B?logo=streamlit&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-bot-26A5E4?logo=telegram&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-US__data.db-003B57?logo=sqlite&logoColor=white)
+![Status](https://img.shields.io/badge/status-active-success)
+
 > An end-to-end **US options analytics platform** that turns raw NYSE/CBOE options-chain data into actionable, *explained* trade intelligence — delivered through both a **Streamlit web terminal** and a **Telegram bot**.
 
 Built on Open Interest flow, dealer gamma positioning, a 24-model signal ensemble, options-pricing math (Black–Scholes + Monte Carlo), and a forward-tested **signal-accuracy** layer that keeps every signal honest.
+
+---
+
+## 🎬 Demo
+
+**📱 Telegram bot** — signals, GEX, and scanners on mobile
+
+![Telegram demo](docs/media/telegram-demo.gif)
+
+**🖥️ Streamlit terminal** — OI analytics, the 24-model engine, and the signal-accuracy lab
+
+![Dashboard demo](docs/media/dashboard-demo.gif)
+
+<sub>📹 Demo clips live in <a href="docs/media/">docs/media/</a> — drop in <code>telegram-demo.gif</code> / <code>dashboard-demo.gif</code> (see that folder's guide) and they appear here automatically.</sub>
 
 ---
 
@@ -125,8 +145,8 @@ flowchart TD
 | `signal_accuracy` | ticker, trade_date, model_name, signal, prob, actual_ret, correct | Live (self-tracking) |
 | `sentiment_log` | ticker, trade_date, source, label, score, fwd_ret | Forward-logged |
 
-> **Date convention:** dates are stored as `MM-DD-YYYY` strings — sort with
-> `substr(date,7,4)||substr(date,1,2)||substr(date,4,2)`.
+> **Date convention:** dates are stored as ISO `YYYY-MM-DD` strings, so they sort
+> chronologically with a plain `ORDER BY` (no string-slicing needed).
 
 ---
 
@@ -144,12 +164,12 @@ flowchart TD
 
 ```bash
 # 1) Install dependencies
-pip install streamlit python-telegram-bot pandas numpy scipy plotly yfinance
+pip install -r requirements.txt
 
-# 2) Launch the web terminal
+# 2) Launch the web terminal   (or double-click start_dashboard.bat on Windows)
 streamlit run dashboard.py
 
-# 3) Run the Telegram bot (set TELEGRAM_TOKEN first)
+# 3) Run the Telegram bot (put your token in token.txt first)
 python telegram_bot_optimized.py
 ```
 
@@ -161,17 +181,24 @@ The dashboard reads from `US_data.db`; the EOD/live ingestion scripts populate i
 
 ```
 NYSE_DATA/
-├── dashboard.py                 # Streamlit terminal (all pages + signal engine helpers)
-├── telegram_bot.py              # Full Telegram bot
-├── telegram_bot_optimized.py    # Production bot (deduped + cached)
-├── run_eod_pipeline.py          # End-of-day ingestion
-├── run_all_offhours.py          # Off-hours batch jobs
-├── architecture.md              # Detailed component flowcharts
-├── CLAUDE.md                    # Engineering reference (schema, functions, patterns)
-└── README.md                    # You are here
+├── telegram_bot_optimized.py    # ⭐ the running Telegram bot (edit directly)
+├── dashboard.py                 # Streamlit web terminal (all pages + signal engine)
+├── run_all_offhours.py          # EOD data-pull scheduler → NYSE_YFin + NYSE_Telegram
+├── NYSE_YFin.py                 # fetch/enrich options + price → US_data.db
+├── NYSE_Telegram.py             # daily report (charts + Excel + send)
+├── _lib/                        # bot helpers (event writeups, news, open positions)
+├── start_dashboard.bat          # one-click dashboard launcher (Windows)
+├── requirements.txt             # dependencies
+├── docs/media/                  # demo GIFs / screenshots
+├── CLAUDE.md                    # engineering reference (schema, functions, patterns)
+├── README.md                    # you are here
+└── archive/                     # non-runtime: core/ analytics + tests, original
+                                 #   build source, and legacy/standalone apps
 ```
 
-See **[architecture.md](architecture.md)** for component-level flowcharts (OI pipeline, EOD vs live views, async performance pattern, message-size handling).
+The runtime is intentionally lean — only what the bot and the EOD data pull actually
+use lives in the root. Everything else (the parallel `core/` analytics package, test
+suite, original build source, and superseded apps) is kept under `archive/`.
 
 ---
 
