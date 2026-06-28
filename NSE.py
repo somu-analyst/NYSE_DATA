@@ -17,7 +17,7 @@ import pandas as pd
 # =====================================================
 
 DB_PATH = r"C:\Users\srini\Options_chain_data\oi_data.db"
-BOT_TOKEN = "***REMOVED_TELEGRAM_TOKEN***"
+BOT_TOKEN = os.environ.get("NSE_BOT_TOKEN") or open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt"), encoding="utf-8").read().strip()
 
 nest_asyncio.apply()
 
