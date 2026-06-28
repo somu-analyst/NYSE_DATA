@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 480" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="1200" height="480" rx="16" fill="#0d1117"/>
+  <rect x="1" y="1" width="1198" height="478" rx="16" fill="none" stroke="#FF4B4B" stroke-opacity="0.35" stroke-width="2"/>
+  <circle cx="270" cy="240" r="84" fill="#FF4B4B" fill-opacity="0.15" stroke="#FF4B4B" stroke-width="3"/>
+  <path d="M250 200 L312 240 L250 280 Z" fill="#FF4B4B"/>
+  <text x="430" y="205" fill="#FF4B4B" font-size="30" font-weight="700" letter-spacing="2">STREAMLIT TERMINAL</text>
+  <text x="430" y="262" fill="#e6edf3" font-size="46" font-weight="800">Live demo — coming soon</text>
+  <text x="430" y="312" fill="#8b949e" font-size="24">OI analytics · 24-model engine · signal-accuracy lab</text>
+  <text x="430" y="352" fill="#586069" font-size="18">▶ add docs/media/dashboard-demo.gif to replace this card</text>
+</svg>

@@ -16,13 +16,15 @@ Built on Open Interest flow, dealer gamma positioning, a 24-model signal ensembl
 
 **📱 Telegram bot** — signals, GEX, and scanners on mobile
 
-![Telegram demo](docs/media/telegram-demo.gif)
+![Telegram demo](docs/media/telegram-demo.svg)
+<!-- When ready: record a clip, save docs/media/telegram-demo.gif, and change .svg -> .gif above. -->
 
 **🖥️ Streamlit terminal** — OI analytics, the 24-model engine, and the signal-accuracy lab
 
-![Dashboard demo](docs/media/dashboard-demo.gif)
+![Dashboard demo](docs/media/dashboard-demo.svg)
+<!-- When ready: record a clip, save docs/media/dashboard-demo.gif, and change .svg -> .gif above. -->
 
-<sub>📹 Demo clips live in <a href="docs/media/">docs/media/</a> — drop in <code>telegram-demo.gif</code> / <code>dashboard-demo.gif</code> (see that folder's guide) and they appear here automatically.</sub>
+<sub>📹 Placeholders for now — see <a href="docs/media/">docs/media/</a> for a 2-minute guide on recording the GIFs that replace these cards.</sub>
 
 ---
 
@@ -199,6 +201,9 @@ NYSE_DATA/
 The runtime is intentionally lean — only what the bot and the EOD data pull actually
 use lives in the root. Everything else (the parallel `core/` analytics package, test
 suite, original build source, and superseded apps) is kept under `archive/`.
+
+See **[architecture.md](architecture.md)** for component-level flowcharts (OI pipeline,
+EOD vs live views, async performance pattern, message-size handling).
 
 ---
 
