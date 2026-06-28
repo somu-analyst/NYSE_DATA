@@ -3,7 +3,7 @@
 ## ⚡ Efficiency rules (read first — saves tokens / avoids limits)
 - **Canonical files:** `telegram_bot_optimized.py` (~23k lines, THE running bot) · `dashboard.py` (Streamlit). Edit these directly — no patch/helper scripts.
 - **NEVER read whole big files.** `telegram_bot_optimized.py`/`dashboard.py` are huge → use `Grep` to locate, then `Read` with `offset`/`limit`. Don't re-read a file you just edited.
-- `telegram_bot.py` = build source for the optimized bot via `build_optimized.py`; also imported by `tests/` + `run_mc_exit_local.py`. Keep it, but runtime edits go to `telegram_bot_optimized.py`.
+- `telegram_bot.py` = build source for the optimized bot via `build_optimized.py` (also imported by `archive/tests/`). Keep it, but runtime edits go to `telegram_bot_optimized.py`.
 - Dates are `MM-DD-YYYY` strings → sort with `substr(d,7,4)||substr(d,1,2)||substr(d,4,2)`.
 - `datetime.utcnow()` → `datetime.now(timezone.utc).replace(tzinfo=None)` (3.12+).
 - Dead/NULL cols: `vol_rank_call/put`, `money_coi_*`. SPY PCR can spike 11+ on expiry (not signal).
@@ -26,23 +26,20 @@
 - **Bot (runtime):** `python telegram_bot_optimized.py` → `main()` (≈L23203) → `app.run_polling`; token from `token.txt`. This is the live process — edit it directly for runtime fixes.
 - **Rebuild the bot:** `telegram_bot_optimized.py` is GENERATED from `telegram_bot.py` by `build_optimized.py` (strips the dead post-`__main__` duplicate, dedups helpers). ⚠️ `build_optimized.py` hardcodes WSL paths (`/mnt/c/...`) → run under WSL/bash: `python3 build_optimized.py`. Hand-edit `telegram_bot.py` then rebuild only when you want the change in both.
 - **Dashboard:** `streamlit run dashboard.py`.
-- **EOD pipeline:** `run_all_offhours.py` = NY-time-gated scheduler (pre-mkt 00:00–09:00 → prev trading day; post-close 17:00+ → today; keeps Windows awake). Launches JOB1 `NYSE_YFin.py` (yfinance/curl_cffi fetch → writes `US_data.db`) then JOB2 `NYSE_Telegram.py` (OI/price/vol PNGs + Excel + send). Newer modular path: `eod_pipeline/` via `run_eod_pipeline.py`.
-- **Tests:** `pytest tests/` (`test_formatting`, `test_sanitize`, `test_event_writeup`, `test_core`). Plus "test" = validate signal correctness vs DB history (see Efficiency rules).
-- **Parallel `core/`:** clean, read-only, importable analytics — never touches the bot. `python -m core.validate --ticker SPY --signal mean_reversion` backtests any registered signal (hit-rate vs baseline); `python -m core.gex --ticker SPY --spot <px>` = signed GEX/walls/zero-gamma (pure port of `_compute_gex`, scipy-free via `core.options_math`). See `core/README.md`. Port pure logic here one function at a time.
-- **Slash commands** (`.claude/commands/`): `/validate-signal [ticker]` · `/usage [daily|weekly|monthly]` (ccusage) · `/build-bot` · `/map <feature>` · `/recap`.
+- **EOD pipeline:** `run_all_offhours.py` = NY-time-gated scheduler (pre-mkt 00:00–09:00 → prev trading day; post-close 17:00+ → today; keeps Windows awake). Launches JOB1 `NYSE_YFin.py` (yfinance/curl_cffi fetch → writes `US_data.db`) then JOB2 `NYSE_Telegram.py` (OI/price/vol PNGs + Excel + send).
+- **Tests / parallel `core/` / migrations:** moved to `archive/` (see below). Run from there, e.g. `cd archive && python -m core.validate --ticker SPY` or `pytest archive/tests/`.
 
 ## 🗺️ Repo map
-- **Entrypoints:** `telegram_bot_optimized.py` (bot) · `dashboard.py` (Streamlit) · `run_all_offhours.py` (EOD scheduler) · `NSE.py` (separate India-market bot).
-- **Data layer:** `NYSE_YFin.py` (fetch/enrich → DB) · `NYSE_Telegram.py` (daily report + charts) · `eod_pipeline/` (config/db/providers/symbols/pipeline modular fetch).
-- **Aux scripts:** `send_organized_report.py` (organized report sender; uses `_lib` + event-writeup helpers) · `build_optimized.py` (bot builder) · `bot_optimized.py` / `streamlit_dashboard.py` (launchers) · `run_event_writeups.py`.
+- **Entrypoints (root):** `telegram_bot_optimized.py` (bot) · `dashboard.py` (Streamlit, launched by bot) · `run_all_offhours.py` (EOD scheduler → `NYSE_YFin.py` + `NYSE_Telegram.py`).
+- **Data layer:** `NYSE_YFin.py` (fetch/enrich → DB) · `NYSE_Telegram.py` (daily report + charts).
+- **Build tooling:** `telegram_bot.py` (build source) · `build_optimized.py` (bot builder).
+- **`archive/`** (not wired into the running bot — duplicates, standalone runners, and standalone tools): `bot_optimized.py`, `streamlit_dashboard.py`, `send_organized_report.py`, `run_event_writeups.py`, `run_eod_pipeline.py`+`eod_pipeline/`, `NSE.py`, `core/`, `tests/`, `migrations/`, and `_lib/{abnormal_activity_detector,market_events_db,options_flow_detector,telegram_rich_formatter}`.
 
-### `_lib/` modules (one-liners — find the file before grepping the bot)
+### `_lib/` modules (root — the 7 the bot actually loads)
 - `event_writeup_engine` — automated pre/post-market event narratives (macro releases, earnings, intraday regime breaks). `event_writeup_bot_hooks` — Telegram scheduling hooks (ET times) for those writeups.
-- `market_events_db` — store/track major events: earnings, dividends, OPEX, Fed. `news_and_earnings` — Finnhub news/earnings/dividends/events.
-- `market_news_aggregator` — news+data across stocks/indices/commodities/FX/crypto. `market_news_enhanced` — premium-source news with links.
-- `options_flow_detector` — rule-based institutional-repositioning detector. `abnormal_activity_detector` — unusual options vol/OI spikes (used by `streamlit_dashboard.py`).
+- `news_and_earnings` — Finnhub news/earnings/dividends/events. `market_news_aggregator` — news+data across stocks/indices/commodities/FX/crypto. `market_news_enhanced` — premium-source news with links.
 - `options_tracker` — open-positions/Greeks helper; dynamically imported by the bot for `get_open_positions`.
-- `telegram_rich_formatter` — rich options-flow alert formatting.
+- (Archived `_lib`: `market_events_db`, `options_flow_detector`, `abnormal_activity_detector`, `telegram_rich_formatter` — used only by archived apps.)
 
 ### Bot commands (registered in `telegram_bot_optimized.py`)
 - `/start` `/menu` entry + command list · `/gex` signed GEX profile (walls, zero-gamma flip) · `/vanna` vanna exposure · `/opex` OPEX / max pain · `/regime` market regime (VIX term structure) · `/squeeze` squeeze scan.
