@@ -37,9 +37,9 @@
 - `event_writeup_engine` — automated pre/post-market event narratives (macro releases, earnings, intraday regime breaks). `event_writeup_bot_hooks` — Telegram scheduling hooks (ET times) for those writeups.
 - `market_events_db` — store/track major events: earnings, dividends, OPEX, Fed. `news_and_earnings` — Finnhub news/earnings/dividends/events.
 - `market_news_aggregator` — news+data across stocks/indices/commodities/FX/crypto. `market_news_enhanced` — premium-source news with links.
-- `options_flow_detector` — rule-based institutional-repositioning detector. `abnormal_activity_detector` — unusual options vol/OI spikes. `abnormal_detector` — monitors open positions for adverse price/options moves.
-- `options_tracker` — trade entry/exit, Greeks, risk mgmt (portfolio core). `portfolio_analytics` — XIRR, allocation, sector, benchmark. `suggestion_engine` — hold/buy/sell/exit recs. `tax_calculator` — cap gains/losses, wash sales, liability.
-- `asset_classifier` — Stock/ETF/Index classification. `schema_adapter` — normalize `options_daily` schema for analytics modules. `telegram_rich_formatter` — rich options-flow alert formatting.
+- `options_flow_detector` — rule-based institutional-repositioning detector. `abnormal_activity_detector` — unusual options vol/OI spikes (used by `streamlit_dashboard.py`).
+- `options_tracker` — open-positions/Greeks helper; dynamically imported by the bot for `get_open_positions`.
+- `telegram_rich_formatter` — rich options-flow alert formatting.
 
 ### Bot commands (registered in `telegram_bot_optimized.py`)
 - `/start` `/menu` entry + command list · `/gex` signed GEX profile (walls, zero-gamma flip) · `/vanna` vanna exposure · `/opex` OPEX / max pain · `/regime` market regime (VIX term structure) · `/squeeze` squeeze scan.
