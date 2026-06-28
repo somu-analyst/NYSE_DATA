@@ -27,7 +27,9 @@
 - **Rebuild the bot:** `telegram_bot_optimized.py` is GENERATED from `telegram_bot.py` by `build_optimized.py` (strips the dead post-`__main__` duplicate, dedups helpers). ⚠️ `build_optimized.py` hardcodes WSL paths (`/mnt/c/...`) → run under WSL/bash: `python3 build_optimized.py`. Hand-edit `telegram_bot.py` then rebuild only when you want the change in both.
 - **Dashboard:** `streamlit run dashboard.py`.
 - **EOD pipeline:** `run_all_offhours.py` = NY-time-gated scheduler (pre-mkt 00:00–09:00 → prev trading day; post-close 17:00+ → today; keeps Windows awake). Launches JOB1 `NYSE_YFin.py` (yfinance/curl_cffi fetch → writes `US_data.db`) then JOB2 `NYSE_Telegram.py` (OI/price/vol PNGs + Excel + send). Newer modular path: `eod_pipeline/` via `run_eod_pipeline.py`.
-- **Tests:** `pytest tests/` (`test_formatting`, `test_sanitize`, `test_event_writeup`). Plus "test" = validate signal correctness vs DB history (see Efficiency rules).
+- **Tests:** `pytest tests/` (`test_formatting`, `test_sanitize`, `test_event_writeup`, `test_core`). Plus "test" = validate signal correctness vs DB history (see Efficiency rules).
+- **Parallel `core/`:** clean, read-only, importable analytics — never touches the bot. `python -m core.validate --ticker SPY` backtests a signal (hit-rate vs baseline); see `core/README.md`. Port pure logic here one function at a time.
+- **Slash commands** (`.claude/commands/`): `/validate-signal [ticker]` · `/usage [daily|weekly|monthly]` (ccusage) · `/build-bot` · `/map <feature>` · `/recap`.
 
 ## 🗺️ Repo map
 - **Entrypoints:** `telegram_bot_optimized.py` (bot) · `dashboard.py` (Streamlit) · `run_all_offhours.py` (EOD scheduler) · `NSE.py` (separate India-market bot).

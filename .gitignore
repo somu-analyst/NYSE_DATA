@@ -236,6 +236,8 @@ logs/
 .claude/*
 !.claude/rules/
 !.claude/rules/**
+!.claude/commands/
+!.claude/commands/**
 *.code-workspace
 
 # Misc runtime
