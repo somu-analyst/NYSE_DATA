@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ⚠️ Disclaimer (read first)
+    url: https://github.com/somu-analyst/NYSE_DATA#-disclaimer
+    about: This project is for education/research only — not financial advice.

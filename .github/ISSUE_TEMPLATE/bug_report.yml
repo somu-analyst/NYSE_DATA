@@ -1,0 +1,40 @@
+name: Bug report
+description: Something in the bot, dashboard, or data pipeline isn't working
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Telegram bot
+        - Streamlit dashboard
+        - Data pipeline (EOD)
+        - core/ analytics
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / traceback
+      render: shell
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: OS, Python version
