@@ -21,6 +21,19 @@
 - **Session hygiene:** keep this file < ~200 lines (move deep specialized rules to `.claude/rules/*.md` with `paths:` frontmatter); manual `/compact` near ~50% context; recap to `LOG.md` every ~10–20 messages; keep subtasks under half the context window.
 - **Limit lockouts:** when usage is throttled, write a fresh-start summary to `LOG.md`/`NEXT.md` and resume cold from those rather than replaying the whole thread.
 
+## ▶️ Run · build · test
+- **Bot (runtime):** `python telegram_bot_optimized.py` → `main()` (≈L23203) → `app.run_polling`; token from `token.txt`. This is the live process — edit it directly for runtime fixes.
+- **Rebuild the bot:** `telegram_bot_optimized.py` is GENERATED from `telegram_bot.py` by `build_optimized.py` (strips the dead post-`__main__` duplicate, dedups helpers). ⚠️ `build_optimized.py` hardcodes WSL paths (`/mnt/c/...`) → run under WSL/bash: `python3 build_optimized.py`. Hand-edit `telegram_bot.py` then rebuild only when you want the change in both.
+- **Dashboard:** `streamlit run dashboard.py`.
+- **EOD pipeline:** `run_all_offhours.py` = NY-time-gated scheduler (pre-mkt 00:00–09:00 → prev trading day; post-close 17:00+ → today; keeps Windows awake). Launches JOB1 `NYSE_YFin.py` (yfinance/curl_cffi fetch → writes `US_data.db`) then JOB2 `NYSE_Telegram.py` (OI/price/vol PNGs + Excel + send). Newer modular path: `eod_pipeline/` via `run_eod_pipeline.py`.
+- **Tests:** `pytest tests/` (`test_formatting`, `test_sanitize`, `test_event_writeup`). Plus "test" = validate signal correctness vs DB history (see Efficiency rules).
+
+## 🗺️ Repo map
+- **Entrypoints:** `telegram_bot_optimized.py` (bot) · `dashboard.py` (Streamlit) · `run_all_offhours.py` (EOD scheduler) · `NSE.py` (separate India-market bot).
+- **Data layer:** `NYSE_YFin.py` (fetch/enrich → DB) · `NYSE_Telegram.py` (daily report + charts) · `eod_pipeline/` (config/db/providers/symbols/pipeline modular fetch).
+- **`_lib/` (imported by bot & reports):** event writeups (`event_writeup_engine`, `event_writeup_bot_hooks`) · news (`market_news_aggregator`, `market_news_enhanced`, `news_and_earnings`, `market_events_db`) · flow/positions (`options_flow_detector`, `options_tracker`, `portfolio_analytics`, `abnormal_activity_detector`, `abnormal_detector`) · misc (`asset_classifier`, `schema_adapter`, `suggestion_engine`, `tax_calculator`, `telegram_rich_formatter`).
+- **Aux scripts:** `send_organized_report.py` (organized report sender; uses `_lib` + event-writeup helpers) · `build_optimized.py` (bot builder) · `bot_optimized.py` / `streamlit_dashboard.py` (launchers) · `run_event_writeups.py`.
+
 ## Tables (Telegram) — ALWAYS use the shared helper
 - `_pipe_table(headers, rows, right_cols=None, title=None, legend=None)` → Excel-style `<pre>`, **emoji/width-aware** (`_disp_w`: emoji/CJK=2) so columns align at the same index. `title` (bold+stars) and `legend` (italic key) render OUTSIDE `<pre>`.
 - Put status emoji in **column 0** only (uniform 🟢/🔴/🟡 family) so it doesn't shift columns. Numbers → `right_cols`. K/M notation (452K not 452,000). Don't hand-roll `mono()` grids — route through `_pipe_table`.
