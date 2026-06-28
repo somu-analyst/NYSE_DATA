@@ -13,11 +13,13 @@
 ## 🧭 Working method (think → act, save tokens)
 - **Graph first:** if `graphify-out/GRAPH_REPORT.md` exists, read it before `Glob`/`Grep` to locate god-files, subsystems, and reusable code. If absent, generate it via `/graphify` (or `graphifyy` CLI) — don't assume a graph exists.
 - **Think before coding:** restate the task in one line, weigh ≤2 approaches and pick the simplest, state assumptions, make surgical/local edits, define how you'll verify, and stop to ask when genuinely confused.
-- **Token-aware:** usage is tracked (ccusage / claude-monitor). Prefer short focused iterations, avoid re-running expensive scans/builds, and for big jobs outline the plan + token impact before staging the work.
+- **Token-aware:** usage is tracked (ccusage / claude-monitor). Prefer short, file-scoped spec-style prompts; avoid re-running expensive scans/builds; reuse cached context; disable unused tools/MCP servers; for big jobs outline the plan + token impact before staging.
+- **Scope small:** one focused task per prompt, ~2–3 sessions/day; lean on slash commands and existing skills instead of ad-hoc multi-step asks.
 - **Conventions win:** match existing patterns; if a request conflicts with the rules above, follow the project rules and flag the conflict.
 - **Multi-provider lanes:** Claude = hard/multi-file/security work; offload bulk research, summarizing, and routine mechanical edits to cheaper lanes (Gemini / local agents) when it conserves limits.
 - **Continuity files (repo root):** `PLAN.md` = remaining work (source of truth) · `LOG.md` = done/decisions/blockers · `NEXT.md` = short switch-over notes. Update before a context reset or handoff to another model/session.
 - **Session hygiene:** keep this file < ~200 lines (move deep specialized rules to `.claude/rules/*.md` with `paths:` frontmatter); manual `/compact` near ~50% context; recap to `LOG.md` every ~10–20 messages; keep subtasks under half the context window.
+- **Limit lockouts:** when usage is throttled, write a fresh-start summary to `LOG.md`/`NEXT.md` and resume cold from those rather than replaying the whole thread.
 
 ## Tables (Telegram) — ALWAYS use the shared helper
 - `_pipe_table(headers, rows, right_cols=None, title=None, legend=None)` → Excel-style `<pre>`, **emoji/width-aware** (`_disp_w`: emoji/CJK=2) so columns align at the same index. `title` (bold+stars) and `legend` (italic key) render OUTSIDE `<pre>`.
