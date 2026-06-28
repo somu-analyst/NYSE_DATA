@@ -310,7 +310,7 @@ def _db_spot(ticker: str) -> float:
         with get_conn() as _c:
             row = pd.read_sql(
                 "SELECT close FROM stock_daily WHERE ticker=? "
-                "ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                "ORDER BY trade_date DESC LIMIT 1",
                 _c, params=[ticker]
             )
         if not row.empty:
@@ -417,7 +417,7 @@ def _db_close_history(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
-    df["dt"] = pd.to_datetime(df["trade_date"], format="%m-%d-%Y", errors="coerce")
+    df["dt"] = pd.to_datetime(df["trade_date"], format="%Y-%m-%d", errors="coerce")
     df = df.dropna(subset=["dt"]).sort_values("dt").set_index("dt")
     return df[["close"]].rename(columns={"close": "Close"})
 
@@ -515,7 +515,7 @@ def _db_option_price(ticker: str, expiry_iso: str, strike: float, opt_type: str)
             row = pd.read_sql(
                 f"SELECT {col} AS price, trade_date_now FROM options_change "
                 "WHERE ticker=? AND strike=? AND expiry_date=? "
-                "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+                "ORDER BY trade_date_now DESC LIMIT 1",
                 _c, params=[ticker, float(strike), db_exp]
             )
         if not row.empty and row["price"].iloc[0] is not None:
@@ -782,7 +782,7 @@ def wrap_facts(conn, universe_cap=120):
         except Exception:
             rows = []
     if not rows:
-        sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+        sk = "trade_date"
         for t in tks:
             try:
                 c = pd.read_sql(f"SELECT close FROM stock_daily WHERE ticker=? ORDER BY {sk} DESC LIMIT 2",
@@ -813,7 +813,7 @@ def wrap_facts(conn, universe_cap=120):
             pass
 
     try:
-        sk = "substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2)"
+        sk = "trade_date_now"
         snap = conn.execute(f"SELECT trade_date_now FROM options_change ORDER BY {sk} DESC LIMIT 1").fetchone()
         if snap:
             d0 = snap[0]
@@ -1589,7 +1589,7 @@ def _sort_dates_chrono(dates_list, descending=True):
     parsed = []
     for d in dates_list:
         try:
-            parsed.append((d, pd.to_datetime(d, format="%m-%d-%Y")))
+            parsed.append((d, pd.to_datetime(d, format="%Y-%m-%d")))
         except Exception:
             pass
     parsed.sort(key=lambda x: x[1], reverse=descending)
@@ -1611,7 +1611,7 @@ def load_oi_for_date(td):
 def load_stock_daily(ticker):
     df = q("SELECT * FROM stock_daily WHERE ticker=?", [ticker])
     if not df.empty:
-        df["_dt"] = pd.to_datetime(df["trade_date"], format="%m-%d-%Y", errors="coerce")
+        df["_dt"] = pd.to_datetime(df["trade_date"], format="%Y-%m-%d", errors="coerce")
         df = df.sort_values("_dt", ascending=False).drop(columns=["_dt"])
     return df
 
@@ -1622,9 +1622,9 @@ def get_next_day_stock_move(ticker, trade_date_mmddyyyy):
     if sd.empty:
         return None, None, None
     sd = sd.copy()
-    sd["_dt"] = pd.to_datetime(sd["trade_date"], format="%m-%d-%Y", errors="coerce")
+    sd["_dt"] = pd.to_datetime(sd["trade_date"], format="%Y-%m-%d", errors="coerce")
     sd = sd.sort_values("_dt").reset_index(drop=True)
-    ref_dt = pd.to_datetime(trade_date_mmddyyyy, format="%m-%d-%Y")
+    ref_dt = pd.to_datetime(trade_date_mmddyyyy, format="%Y-%m-%d")
     ref_row = sd[sd["_dt"] == ref_dt]
     if ref_row.empty:
         return None, None, None
@@ -1966,7 +1966,7 @@ def _sa_features(conn, ticker):
     """Per-ticker daily feature frame for signal-accuracy backtest: close, pcr_oi,
     OI net bias (sum CallΔOI - sum PutΔOI per snapshot), plus derived momentum / RSI /
     SMA features. Returns a date-sorted DataFrame or None if too little history."""
-    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    sk = "trade_date"
     sd = pd.read_sql(
         f"SELECT trade_date, close, volume, pcr_oi FROM stock_daily WHERE ticker=? ORDER BY {sk}",
         conn, params=(ticker.upper(),))
@@ -2104,7 +2104,7 @@ def _log_sentiment(ticker, source, label, score=None):
     sentiment is noisy/reflexive, so we record it for eyeballing, not as a validated edge).
     Keyed by ticker+date+source; idempotent within a day."""
     try:
-        today_s = datetime.now().strftime("%m-%d-%Y")
+        today_s = datetime.now().strftime("%Y-%m-%d")
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS sentiment_log ("
@@ -2142,7 +2142,7 @@ def _sentiment_log_view(ticker=None, move_thr=0.005):
             for tk in need["ticker"].unique():
                 px = pd.read_sql(
                     "SELECT trade_date, close FROM stock_daily WHERE ticker=? ORDER BY "
-                    "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)",
+                    "trade_date",
                     conn, params=(tk,))
                 if len(px) < 2:
                     continue
@@ -2221,7 +2221,7 @@ def _oi_idea_metrics(conn, ticker, strike, direction, spot, r=0.045):
     cand = []
     for _, rr in rows.iterrows():
         ed = None
-        for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
             try:
                 ed = datetime.strptime(str(rr["expiry_date"]), fmt); break
             except Exception:
@@ -2285,7 +2285,7 @@ def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ide
         return {"n": 0, "error": "not enough history"}, pd.DataFrame()
 
     def _parse(d):
-        for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
             try:
                 return datetime.strptime(str(d), fmt)
             except Exception:
@@ -2788,8 +2788,7 @@ def _gp_orderflow(tk):
         df = pd.read_sql(
             "SELECT change_OI_Call, change_OI_Put, vol_Call_now, vol_Put_now FROM options_change "
             "WHERE UPPER(ticker)=? AND trade_date_now=(SELECT trade_date_now FROM options_change "
-            "WHERE UPPER(ticker)=? ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)"
-            "||substr(trade_date_now,4,2) DESC LIMIT 1)", conn, params=(tk.upper(), tk.upper()))
+            "WHERE UPPER(ticker)=? ORDER BY trade_date_now DESC LIMIT 1)", conn, params=(tk.upper(), tk.upper()))
     except Exception:
         df = pd.DataFrame()
     finally:
@@ -2835,8 +2834,7 @@ def _gp_oi_analytics(tk, spot):
             "SELECT strike, expiry_date, change_OI_Call, change_OI_Put, "
             "openInt_Call_now, openInt_Put_now, vol_Call_now, vol_Put_now FROM options_change "
             "WHERE UPPER(ticker)=? AND trade_date_now=(SELECT trade_date_now FROM options_change "
-            "WHERE UPPER(ticker)=? ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)"
-            "||substr(trade_date_now,4,2) DESC LIMIT 1)", conn, params=(tk.upper(), tk.upper()))
+            "WHERE UPPER(ticker)=? ORDER BY trade_date_now DESC LIMIT 1)", conn, params=(tk.upper(), tk.upper()))
     except Exception:
         df = pd.DataFrame()
     finally:
@@ -2865,7 +2863,7 @@ def _gp_oi_analytics(tk, spot):
 
     # ── across-strike: biggest ΔOI strikes (front-most expiry only) ──
     def _exp_key(s):
-        for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
             try:
                 return datetime.strptime(str(s), fmt)
             except Exception:
@@ -3571,7 +3569,7 @@ def _pos_payoff_fig(tk, a):
 @st.cache_data(ttl=3600, show_spinner=False)
 def _beta_to_spy(ticker, lookback=60):
     """Beta of a ticker's daily returns vs SPY from stored stock_daily history (or None)."""
-    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    sk = "trade_date"
     conn = get_conn()
     try:
         a = pd.read_sql(f"SELECT trade_date, close FROM stock_daily WHERE ticker=? ORDER BY {sk}",
@@ -3599,7 +3597,7 @@ def _corr_matrix(tickers):
     """Pairwise return-correlation matrix of the given tickers from stock_daily; also the
     average off-diagonal correlation (a concentration/diversification gauge)."""
     import itertools
-    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    sk = "trade_date"
     conn = get_conn()
     try:
         frames = {}
@@ -4071,7 +4069,7 @@ def _iv_rank(ticker, r=0.045):
     spot_by = {str(d): float(c) for d, c in zip(sd["trade_date"], sd["close"])}
 
     def _pd_(x):
-        for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
             try:
                 return datetime.strptime(str(x), fmt)
             except Exception:
@@ -4161,7 +4159,7 @@ def _roll_suggestion(conn, leg):
         # target expiry: nearest with 25-45 DTE (further out than the current leg)
         exps = {}
         for _, rr in ch.iterrows():
-            for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+            for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
                 try:
                     ed = datetime.strptime(str(rr["expiry_date"]), fmt); break
                 except Exception:
@@ -4204,7 +4202,7 @@ def _portfolio_var(legs, r=0.045, lookback=60, conf=0.05):
         for tk in {l["ticker"] for l in legs}:
             sd = pd.read_sql(
                 "SELECT close FROM stock_daily WHERE UPPER(ticker)=? ORDER BY "
-                "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT ?",
+                "trade_date DESC LIMIT ?",
                 conn, params=(tk.upper(), lookback + 1))
             c = list(sd["close"].astype(float))[::-1]
             rets[tk] = [c[i] / c[i - 1] - 1 for i in range(1, len(c))] if len(c) > 2 else []
@@ -4468,7 +4466,7 @@ def backtest_oi_signals(ticker, lookback=10):
     conn.close()
     # Sort stock data chronologically
     if not stock_raw.empty:
-        stock_raw["_dt"] = pd.to_datetime(stock_raw["trade_date"], format="%m-%d-%Y", errors="coerce")
+        stock_raw["_dt"] = pd.to_datetime(stock_raw["trade_date"], format="%Y-%m-%d", errors="coerce")
         stock = stock_raw.sort_values("_dt", ascending=False).drop(columns=["_dt"])
     else:
         stock = stock_raw
@@ -5639,7 +5637,7 @@ if page == "🌍 Market Overview":
                                 with sqlite3.connect(DB_PATH) as _oi_conn:
                                     _oi_dates = pd.read_sql(
                                         "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=? "
-                                        "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+                                        "ORDER BY trade_date_now DESC LIMIT 1",
                                         _oi_conn, params=(_oi_ticker,)
                                     )
                                     if not _oi_dates.empty:
@@ -5716,7 +5714,7 @@ if page == "🌍 Market Overview":
                                             st.markdown("**📅 OI Build Trend (1W / 1M)**")
                                             _trend_dates = pd.read_sql(
                                                 "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=? "
-                                                "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 25",
+                                                "ORDER BY trade_date_now DESC LIMIT 25",
                                                 _oi_conn, params=(_oi_ticker,)
                                             )["trade_date_now"].tolist()
 
@@ -6111,7 +6109,7 @@ elif page == "🔥 OI Analytics & Prediction":
             _today_dt = None
             try:
                 import datetime as _dt_mod
-                _today_dt = _dt_mod.datetime.strptime(sel_date, "%m-%d-%Y").date()
+                _today_dt = _dt_mod.datetime.strptime(sel_date, "%Y-%m-%d").date()
             except Exception:
                 pass
             def _oa_exp_sort(d):
@@ -7218,7 +7216,7 @@ elif page == "🎯 Prop Trading Screen":
                     if risk is None or "error" in (risk or {}):
                         # Try MM-DD-YYYY → YYYY-MM-DD conversion
                         try:
-                            exp_parsed = datetime.strptime(opp["Expiry"], "%m-%d-%Y")
+                            exp_parsed = datetime.strptime(opp["Expiry"], "%Y-%m-%d")
                             exp_str = exp_parsed.strftime("%Y-%m-%d")
                         except Exception:
                             exp_str = opp["Expiry"]
@@ -7247,7 +7245,7 @@ elif page == "🎯 Prop Trading Screen":
 
                         # Waiting time / DTE
                         try:
-                            exp_dt = datetime.strptime(opp["Expiry"], "%m-%d-%Y")
+                            exp_dt = datetime.strptime(opp["Expiry"], "%Y-%m-%d")
                         except Exception:
                             try:
                                 exp_dt = datetime.strptime(opp["Expiry"], "%Y-%m-%d")
@@ -8031,7 +8029,7 @@ elif page == "📊 Backtest Lab":
                 _el_conn = get_conn()
                 _el_today = _el_conn.execute(
                     "SELECT trade_date FROM stock_daily "
-                    "ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1"
+                    "ORDER BY trade_date DESC LIMIT 1"
                 ).fetchone()
                 _today_d = _el_today[0] if _el_today else ""
                 _all_tickers = [r[0] for r in _el_conn.execute(
@@ -8042,7 +8040,7 @@ elif page == "📊 Backtest Lab":
                 def _bt_gamma(ticker, conn_inner, wall_mult=2.5, hold=5):
                     _dfp = pd.read_sql(
                         "SELECT trade_date, close FROM stock_daily WHERE ticker=? "
-                        "ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)",
+                        "ORDER BY trade_date",
                         conn_inner, params=(ticker,))
                     _dfp['close'] = pd.to_numeric(_dfp['close'], errors='coerce')
                     _dfp = _dfp.dropna().reset_index(drop=True)
@@ -8153,7 +8151,7 @@ This creates a self-reinforcing ceiling — the wall repels price.
                 _bconn = get_conn()
                 _dfp_bt = pd.read_sql(
                     "SELECT trade_date, close FROM stock_daily WHERE ticker=? "
-                    "ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)",
+                    "ORDER BY trade_date",
                     _bconn, params=(_el_sel,))
                 _dfp_bt['close'] = pd.to_numeric(_dfp_bt['close'], errors='coerce')
                 _dfp_bt = _dfp_bt.dropna().reset_index(drop=True)
@@ -9773,12 +9771,12 @@ elif page == "\U0001f9e0 Smart Money Hub":
         # Use latest date actually in DB (market may not have run today yet)
         _td_row = conn.execute(
             "SELECT trade_date_now FROM options_change ORDER BY "
-            "substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1"
+            "trade_date_now DESC LIMIT 1"
         ).fetchone()
-        _td = _td_row[0] if _td_row else datetime.now().strftime("%m-%d-%Y")
+        _td = _td_row[0] if _td_row else datetime.now().strftime("%Y-%m-%d")
         _td2_row = conn.execute(
             "SELECT trade_date FROM stock_daily ORDER BY "
-            "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1"
+            "trade_date DESC LIMIT 1"
         ).fetchone()
         _td2 = _td2_row[0] if _td2_row else _td
         st.caption(f"📅 Data as of: **{_td}**")
@@ -10147,7 +10145,7 @@ elif page == "\U0001f3af Gamma Wall Advisor":
         """Return (trades_df, metrics_dict) with expectancy + far-OTM subset stats."""
         _dfp = pd.read_sql(
             "SELECT trade_date, close FROM stock_daily WHERE ticker=? "
-            "ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)",
+            "ORDER BY trade_date",
             conn_inner, params=(ticker,))
         _dfp["close"] = pd.to_numeric(_dfp["close"], errors="coerce")
         _dfp = _dfp.dropna().reset_index(drop=True)
@@ -10231,12 +10229,12 @@ elif page == "\U0001f3af Gamma Wall Advisor":
     # ── Latest DB dates ───────────────────────────────────────────────
     _ga_td  = _ga_conn.execute(
         "SELECT trade_date_now FROM options_change ORDER BY "
-        "substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1"
+        "trade_date_now DESC LIMIT 1"
     ).fetchone()
-    _ga_today = _ga_td[0] if _ga_td else datetime.now().strftime("%m-%d-%Y")
+    _ga_today = _ga_td[0] if _ga_td else datetime.now().strftime("%Y-%m-%d")
     _ga_td2 = _ga_conn.execute(
         "SELECT trade_date FROM stock_daily ORDER BY "
-        "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1"
+        "trade_date DESC LIMIT 1"
     ).fetchone()
     _ga_today2 = _ga_td2[0] if _ga_td2 else _ga_today
     _ga_all_tickers = sorted([r[0] for r in _ga_conn.execute(
@@ -10282,7 +10280,7 @@ Professional options desk — dealer GEX analysis, expiry-level walls, position 
         _all_ga_exps = sorted(_ga_oi_meta["expiry_date"].tolist(), key=_ga_exp_sort)
         try:
             import datetime as _dmod_ga
-            _ref_ga = _dmod_ga.datetime.strptime(_ga_today, "%m-%d-%Y").date()
+            _ref_ga = _dmod_ga.datetime.strptime(_ga_today, "%Y-%m-%d").date()
             _fut_ga = [e for e in _all_ga_exps
                        if _dmod_ga.date(int(e.split("-")[2]),int(e.split("-")[0]),int(e.split("-")[1])) >= _ref_ga]
             _pst_ga = [e for e in _all_ga_exps if e not in _fut_ga]
@@ -10971,7 +10969,7 @@ The far-dated deep OTM puts are bought by pension funds and institutions as cata
                                     "SELECT trade_date_now AS dt, SUM(openInt_Call_now) AS oi "
                                     "FROM options_change WHERE ticker=? AND ABS(strike-?)<1.5 "
                                     "GROUP BY trade_date_now "
-                                    "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 10",
+                                    "ORDER BY trade_date_now DESC LIMIT 10",
                                     _ga_conn, params=(_ga_sel, _cw))
                                 if len(_oib) >= 3:
                                     _oib = _oib.iloc[::-1].reset_index(drop=True)
@@ -11651,7 +11649,7 @@ Real edge comes from discipline and filters — not a higher strike.
                     try:
                         _dte = (datetime.strptime(str(_ex), "%Y-%m-%d") - datetime.now()).days
                     except Exception:
-                        try: _dte = (datetime.strptime(str(_ex), "%m-%d-%Y") - datetime.now()).days
+                        try: _dte = (datetime.strptime(str(_ex), "%Y-%m-%d") - datetime.now()).days
                         except: _dte = -1
                     _zone = "✅ IDEAL (21-50d)" if 21<=_dte<=50 else \
                             ("⚠️ Short (<21d)" if 0<_dte<21 else
@@ -11763,12 +11761,12 @@ Real edge comes from discipline and filters — not a higher strike.
                 if _tk not in _spots:
                     _sp = _ga_conn.execute(
                         "SELECT close FROM stock_daily WHERE UPPER(ticker)=? ORDER BY "
-                        "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                        "trade_date DESC LIMIT 1",
                         (_tk,)).fetchone()
                     _spots[_tk] = float(_sp[0]) if _sp else None
                 _spot_v = _spots[_tk]
                 _dte = None
-                for _fmt in ("%Y-%m-%d", "%m-%d-%Y"):
+                for _fmt in ("%Y-%m-%d", "%Y-%m-%d"):
                     try:
                         _dte = (datetime.strptime(str(_r["expiry"]), _fmt) - datetime.now()).days
                         break
@@ -11806,12 +11804,12 @@ Real edge comes from discipline and filters — not a higher strike.
                 try:
                     _pexp = datetime.strptime(str(_p["expiry"]), "%Y-%m-%d")
                 except Exception:
-                    try: _pexp = datetime.strptime(str(_p["expiry"]), "%m-%d-%Y")
+                    try: _pexp = datetime.strptime(str(_p["expiry"]), "%Y-%m-%d")
                     except: _pexp = None
                 _dte_p = (_pexp - datetime.now()).days if _pexp else None
                 _csp_r = _ga_conn.execute(
                     "SELECT close FROM stock_daily WHERE ticker=? ORDER BY "
-                    "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                    "trade_date DESC LIMIT 1",
                     (_p["ticker"],)).fetchone()
                 _csp = float(_csp_r[0]) if _csp_r else None
                 _ss = float(_p["short_strike"]); _ls = float(_p["long_strike"])
@@ -11849,21 +11847,21 @@ Stop: buy back at <b>${_cred*2:.2f}</b>
                     _ga_conn.execute(
                         "UPDATE gamma_wall_trades SET status='CLOSED',exit_date=?,exit_price=?,"
                         "exit_reason='50%_PROFIT',pnl_dollar=?,pnl_pct=50 WHERE id=?",
-                        (datetime.now().strftime("%m-%d-%Y"), _cred*0.5, _pnl, _p["id"]))
+                        (datetime.now().strftime("%Y-%m-%d"), _cred*0.5, _pnl, _p["id"]))
                     _ga_conn.commit(); st.rerun()
                 if _bc2.button(f"\U0001f6d1 STOP 2×", key=f"p_stop_{_p['id']}"):
                     _pnl = -_cred * 2.0 * 100 * int(_p["quantity"])
                     _ga_conn.execute(
                         "UPDATE gamma_wall_trades SET status='CLOSED',exit_date=?,exit_price=?,"
                         "exit_reason='2X_STOP',pnl_dollar=?,pnl_pct=-200 WHERE id=?",
-                        (datetime.now().strftime("%m-%d-%Y"), _cred*2, _pnl, _p["id"]))
+                        (datetime.now().strftime("%Y-%m-%d"), _cred*2, _pnl, _p["id"]))
                     _ga_conn.commit(); st.rerun()
                 if _bc3.button(f"\U0001f4cb EXPIRED", key=f"p_exp_{_p['id']}"):
                     _pnl = _cred * 100 * int(_p["quantity"])
                     _ga_conn.execute(
                         "UPDATE gamma_wall_trades SET status='CLOSED',exit_date=?,exit_price=0,"
                         "exit_reason='EXPIRED',pnl_dollar=?,pnl_pct=100 WHERE id=?",
-                        (datetime.now().strftime("%m-%d-%Y"), _pnl, _p["id"]))
+                        (datetime.now().strftime("%Y-%m-%d"), _pnl, _p["id"]))
                     _ga_conn.commit(); st.rerun()
                 if _bc4.button(f"✏️ Manual", key=f"p_man_{_p['id']}"):
                     _mc_pr = st.number_input("Close price", min_value=0.0, step=0.01,
@@ -11873,7 +11871,7 @@ Stop: buy back at <b>${_cred*2:.2f}</b>
                         _ga_conn.execute(
                             "UPDATE gamma_wall_trades SET status='CLOSED',exit_date=?,exit_price=?,"
                             "exit_reason='MANUAL',pnl_dollar=?,pnl_pct=? WHERE id=?",
-                            (datetime.now().strftime("%m-%d-%Y"), _mc_pr,
+                            (datetime.now().strftime("%Y-%m-%d"), _mc_pr,
                              _pnl, (_cred-_mc_pr)/_cred*100, _p["id"]))
                         _ga_conn.commit(); st.rerun()
 
@@ -11976,7 +11974,7 @@ Stop: buy back at <b>${_cred*2:.2f}</b>
                         "INSERT INTO gamma_wall_trades "
                         "(ticker,trade_date,expiry,short_strike,long_strike,spread_type,"
                         " credit,quantity,advisor_notes,status) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (_f_tk, _f_ent.strftime("%m-%d-%Y"), _f_exp.strftime("%m-%d-%Y"),
+                        (_f_tk, _f_ent.strftime("%Y-%m-%d"), _f_exp.strftime("%Y-%m-%d"),
                          _f_short, _f_long, _f_type, _f_cr, int(_f_qty),
                          str(_f_note), "OPEN"))
                     _ga_conn.commit()
@@ -12743,15 +12741,15 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             try:
                 row = _gp_conn.execute(
                     "SELECT close FROM stock_daily WHERE UPPER(ticker)=? ORDER BY "
-                    "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                    "trade_date DESC LIMIT 1",
                     (tk.upper(),)).fetchone()
                 return float(row[0]) if row else None
             except Exception:
                 return None
 
         def _gp_to_mdy(s):
-            for fmt in ("%Y-%m-%d", "%m-%d-%Y"):
-                try: return datetime.strptime(str(s), fmt).strftime("%m-%d-%Y")
+            for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+                try: return datetime.strptime(str(s), fmt).strftime("%Y-%m-%d")
                 except Exception: pass
             return None
 
@@ -12760,8 +12758,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             try:
                 pr = pd.read_sql(
                     f"SELECT {col} AS last FROM options_change WHERE UPPER(ticker)=? AND strike=? "
-                    "AND expiry_date=? ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)"
-                    "||substr(trade_date_now,4,2) DESC LIMIT 1",
+                    "AND expiry_date=? ORDER BY trade_date_now DESC LIMIT 1",
                     _gp_conn, params=(tk.upper(), float(K), exp_mdy))
                 if not pr.empty and pr.iloc[0]["last"] and float(pr.iloc[0]["last"]) > 0:
                     return float(pr.iloc[0]["last"])
@@ -12781,7 +12778,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _exp_mdy = _gp_to_mdy(_exp)
             _eod_spot = _gp_spot(_tk)
             _dte = None
-            for _fmt in ("%Y-%m-%d", "%m-%d-%Y"):
+            for _fmt in ("%Y-%m-%d", "%Y-%m-%d"):
                 try:
                     # date-only diff: an option expiring tomorrow is 1 DTE all day, not 0 in the afternoon
                     _dte = (datetime.strptime(_exp, _fmt).date() - datetime.now().date()).days; break
@@ -13156,7 +13153,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         "SELECT strike, openInt_Call_now, openInt_Put_now, R1, S1 FROM options_change "
                         "WHERE UPPER(ticker)=? AND expiry_date=? AND trade_date_now=("
                         "SELECT trade_date_now FROM options_change WHERE UPPER(ticker)=? AND expiry_date=? "
-                        "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) "
+                        "ORDER BY trade_date_now "
                         "DESC LIMIT 1)",
                         _gp_conn, params=(_tk, _near["exp_mdy"], _tk, _near["exp_mdy"]))
                 except Exception:
@@ -15388,7 +15385,7 @@ if page == "🔬 OI Comparison Charts":
         st.warning("Need at least 2 trade dates in DB for comparison.")
         st.stop()
 
-    _today = datetime.now().strftime("%m-%d-%Y")
+    _today = datetime.now().strftime("%Y-%m-%d")
     _stale = dates[0] != _today
     st.info(
         f"📅 Latest snapshot in DB: **{dates[0]}**"
@@ -15436,11 +15433,11 @@ if page == "🔬 OI Comparison Charts":
 
     # ── Classify & sort expiries ──
     all_expiries_raw = comp_df["expiry_date"].dropna().unique().tolist()
-    ref_dt = pd.to_datetime(td_now, format="%m-%d-%Y")
+    ref_dt = pd.to_datetime(td_now, format="%Y-%m-%d")
     future_exp, past_exp = [], []
     for e in all_expiries_raw:
         try:
-            edt = pd.to_datetime(e, format="%m-%d-%Y")
+            edt = pd.to_datetime(e, format="%Y-%m-%d")
             if edt >= ref_dt:
                 future_exp.append((e, edt))
             else:
@@ -15490,9 +15487,9 @@ if page == "🔬 OI Comparison Charts":
         if _spy_pct_val is None:
             _spy_sd = load_stock_daily("SPY")
             if not _spy_sd.empty:
-                _spy_sd["_dt"] = pd.to_datetime(_spy_sd["trade_date"], format="%m-%d-%Y", errors="coerce")
+                _spy_sd["_dt"] = pd.to_datetime(_spy_sd["trade_date"], format="%Y-%m-%d", errors="coerce")
                 _spy_sd = _spy_sd.sort_values("_dt").reset_index(drop=True)
-                _ref_dt = pd.to_datetime(td_now, format="%m-%d-%Y")
+                _ref_dt = pd.to_datetime(td_now, format="%Y-%m-%d")
                 _ref_row = _spy_sd[_spy_sd["_dt"] == _ref_dt]
                 if not _ref_row.empty:
                     _idx = _ref_row.index[0]
@@ -15851,7 +15848,7 @@ reveals where smart money is building or liquidating positions.
 
         # Expiry type label
         try:
-            edt = pd.to_datetime(expiry, format="%m-%d-%Y")
+            edt = pd.to_datetime(expiry, format="%Y-%m-%d")
             is_future = edt >= ref_dt
             dte = (edt - ref_dt).days
             exp_tag = f"{'🟢' if is_future else '🔴'} {expiry} | DTE: {dte}"
@@ -16251,7 +16248,7 @@ reveals where smart money is building or liquidating positions.
             _trades_this_exp = pd.DataFrame()
             if not _oi_open_trades.empty:
                 try:
-                    _exp_ymd = pd.to_datetime(expiry, format="%m-%d-%Y").strftime("%Y-%m-%d")
+                    _exp_ymd = pd.to_datetime(expiry, format="%Y-%m-%d").strftime("%Y-%m-%d")
                 except Exception:
                     _exp_ymd = expiry
                 _trades_this_exp = _oi_open_trades[_oi_open_trades["expiry"] == _exp_ymd]
@@ -16773,7 +16770,7 @@ if page == "🚀 Live Momentum Scanner":
                 # PCR from DB
                 pcr = 1.0
                 try:
-                    _pd = q("SELECT pcr_oi FROM stock_daily WHERE ticker=? ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1", (tk,))
+                    _pd = q("SELECT pcr_oi FROM stock_daily WHERE ticker=? ORDER BY trade_date DESC LIMIT 1", (tk,))
                     if _pd and _pd[0][0]:
                         pcr = float(_pd[0][0])
                 except Exception:
@@ -17135,7 +17132,7 @@ if page == "🧠 High-Prob Engine":
                 try:
                     _spy = conn_hp.execute(
                         "SELECT close FROM stock_daily WHERE ticker='SPY'"
-                        " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 2"
+                        " ORDER BY trade_date DESC LIMIT 2"
                     ).fetchall()
                     spy_ret = (float(_spy[0][0]) / float(_spy[1][0]) - 1) * 100 if len(_spy) >= 2 else 0.0
                 except Exception:
@@ -17191,7 +17188,7 @@ if page == "🧠 High-Prob Engine":
                     _vp_conn = get_conn()
                     _px = pd.read_sql(
                         "SELECT high, low, close, volume FROM stock_daily WHERE ticker=?"
-                        " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 60",
+                        " ORDER BY trade_date DESC LIMIT 60",
                         _vp_conn, params=(sel_ticker,))
                     _vp_conn.close()
                     for _c in ['high','low','close','volume']:
@@ -17729,8 +17726,7 @@ if page == "📺 TradingView":
                 _wdf = pd.read_sql(
                     "SELECT strike, openInt_Call_now, openInt_Put_now FROM options_change "
                     "WHERE UPPER(ticker)=? AND trade_date_now=(SELECT trade_date_now FROM options_change "
-                    "WHERE UPPER(ticker)=? ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||"
-                    "substr(trade_date_now,4,2) DESC LIMIT 1)", _wc, params=(_wsym, _wsym))
+                    "WHERE UPPER(ticker)=? ORDER BY trade_date_now DESC LIMIT 1)", _wc, params=(_wsym, _wsym))
             _w = compute_walls(_wdf, _sp if _lv else None) if _wdf is not None and not _wdf.empty else None
             if _w:
                 if _w.get("call_wall"):
@@ -18153,7 +18149,7 @@ def _spread_backtest(ticker, dte=30, width_pct=0.04, profit_target=0.30, loss_th
         with get_conn() as c:
             rows = c.execute(
                 "SELECT trade_date, close FROM stock_daily WHERE ticker=? "
-                "ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)",
+                "ORDER BY trade_date",
                 (ticker.upper(),)).fetchall()
     except Exception:
         return None
@@ -18234,7 +18230,7 @@ def _smartmoney_screen():
     """Per-ticker option-flow metrics from the latest options_change snapshot:
     call/put OI & ΔOI, call turnover (speculation), call/put vol ratio, LEAPS call OI (>300 DTE)."""
     import datetime as _dt
-    sk = "substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2)"
+    sk = "trade_date_now"
     with get_conn() as c:
         row = c.execute(f"SELECT trade_date_now FROM options_change ORDER BY {sk} DESC LIMIT 1").fetchone()
         if not row:
@@ -18251,7 +18247,7 @@ def _smartmoney_screen():
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     def _dte(e):
-        for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
             try:
                 return (_dt.datetime.strptime(str(e), fmt).date() - _dt.date.today()).days
             except Exception:
@@ -18276,7 +18272,7 @@ def _smartmoney_screen():
 @st.cache_data(ttl=600, show_spinner=False)
 def _accumulation_screen():
     """Delivery-style accumulation proxy from stock_daily: latest volume vs 20d avg + 5d/20d return."""
-    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    sk = "trade_date"
     rows = []
     with get_conn() as c:
         tks = [r[0] for r in c.execute("SELECT DISTINCT ticker FROM stock_daily").fetchall()]

@@ -60,10 +60,10 @@ nyse_cal = mcal.get_calendar("NYSE")
 # BASIC HELPERS
 # =========================
 def parse_mmddyyyy(d: str) -> datetime:
-    return datetime.strptime(d, "%m-%d-%Y")
+    return datetime.strptime(d, "%Y-%m-%d")
 
 def mmddyyyy_to_str(dt: datetime) -> str:
-    return dt.strftime("%m-%d-%Y")
+    return dt.strftime("%Y-%m-%d")
 
 def get_conn():
     return sqlite3.connect(DB_PATH)
@@ -76,14 +76,14 @@ def latest_trade_date_now():
         )
     if df.empty:
         return None
-    dates = pd.to_datetime(df["trade_date_now"], format="%m-%d-%Y", errors="coerce")
+    dates = pd.to_datetime(df["trade_date_now"], format="%Y-%m-%d", errors="coerce")
     if dates.isna().all():
         return None
     max_idx = dates.idxmax()
     return df.loc[max_idx, "trade_date_now"]
 
 def get_prev_trade_date_mmddyyyy(trade_date_now: str) -> str | None:
-    dt_now = pd.to_datetime(trade_date_now, format="%m-%d-%Y")
+    dt_now = pd.to_datetime(trade_date_now, format="%Y-%m-%d")
     sched = nyse_cal.schedule(
         start_date=dt_now - pd.Timedelta(days=15),
         end_date=dt_now
@@ -95,7 +95,7 @@ def get_prev_trade_date_mmddyyyy(trade_date_now: str) -> str | None:
     if len(prev_days) == 0:
         return None
     prev = prev_days[-1]
-    return prev.strftime("%m-%d-%Y")
+    return prev.strftime("%Y-%m-%d")
 
 def get_symbols_for_trade_date(td_now: str):
     with get_conn() as conn:
@@ -189,7 +189,7 @@ def classify_expiry_type(expiry_str: str) -> str:
         return "WEEKLY"
 
 def get_last_n_trade_dates_mmddyyyy(trade_date_now: str, n: int = 5) -> list[str]:
-    dt_now = pd.to_datetime(trade_date_now, format="%m-%d-%Y")
+    dt_now = pd.to_datetime(trade_date_now, format="%Y-%m-%d")
     sched = nyse_cal.schedule(
         start_date=dt_now - pd.Timedelta(days=20),
         end_date=dt_now
@@ -199,7 +199,7 @@ def get_last_n_trade_dates_mmddyyyy(trade_date_now: str, n: int = 5) -> list[str
         return [trade_date_now]
     days = days[days <= dt_now]
     last = days[-n:]
-    return [d.strftime("%m-%d-%Y") for d in last]
+    return [d.strftime("%Y-%m-%d") for d in last]
 
 def get_expiry_level_pcr_series(symbol: str, expiry: str, trade_date_now: str, lookback: int = 5):
     dates = get_last_n_trade_dates_mmddyyyy(trade_date_now, n=lookback)
@@ -217,7 +217,7 @@ def get_expiry_level_pcr_series(symbol: str, expiry: str, trade_date_now: str, l
         )
     if df.empty:
         return pd.DataFrame(columns=["trade_date", "pcr_oi"])
-    df["trade_date_dt"] = pd.to_datetime(df["trade_date"], format="%m-%d-%Y", errors="coerce")
+    df["trade_date_dt"] = pd.to_datetime(df["trade_date"], format="%Y-%m-%d", errors="coerce")
     df = df.dropna(subset=["trade_date_dt"])
     grp = df.groupby("trade_date_dt", as_index=False).agg(
         total_call_oi=("openInt_Call", "sum"),
@@ -241,7 +241,7 @@ def get_60d_volume_avgs(symbol, trade_date_now: str):
         )
     if df.empty:
         return pd.DataFrame(columns=["expiry_date", "strike", "vol_call_avg60", "vol_put_avg60"])
-    df["trade_date_dt"] = pd.to_datetime(df["trade_date"], format="%m-%d-%Y", errors="coerce")
+    df["trade_date_dt"] = pd.to_datetime(df["trade_date"], format="%Y-%m-%d", errors="coerce")
     df = df.dropna(subset=["trade_date_dt"])
     df = df.sort_values(["expiry_date", "strike", "trade_date_dt"])
     def _rolling_60(s):
@@ -898,7 +898,7 @@ def build_strategy_for_symbol(symbol, trade_date_now):
     spot = float(df_stock["close"].iloc[0])
 
     df_opt["expiry_dt"] = pd.to_datetime(df_opt["expiry_date"], errors="coerce")
-    trade_dt = datetime.strptime(td_chain, "%m-%d-%Y")
+    trade_dt = datetime.strptime(td_chain, "%Y-%m-%d")
     df_opt["dte"] = (df_opt["expiry_dt"] - trade_dt).dt.days
     df_opt["strike"] = pd.to_numeric(df_opt["strike"], errors="coerce")
 

@@ -714,7 +714,7 @@ class OptionsFlowFormatter:
         
         # Build header
         try:
-            report_date = datetime.strptime(date, '%m-%d-%Y').strftime('%B %d, %Y')
+            report_date = datetime.strptime(date, '%Y-%m-%d').strftime('%B %d, %Y')
         except:
             report_date = date
         message = "📈 *Options Flow Daily Report*\n"

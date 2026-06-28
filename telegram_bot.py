@@ -1263,7 +1263,7 @@ def _ensure_group_id_column():
         conn.close()
 
 # Convert MM-DD-YYYY to sortable YYYYMMDD for SQLite ORDER/MAX
-_DT = "substr({c},7,4)||substr({c},1,2)||substr({c},4,2)"
+_DT = "{c}"
 def _max_date_sql(col, table, where=""):
     """Return SQL subquery for chronological MAX of a MM-DD-YYYY column."""
     expr = _DT.format(c=col)
@@ -3421,7 +3421,7 @@ def _mirofish_score_position(tr):
                    vol_Call_now, vol_Put_now, R1, S1
             FROM options_change
             WHERE ticker = ? AND ABS(strike - ?) < 1
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            ORDER BY trade_date_now DESC
             LIMIT 1
         """, conn, params=(tk, strike))
         conn.close()
@@ -3462,7 +3462,7 @@ def _mirofish_score_position(tr):
         conn = get_conn()
         sd = pd.read_sql("""
             SELECT pcr_oi FROM stock_daily WHERE ticker = ?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1
+            ORDER BY trade_date DESC LIMIT 1
         """, conn, params=(tk,))
         conn.close()
         if not sd.empty:
@@ -3543,7 +3543,7 @@ async def mirofish_menu(query):
         dt = ""
         latest = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1
+            ORDER BY trade_date_now DESC LIMIT 1
         """, conn)
         if not latest.empty:
             dt = latest["trade_date_now"].iloc[0]
@@ -3584,7 +3584,7 @@ async def mirofish_menu(query):
         for _btk, _, _ in bear_tickers[:3]:
             try:
                 _sp_df = pd.read_sql(
-                    "SELECT close FROM stock_daily WHERE ticker=? ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                    "SELECT close FROM stock_daily WHERE ticker=? ORDER BY trade_date DESC LIMIT 1",
                     conn, params=(_btk,))
                 _spot = float(_sp_df["close"].iloc[0]) if not _sp_df.empty else 0
                 _sk_df = pd.read_sql("""
@@ -3834,7 +3834,7 @@ def _oi_expiry_flow_table(ticker: str, conn, latest_date: str) -> str:
             FROM options_change
             WHERE ticker=? AND trade_date_now=?
             GROUP BY expiry_date
-            ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
+            ORDER BY expiry_date
         """, conn, params=(ticker, latest_date))
     except Exception:
         return ""
@@ -3855,7 +3855,7 @@ def _oi_expiry_flow_table(ticker: str, conn, latest_date: str) -> str:
     rows = []
     for _, r in edf.iterrows():
         try:
-            if datetime.strptime(str(r["expiry_date"]), "%m-%d-%Y").date() < _today:
+            if datetime.strptime(str(r["expiry_date"]), "%Y-%m-%d").date() < _today:
                 continue
         except Exception:
             pass
@@ -3912,12 +3912,12 @@ def _compute_gex(ticker: str, conn, spot: float, expiry=None) -> dict:
     try:
         _ld = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker,))
         if _ld.empty:
             return result
         date_str = _ld["trade_date_now"].iloc[0]
-        ref_dt = datetime.strptime(date_str, "%m-%d-%Y")
+        ref_dt = datetime.strptime(date_str, "%Y-%m-%d")
     except Exception:
         return result
 
@@ -3934,7 +3934,7 @@ def _compute_gex(ticker: str, conn, spot: float, expiry=None) -> dict:
         try:
             _es = str(e["expiry_date"])
             try:
-                ed = datetime.strptime(_es, "%m-%d-%Y")
+                ed = datetime.strptime(_es, "%Y-%m-%d")
             except ValueError:
                 ed = datetime.strptime(_es, "%Y-%m-%d")
         except Exception:
@@ -3965,7 +3965,7 @@ def _compute_gex(ticker: str, conn, spot: float, expiry=None) -> dict:
     try:
         _hsd = pd.read_sql(
             "SELECT close FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 25",
+            " ORDER BY trade_date DESC LIMIT 25",
             conn, params=(ticker,))
         if len(_hsd) >= 10:
             _rets = _hsd["close"].astype(float).pct_change().dropna()
@@ -4074,7 +4074,7 @@ def _oi_opportunity_table(ticker: str, conn, df, spot: float) -> str:
     hv = 0.30
     try:
         _hsd = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
+            ORDER BY trade_date DESC
             LIMIT 25""", conn, params=(ticker,))
         if len(_hsd) >= 10:
             _rets = _hsd["close"].astype(float).pct_change().dropna()
@@ -4088,12 +4088,12 @@ def _oi_opportunity_table(ticker: str, conn, df, spot: float) -> str:
     exp_str = ""
     try:
         _edt = pd.read_sql("""SELECT DISTINCT expiry_date FROM options_change WHERE ticker=?
-            AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) > ?
-            ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) LIMIT 1""",
+            AND expiry_date > ?
+            ORDER BY expiry_date LIMIT 1""",
             conn, params=(ticker, datetime.now().strftime("%Y%m%d")))
         if not _edt.empty:
             exp_str = _edt["expiry_date"].iloc[0]
-            dte = max(1, (datetime.strptime(str(exp_str), "%m-%d-%Y") - datetime.now()).days)
+            dte = max(1, (datetime.strptime(str(exp_str), "%Y-%m-%d") - datetime.now()).days)
     except Exception:
         pass
 
@@ -4256,7 +4256,7 @@ def _oi_week_heatmap(ticker: str, conn, spot: float, latest_date: str):
         # ── 1. Pull last 30 trade dates ────────────────────────────────
         _dates_df = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            ORDER BY trade_date_now DESC
             LIMIT 30
         """, conn, params=(ticker,))
         if _dates_df.empty or len(_dates_df) < 2:
@@ -4625,18 +4625,18 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
     _dte_days = 21  # assume nearest expiry ~3 weeks out
     try:
         _hsd = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 25""",
+            ORDER BY trade_date DESC LIMIT 25""",
             conn, params=(ticker,))
         if len(_hsd) >= 10:
             _rets = _hsd["close"].astype(float).pct_change().dropna()
             _hv = max(0.10, min(float(_rets.std() * (252**0.5)), 2.0))
         # Nearest expiry DTE
         _edt = pd.read_sql("""SELECT DISTINCT expiry_date FROM options_change WHERE ticker=?
-            AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) > ?
-            ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) LIMIT 1""",
+            AND expiry_date > ?
+            ORDER BY expiry_date LIMIT 1""",
             conn, params=(ticker, datetime.now().strftime("%Y%m%d")))
         if not _edt.empty:
-            _dte_days = max(1, (datetime.strptime(str(_edt["expiry_date"].iloc[0]), "%m-%d-%Y") - datetime.now()).days)
+            _dte_days = max(1, (datetime.strptime(str(_edt["expiry_date"].iloc[0]), "%Y-%m-%d") - datetime.now()).days)
     except Exception:
         pass
     _T = max(_dte_days, 1) / 365.0
@@ -4779,7 +4779,7 @@ def _oi_strike_breakdown(ticker: str, conn, spot: float, latest_date: str,
     try:
         _wk_dates = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            ORDER BY trade_date_now DESC
             LIMIT 30
         """, conn, params=(ticker,))
         if len(_wk_dates) >= 2:
@@ -5000,7 +5000,7 @@ def _oi_trend_summary(ticker: str, conn, latest_date: str) -> str:
         # Get sorted dates
         dates_df = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change WHERE ticker = ?
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            ORDER BY trade_date_now DESC
             LIMIT 25
         """, conn, params=(ticker,))
     except Exception:
@@ -5207,14 +5207,14 @@ async def mirofish_ticker_detail(query, ticker):
                    R1, S1
             FROM options_change
             WHERE ticker = ?
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC,
+            ORDER BY trade_date_now DESC,
                      (ABS(change_OI_Call) + ABS(change_OI_Put)) DESC
             LIMIT 40
         """, conn, params=(tk,))
 
         sd = pd.read_sql("""
             SELECT close, pcr_oi FROM stock_daily WHERE ticker = ?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1
+            ORDER BY trade_date DESC LIMIT 1
         """, conn, params=(tk,))
 
         _latest_oc_date = oc["trade_date_now"].iloc[0] if not oc.empty else ""
@@ -5345,7 +5345,7 @@ def analyze_oi_rolls(ticker, conn):
             WHERE ticker = ?
               AND trade_date_now = (
                   SELECT trade_date_now FROM options_change WHERE ticker = ?
-                  ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+                  ORDER BY trade_date_now DESC
                   LIMIT 1)
             ORDER BY expiry_date, strike
         """, conn, params=(tk, tk))
@@ -5541,7 +5541,7 @@ def analyze_inst_signals(ticker, conn):
             WHERE ticker = ?
               AND trade_date_now = (
                   SELECT trade_date_now FROM options_change WHERE ticker = ?
-                  ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+                  ORDER BY trade_date_now DESC
                   LIMIT 1)
         """, conn, params=(tk, tk))
     except Exception:
@@ -5561,7 +5561,7 @@ def analyze_inst_signals(ticker, conn):
 
     td_str = str(df["trade_date_now"].iloc[0])
     try:
-        td = _dt.strptime(td_str, "%m-%d-%Y")
+        td = _dt.strptime(td_str, "%Y-%m-%d")
     except Exception:
         td = None
 
@@ -5584,7 +5584,7 @@ def analyze_inst_signals(ticker, conn):
         dte = None
         if td is not None:
             try:
-                dte = max(0, (_dt.strptime(exp_label, "%m-%d-%Y") - td).days)
+                dte = max(0, (_dt.strptime(exp_label, "%Y-%m-%d") - td).days)
             except Exception:
                 pass
         best_s, best_pain = None, float("inf")
@@ -5662,7 +5662,7 @@ def analyze_inst_signals(ticker, conn):
             SELECT call_notional_oi, put_notional_oi, net_notional_oi,
                    bull_score, bear_score, avg_spot, avg_dte
             FROM us_analytics_daily WHERE ticker = ?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
+            ORDER BY trade_date DESC
             LIMIT 1
         """, conn, params=(tk,))
         if not an.empty:
@@ -5731,7 +5731,7 @@ def analyze_inst_signals(ticker, conn):
         for _, pr in df[df["total_oi"] >= mean_oi_val * 2.0].iterrows():
             exp_str = str(pr["expiry_date"])
             try:
-                dte_v = max(0, (_dt.strptime(exp_str, "%m-%d-%Y") - td).days)
+                dte_v = max(0, (_dt.strptime(exp_str, "%Y-%m-%d") - td).days)
             except Exception:
                 dte_v = 99
             if dte_v <= 7:
@@ -6030,7 +6030,7 @@ async def inst_signals_detail(query, ticker):
     try:
         conn_inst = get_conn()
         _oc_dt = pd.read_sql("""SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            ORDER BY trade_date_now DESC
             LIMIT 1""", conn_inst, params=(tk,))
         _inst_latest = _oc_dt["trade_date_now"].iloc[0] if not _oc_dt.empty else ""
         _inst_spot = sig.get("notional", {}).get("avg_spot", 0) if sig.get("notional") else spot
@@ -6096,7 +6096,7 @@ def analyze_mean_reversion(ticker, conn):
     try:
         sd = pd.read_sql("""
             SELECT trade_date, close, pcr_oi FROM stock_daily WHERE ticker = ?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
+            ORDER BY trade_date DESC
             LIMIT 60
         """, conn, params=(tk,))
     except Exception:
@@ -6176,7 +6176,7 @@ def analyze_mean_reversion(ticker, conn):
             SELECT trade_date, net_notional_oi as net_oi,
                    call_notional_oi as call_oi, put_notional_oi as put_oi
             FROM us_analytics_daily WHERE ticker = ?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
+            ORDER BY trade_date DESC
             LIMIT 30
         """, conn, params=(tk,))
         if len(an) >= 10:
@@ -6387,7 +6387,7 @@ def analyze_technical_signals(ticker, conn):
     try:
         sd = pd.read_sql("""
             SELECT trade_date, close FROM stock_daily WHERE ticker = ?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) ASC
+            ORDER BY trade_date ASC
             LIMIT 90
         """, conn, params=(tk,))
     except Exception:
@@ -7098,7 +7098,7 @@ async def oi_menu(query, expiry=None):
     try:
         latest_td_df = pd.read_sql("""
             SELECT DISTINCT trade_date FROM options_daily
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
+            ORDER BY trade_date DESC
             LIMIT 1
         """, conn)
         if latest_td_df.empty:
@@ -7132,7 +7132,7 @@ async def oi_menu(query, expiry=None):
     expired_expiries = []
     for d in all_expiry_dates:
         try:
-            dt = datetime.strptime(str(d), "%m-%d-%Y").date()
+            dt = datetime.strptime(str(d), "%Y-%m-%d").date()
             if dt >= today:
                 future_expiries.append((dt, d))
             else:
@@ -7249,7 +7249,7 @@ async def oi_detail(query, ticker):
             SELECT DISTINCT trade_date 
             FROM options_daily 
             WHERE ticker = ?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC 
+            ORDER BY trade_date DESC 
             LIMIT 1
         """, conn, params=(str(ticker).upper(),))
         
@@ -7326,7 +7326,7 @@ async def oi_detail(query, ticker):
             FROM options_daily
             WHERE ticker = ? AND trade_date = ?
             GROUP BY expiry_date
-            ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
+            ORDER BY expiry_date
         """, get_conn(), params=(str(ticker).upper(), str(dt)))
         if not exp_df.empty:
             rows = [f"{'Expiry':<8} {'Call':>6} {'Put':>6} {'PCR':>5}"]
@@ -7455,11 +7455,11 @@ async def oi_detail(query, ticker):
     try:
         conn3 = get_conn()
         _sd3 = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
+            ORDER BY trade_date DESC
             LIMIT 1""", conn3, params=(str(ticker).upper(),))
         _spot3 = float(_sd3["close"].iloc[0]) if not _sd3.empty else 0.0
         _oc_date3 = pd.read_sql("""SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            ORDER BY trade_date_now DESC
             LIMIT 1""", conn3, params=(str(ticker).upper(),))
         _latest3 = _oc_date3["trade_date_now"].iloc[0] if not _oc_date3.empty else ""
         if _latest3 and _spot3 > 0:
@@ -7501,7 +7501,7 @@ async def oi_compare_select_expiry(query, ctx, step=1):
     parsed_expiries = []
     for d in all_expiries_raw:
         try:
-            dt = datetime.strptime(str(d), "%m-%d-%Y").date()
+            dt = datetime.strptime(str(d), "%Y-%m-%d").date()
             parsed_expiries.append((dt, d))
         except Exception:
             continue
@@ -7614,10 +7614,10 @@ async def oi_compare_view(query, ctx, exp1, exp2):
 def _get_prev_trade_date(trade_date_str):
     """Get previous trade date in MM-DD-YYYY format"""
     try:
-        dt = datetime.strptime(trade_date_str, "%m-%d-%Y").date()
+        dt = datetime.strptime(trade_date_str, "%Y-%m-%d").date()
         # Go back 1 day (assuming daily data, could be improved with calendar)
         prev = dt - timedelta(days=1)
-        return prev.strftime("%m-%d-%Y")
+        return prev.strftime("%Y-%m-%d")
     except Exception:
         return None
 
@@ -7632,7 +7632,7 @@ def _generate_oi_change_chart(ticker, today_date, prev_date):
         expiries_df = pd.read_sql("""
             SELECT DISTINCT expiry_date FROM options_daily 
             WHERE ticker = ? AND trade_date = ?
-            ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2)
+            ORDER BY expiry_date
         """, conn, params=(ticker.upper(), today_date))
         all_expiries = expiries_df["expiry_date"].tolist()[:2]  # Only next 2
     except Exception as e:
@@ -7842,7 +7842,7 @@ async def oi_change_ticker_menu(query):
         # Get latest trade date (MM-DD-YYYY format, sort chronologically)
         latest_date_df = pd.read_sql("""
             SELECT DISTINCT trade_date FROM options_daily 
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1
+            ORDER BY trade_date DESC LIMIT 1
         """, conn)
         if latest_date_df.empty:
             await query.message.reply_text("📊 No options data available.", reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
@@ -7903,7 +7903,7 @@ async def oi_change_chart_eod_view(query, ticker):
     try:
         dates_df = pd.read_sql("""
             SELECT DISTINCT trade_date FROM options_daily 
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 2
+            ORDER BY trade_date DESC LIMIT 2
         """, conn)
         if len(dates_df) < 2:
             await query.message.reply_text("📊 Insufficient historical data.", reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
@@ -7976,7 +7976,7 @@ def _fetch_live_oi_data(ticker):
                 
                 df = pd.merge(calls, puts, on='strike', how='outer').fillna(0)
                 # Convert YYYY-MM-DD (from yfinance) to MM-DD-YYYY (database format)
-                df['expiry'] = datetime.strptime(exp, "%Y-%m-%d").strftime("%m-%d-%Y")
+                df['expiry'] = datetime.strptime(exp, "%Y-%m-%d").strftime("%Y-%m-%d")
                 live_data.append(df)
             except Exception as e:
                 log.warning(f"Failed to fetch live OI for {ticker} expiry {exp}: {e}")
@@ -8249,7 +8249,7 @@ async def oi_change_chart_live_view(query, ticker):
     try:
         latest_date_df = pd.read_sql("""
             SELECT DISTINCT trade_date FROM options_daily 
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1
+            ORDER BY trade_date DESC LIMIT 1
         """, conn)
         if latest_date_df.empty:
             await query.message.reply_text("📊 No EOD data available.", reply_markup=InlineKeyboardMarkup([[BACK_BTN]]))
@@ -8541,7 +8541,7 @@ async def generate_nyse_report(query, max_symbols=10):
         conn = get_conn()
         try:
             latest_date_df = pd.read_sql(
-                "SELECT DISTINCT trade_date_now FROM options_change ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+                "SELECT DISTINCT trade_date_now FROM options_change ORDER BY trade_date_now DESC LIMIT 1",
                 conn
             )
             if latest_date_df.empty:
@@ -8660,7 +8660,7 @@ async def signal_scanner(query):
         # Get latest date using proper MM-DD-YYYY sort
         latest_row = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+            ORDER BY trade_date_now DESC
             LIMIT 1
         """, conn)
         if latest_row.empty:
@@ -8759,7 +8759,7 @@ async def signal_scanner(query):
     for _tk_row in list(bulls.head(3).itertuples()) + list(bears.head(3).itertuples()):
         _tk = str(_tk_row.ticker)
         _sd2 = pd.read_sql("""SELECT close FROM stock_daily WHERE ticker=?
-            ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
+            ORDER BY trade_date DESC
             LIMIT 1""", conn2, params=(_tk,))
         _spot2 = float(_sd2["close"].iloc[0]) if not _sd2.empty else 0.0
         _breakdown = _oi_strike_breakdown(_tk, conn2, _spot2, latest_date)
@@ -8972,7 +8972,7 @@ async def market_analytics_report(query):
     try:
         lr = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1
+            ORDER BY trade_date_now DESC LIMIT 1
         """, conn)
         if not lr.empty:
             latest_date = lr["trade_date_now"].iloc[0]
@@ -9302,7 +9302,7 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
         _oi_conn = get_conn()
         _lr = pd.read_sql("""
             SELECT DISTINCT trade_date_now FROM options_change
-            ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1
+            ORDER BY trade_date_now DESC LIMIT 1
         """, _oi_conn)
         if not _lr.empty:
             _ltd = _lr["trade_date_now"].iloc[0]
@@ -9339,7 +9339,7 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
             dte = (datetime.strptime(expiry_s[:10], "%Y-%m-%d").date() - today).days
         except Exception:
             try:
-                dte = (datetime.strptime(expiry_s[:10], "%m-%d-%Y").date() - today).days
+                dte = (datetime.strptime(expiry_s[:10], "%Y-%m-%d").date() - today).days
             except Exception:
                 pass
 
@@ -9357,7 +9357,7 @@ async def position_monitor(ctx: ContextTypes.DEFAULT_TYPE):
                 _exp_yf = datetime.strptime(expiry_s[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
             except Exception:
                 try:
-                    _exp_yf = datetime.strptime(expiry_s[:10], "%m-%d-%Y").strftime("%Y-%m-%d")
+                    _exp_yf = datetime.strptime(expiry_s[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
                 except Exception:
                     _exp_yf = None
             if _exp_yf:
@@ -9624,7 +9624,7 @@ async def position_alerts(ctx: ContextTypes.DEFAULT_TYPE):
         dte = None
         try: dte = (datetime.strptime(expiry_s, "%Y-%m-%d").date() - today).days
         except Exception:
-            try: dte = (datetime.strptime(expiry_s, "%m-%d-%Y").date() - today).days
+            try: dte = (datetime.strptime(expiry_s, "%Y-%m-%d").date() - today).days
             except Exception: pass
         if dte is not None and dte < 0:
             continue  # skip expired
@@ -9647,7 +9647,7 @@ async def position_alerts(ctx: ContextTypes.DEFAULT_TYPE):
             cur_px = entry
             try:
                 try:    _exp_yf = datetime.strptime(expiry_s, "%Y-%m-%d").strftime("%Y-%m-%d")
-                except: _exp_yf = datetime.strptime(expiry_s, "%m-%d-%Y").strftime("%Y-%m-%d")
+                except: _exp_yf = datetime.strptime(expiry_s, "%Y-%m-%d").strftime("%Y-%m-%d")
                 _chain = yf.Ticker(tk).option_chain(_exp_yf)
                 _df    = _chain.calls if otype == "CALL" else _chain.puts
                 _near  = _df[abs(_df["strike"] - strike) < 0.01]
@@ -9835,7 +9835,7 @@ def _live_momentum_scanner(top_n: int = 5):
         conn = get_conn()
         for idx, row in df.iterrows():
             _p = pd.read_sql(
-                "SELECT pcr_oi FROM stock_daily WHERE ticker=? ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+                "SELECT pcr_oi FROM stock_daily WHERE ticker=? ORDER BY trade_date DESC LIMIT 1",
                 conn, params=(row["ticker"],))
             if not _p.empty and _p["pcr_oi"].iloc[0]:
                 df.at[idx, "pcr"] = float(_p["pcr_oi"].iloc[0])
@@ -10061,7 +10061,7 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
             # Latest OI date
             latest_row = pd.read_sql("""
                 SELECT DISTINCT trade_date_now FROM options_change
-                ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1
+                ORDER BY trade_date_now DESC LIMIT 1
             """, conn)
             if not latest_row.empty:
                 latest_dt = latest_row["trade_date_now"].iloc[0]
@@ -10106,9 +10106,9 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
                                    SUM(change_OI_Put)  AS p_chg
                             FROM options_change
                             WHERE ticker=? AND trade_date_now=?
-                              AND substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) > ?
+                              AND expiry_date > ?
                             GROUP BY expiry_date
-                            ORDER BY substr(expiry_date,7,4)||substr(expiry_date,1,2)||substr(expiry_date,4,2) ASC
+                            ORDER BY expiry_date ASC
                             LIMIT 2
                         """, conn, params=(tk, latest_dt, today_ymd))
                         if not df.empty:
@@ -10438,7 +10438,7 @@ async def backtest_lab_view(query):
     px = px.dropna(subset=["ticker", "trade_date", "close"]).copy()
     px["close"] = pd.to_numeric(px["close"], errors="coerce")
     # Parse MM-DD-YYYY dates for proper chronological sorting
-    px["_date_sort"] = pd.to_datetime(px["trade_date"], format="%m-%d-%Y", errors="coerce")
+    px["_date_sort"] = pd.to_datetime(px["trade_date"], format="%Y-%m-%d", errors="coerce")
     px = px.sort_values(["ticker", "_date_sort"])
     px["next_close"] = px.groupby("ticker")["close"].shift(-1)
     px["next_ret"] = (px["next_close"] - px["close"]) / px["close"]
@@ -11087,7 +11087,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             page = int(data.split("_")[-1])
             conn = get_conn()
             try:
-                latest_date_df = pd.read_sql("SELECT DISTINCT trade_date FROM options_daily ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1", conn)
+                latest_date_df = pd.read_sql("SELECT DISTINCT trade_date FROM options_daily ORDER BY trade_date DESC LIMIT 1", conn)
                 latest_date = latest_date_df["trade_date"].iloc[0] if not latest_date_df.empty else None
                 if latest_date:
                     tickers_df = pd.read_sql("SELECT DISTINCT ticker FROM options_daily WHERE trade_date = ? ORDER BY ticker", conn, params=(latest_date,))
@@ -11131,7 +11131,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     SELECT DISTINCT ticker FROM options_daily
                     WHERE trade_date = (
                         SELECT trade_date FROM options_daily
-                        ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1
+                        ORDER BY trade_date DESC LIMIT 1
                     )
                     """,
                     conn,
@@ -12982,7 +12982,7 @@ def short_squeeze_signal(ticker, conn=None):
                 "SELECT SUM(change_OI_Call) c, SUM(change_OI_Put) p FROM options_change "
                 "WHERE ticker=? AND trade_date_now=("
                 "  SELECT trade_date_now FROM options_change WHERE ticker=? "
-                "  ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1)",
+                "  ORDER BY trade_date_now DESC LIMIT 1)",
                 conn, params=(tk, tk))
             if not row.empty:
                 _c = row["c"].iloc[0]; _p = row["p"].iloc[0]
@@ -13183,7 +13183,7 @@ def _update_hp_outcomes(ticker, conn):
         _setup_hp_tables(conn)
         px = pd.read_sql(
             "SELECT trade_date, close FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)",
+            " ORDER BY trade_date",
             conn, params=(ticker.upper(),))
         if len(px) < 2:
             return
@@ -13220,12 +13220,12 @@ def _update_hp_outcomes(ticker, conn):
             rows = pd.read_sql(
                 "SELECT correct FROM signal_accuracy WHERE ticker=? AND model_name=?"
                 " AND correct>=0 ORDER BY"
-                " substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 20",
+                " trade_date DESC LIMIT 20",
                 conn, params=(ticker.upper(), model))
             if len(rows) >= 5:
                 acc = float(rows["correct"].mean())
                 weight = max(0.2, min(1.8, (acc - 0.5) * 2.0 + 1.0))
-                today_s = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%m-%d-%Y")
+                today_s = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d")
                 conn.execute(
                     "INSERT OR REPLACE INTO signal_weights"
                     " (ticker, model_name, accuracy_20d, weight, last_updated)"
@@ -13258,7 +13258,7 @@ def _hp_model_gex(ticker, conn, spot):
     try:
         dates = pd.read_sql(
             "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 3",
+            " ORDER BY trade_date_now DESC LIMIT 3",
             conn, params=(ticker.upper(),))
         if len(dates) < 2 or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "gex": 0, "regime": "unknown",
@@ -13277,7 +13277,7 @@ def _hp_model_gex(ticker, conn, spot):
                 conn, params=(ticker.upper(), date_str))
             if df.empty:
                 return 0.0
-            ref_dt = datetime.strptime(date_str, "%m-%d-%Y")
+            ref_dt = datetime.strptime(date_str, "%Y-%m-%d")
             total = 0.0
             for _, r in df.iterrows():
                 K = float(r["strike"])
@@ -13285,7 +13285,7 @@ def _hp_model_gex(ticker, conn, spot):
                 p_oi = float(r["p_oi"] or 0)
                 c_px = float(r["c_px"] or 0)
                 try:
-                    exp_dt = datetime.strptime(str(r["expiry_date"]), "%m-%d-%Y")
+                    exp_dt = datetime.strptime(str(r["expiry_date"]), "%Y-%m-%d")
                 except Exception:
                     continue
                 T = max((exp_dt - ref_dt).days / 365.0, 1 / 365.0)
@@ -13323,7 +13323,7 @@ def _hp_model_pcr_z(ticker, conn):
     try:
         sd = pd.read_sql(
             "SELECT trade_date, pcr_oi FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 25",
+            " ORDER BY trade_date DESC LIMIT 25",
             conn, params=(ticker.upper(),))
         if len(sd) < 10:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Insufficient PCR history"}
@@ -13378,14 +13378,14 @@ def _hp_model_oi_momentum(ticker, conn, spot):
     try:
         dates = pd.read_sql(
             "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 5",
+            " ORDER BY trade_date_now DESC LIMIT 5",
             conn, params=(ticker.upper(),))
         if len(dates) < 4:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 4 days"}
 
         px = pd.read_sql(
             "SELECT trade_date, close FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 5",
+            " ORDER BY trade_date DESC LIMIT 5",
             conn, params=(ticker.upper(),))
         px["close"] = pd.to_numeric(px["close"], errors="coerce")
 
@@ -13465,7 +13465,7 @@ def _hp_model_gamma_pin(ticker, conn, spot):
         nearest, min_dte = None, 999
         for _, er in expiries.iterrows():
             try:
-                exp_dt = datetime.strptime(str(er["expiry_date"]), "%m-%d-%Y")
+                exp_dt = datetime.strptime(str(er["expiry_date"]), "%Y-%m-%d")
                 dte = (exp_dt - today_dt).days
                 if 0 < dte < min_dte:
                     min_dte, nearest = dte, er["expiry_date"]
@@ -13476,7 +13476,7 @@ def _hp_model_gamma_pin(ticker, conn, spot):
 
         latest = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         if latest.empty:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "No latest date"}
@@ -13550,7 +13550,7 @@ def _hp_model_vol_flow(ticker, conn):
     try:
         dates = pd.read_sql(
             "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 8",
+            " ORDER BY trade_date_now DESC LIMIT 8",
             conn, params=(ticker.upper(),))
         if len(dates) < 6:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 6 days for vol avg"}
@@ -13608,7 +13608,7 @@ def _hp_model_iv_skew(ticker, conn, spot):
     try:
         latest = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         if latest.empty or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "No data"}
@@ -13621,7 +13621,7 @@ def _hp_model_iv_skew(ticker, conn, spot):
         nearest, min_dte = None, 999
         for _, er in expiries.iterrows():
             try:
-                exp_dt = datetime.strptime(str(er["expiry_date"]), "%m-%d-%Y")
+                exp_dt = datetime.strptime(str(er["expiry_date"]), "%Y-%m-%d")
                 dte = (exp_dt - today_dt).days
                 if 1 < dte < min_dte:
                     min_dte, nearest = dte, er["expiry_date"]
@@ -13705,13 +13705,13 @@ def _hp_walk_forward_backtest(ticker, conn, extreme_filter=0.03):
     try:
         sd = pd.read_sql(
             "SELECT trade_date, close, pcr_oi FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) ASC",
+            " ORDER BY trade_date ASC",
             conn, params=(ticker.upper(),))
         oi = pd.read_sql(
             "SELECT trade_date_now, SUM(vol_Call_now) AS cv, SUM(vol_Put_now) AS pv,"
             " SUM(openInt_Call_now) AS co, SUM(openInt_Put_now) AS po"
             " FROM options_change WHERE ticker=? GROUP BY trade_date_now"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) ASC",
+            " ORDER BY trade_date_now ASC",
             conn, params=(ticker.upper(),))
 
         sd["close"]    = pd.to_numeric(sd["close"],  errors="coerce")
@@ -13795,7 +13795,7 @@ def _hp_model_rv_iv(ticker, conn, spot):
         from datetime import datetime as _dt2
         prices = pd.read_sql(
             "SELECT close FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 35",
+            " ORDER BY trade_date DESC LIMIT 35",
             conn, params=(ticker.upper(),))
         if len(prices) < 22 or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Insufficient history"}
@@ -13804,7 +13804,7 @@ def _hp_model_rv_iv(ticker, conn, spot):
 
         latest = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         if latest.empty:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "No options data"}
@@ -13822,7 +13822,7 @@ def _hp_model_rv_iv(ticker, conn, spot):
         ivs = []
         for _, row in opts.iterrows():
             try:
-                exp = _dt2.strptime(row["expiry_date"], "%m-%d-%Y").date()
+                exp = _dt2.strptime(row["expiry_date"], "%Y-%m-%d").date()
                 T   = max((exp - today).days / 365.0, 1/365.0)
                 iv  = _implied_vol_hp(float(row["lastPrice_Call_now"]), spot, float(row["strike"]), T)
                 if 0.05 < iv < 3.0:
@@ -13862,7 +13862,7 @@ def _hp_model_oi_term_structure(ticker, conn):
         today = _dt2.now().date()
         ld = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         if ld.empty:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "No options data"}
@@ -13879,7 +13879,7 @@ def _hp_model_oi_term_structure(ticker, conn):
         near_c = near_p = far_c = far_p = 0.0
         for _, r in df.iterrows():
             try:
-                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                exp = _dt2.strptime(r["expiry_date"], "%Y-%m-%d").date()
                 dte = (exp - today).days
                 if dte < 1:
                     continue
@@ -13916,7 +13916,7 @@ def _hp_model_maxpain_velocity(ticker, conn, spot):
         from datetime import datetime as _dt2
         dates = pd.read_sql(
             "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 4",
+            " ORDER BY trade_date_now DESC LIMIT 4",
             conn, params=(ticker.upper(),))
         if len(dates) < 3 or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need ≥3 days data"}
@@ -13969,7 +13969,7 @@ def _hp_model_iv_rank(ticker, conn, spot):
 
         dates = pd.read_sql(
             "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 65",
+            " ORDER BY trade_date_now DESC LIMIT 65",
             conn, params=(ticker.upper(),))
         if len(dates) < 20 or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 20+ days for IV rank"}
@@ -13983,7 +13983,7 @@ def _hp_model_iv_rank(ticker, conn, spot):
             ivs = []
             for _, r in opts.iterrows():
                 try:
-                    exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                    exp = _dt2.strptime(r["expiry_date"], "%Y-%m-%d").date()
                     T   = max((exp - today).days / 365.0, 1/365.0)
                     iv  = _implied_vol_hp(float(r["lastPrice_Call_now"]), spot, float(r["strike"]), T)
                     if 0.05 < iv < 3.0:
@@ -14030,7 +14030,7 @@ def _hp_model_pcp_deviation(ticker, conn, spot):
         today = _dt2.now().date()
         ld = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         if ld.empty or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "No data"}
@@ -14049,7 +14049,7 @@ def _hp_model_pcp_deviation(ticker, conn, spot):
         for _, r in opts.iterrows():
             try:
                 K   = float(r["strike"]); C = float(r["lastPrice_Call_now"]); P = float(r["lastPrice_Put_now"])
-                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                exp = _dt2.strptime(r["expiry_date"], "%Y-%m-%d").date()
                 T   = max((exp - today).days / 365.0, 1/365.0)
                 r_  = 0.05
                 parity = spot - K * _math.exp(-r_ * T)   # C - P should equal this
@@ -14082,7 +14082,7 @@ def _hp_model_vol_regime(ticker, conn):
     try:
         prices = pd.read_sql(
             "SELECT close FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 30",
+            " ORDER BY trade_date DESC LIMIT 30",
             conn, params=(ticker.upper(),))
         if len(prices) < 22:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 22+ days for HV regime"}
@@ -14119,7 +14119,7 @@ def _hp_model_multi_expiry_oi(ticker, conn):
         today = _dt2.now().date()
         dates = pd.read_sql(
             "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 3",
+            " ORDER BY trade_date_now DESC LIMIT 3",
             conn, params=(ticker.upper(),))
         if len(dates) < 2:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 2+ days"}
@@ -14141,7 +14141,7 @@ def _hp_model_multi_expiry_oi(ticker, conn):
         bull_exp = bear_exp = 0
         for _, r in merged.iterrows():
             try:
-                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                exp = _dt2.strptime(r["expiry_date"], "%Y-%m-%d").date()
                 if (exp - today).days < 3:
                     continue
                 dc = float(r["co_n"] or 0) - float(r["co_p"] or 0)
@@ -14171,7 +14171,7 @@ def _hp_model_smart_money_uoa(ticker, conn):
     try:
         dates = pd.read_sql(
             "SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 12",
+            " ORDER BY trade_date_now DESC LIMIT 12",
             conn, params=(ticker.upper(),))
         if len(dates) < 5:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 5+ days for UOA baseline"}
@@ -14232,7 +14232,7 @@ def _hp_model_hhi_pin(ticker, conn, spot):
     try:
         ld = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         if ld.empty or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "No data"}
@@ -14272,7 +14272,7 @@ def _hp_model_pcr_velocity(ticker, conn):
     try:
         df = pd.read_sql(
             "SELECT trade_date, pcr_oi FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 10",
+            " ORDER BY trade_date DESC LIMIT 10",
             conn, params=(ticker.upper(),))
         if len(df) < 5:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 5+ days for PCR velocity"}
@@ -14317,7 +14317,7 @@ def _hp_model_vrvp(ticker, conn, spot):
     try:
         px = pd.read_sql(
             "SELECT high, low, close, volume FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 60",
+            " ORDER BY trade_date DESC LIMIT 60",
             conn, params=(ticker.upper(),))
         if len(px) < 20 or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 20+ days for VRVP"}
@@ -14495,7 +14495,7 @@ def _hp_model_vwap_dev(ticker, conn, spot):
     try:
         px = pd.read_sql(
             "SELECT high, low, close, volume FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 25",
+            " ORDER BY trade_date DESC LIMIT 25",
             conn, params=(ticker.upper(),))
         if len(px) < 15 or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 15+ days for VWAP"}
@@ -14546,7 +14546,7 @@ def _hp_model_expected_move(ticker, conn, spot):
         today = _dt2.now().date()
         ld = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         if ld.empty or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "No options data"}
@@ -14567,7 +14567,7 @@ def _hp_model_expected_move(ticker, conn, spot):
         best_row = None; best_dte = 9999
         for _, r in atm.iterrows():
             try:
-                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                exp = _dt2.strptime(r["expiry_date"], "%Y-%m-%d").date()
                 dte = (exp - today).days
                 if 1 <= dte < best_dte:
                     best_dte = dte; best_row = r
@@ -14582,7 +14582,7 @@ def _hp_model_expected_move(ticker, conn, spot):
         # Check actual prior day return
         px2 = pd.read_sql(
             "SELECT close FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 2",
+            " ORDER BY trade_date DESC LIMIT 2",
             conn, params=(ticker.upper(),))
         if len(px2) < 2:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 2 price days"}
@@ -14622,7 +14622,7 @@ def _hp_model_left_skew(ticker, conn, spot):
         today = _dt2.now().date()
         ld = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         if ld.empty or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "No data"}
@@ -14646,7 +14646,7 @@ def _hp_model_left_skew(ticker, conn, spot):
         p_ivs = []; c_ivs = []
         for _, r in puts.iterrows():
             try:
-                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                exp = _dt2.strptime(r["expiry_date"], "%Y-%m-%d").date()
                 T   = max((exp - today).days / 365.0, 1/365.0)
                 K   = float(r["strike"]); P = float(r["lastPrice_Put_now"])
                 # Put IV via call-put parity: P = C + K*e^(-rT) - S
@@ -14657,7 +14657,7 @@ def _hp_model_left_skew(ticker, conn, spot):
             except Exception: pass
         for _, r in calls.iterrows():
             try:
-                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                exp = _dt2.strptime(r["expiry_date"], "%Y-%m-%d").date()
                 T   = max((exp - today).days / 365.0, 1/365.0)
                 iv  = _implied_vol_hp(float(r["lastPrice_Call_now"]), spot, float(r["strike"]), T)
                 if 0.05 < iv < 4.0: c_ivs.append(iv * 100)
@@ -14700,7 +14700,7 @@ def _hp_model_vrp(ticker, conn, spot):
         # Realized vol: 10-day HV
         px = pd.read_sql(
             "SELECT close FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 15",
+            " ORDER BY trade_date DESC LIMIT 15",
             conn, params=(ticker.upper(),))
         if len(px) < 11 or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "Need 11+ days for VRP"}
@@ -14710,7 +14710,7 @@ def _hp_model_vrp(ticker, conn, spot):
         # IV from nearest ATM straddle
         ld = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         if ld.empty:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "No options data"}
@@ -14729,7 +14729,7 @@ def _hp_model_vrp(ticker, conn, spot):
         ivs = []
         for _, r in atm.iterrows():
             try:
-                exp = _dt2.strptime(r["expiry_date"], "%m-%d-%Y").date()
+                exp = _dt2.strptime(r["expiry_date"], "%Y-%m-%d").date()
                 T   = max((exp - today).days / 365.0, 1/365.0)
                 iv  = _implied_vol_hp(float(r["lastPrice_Call_now"]), spot, float(r["strike"]), T)
                 if 0.05 < iv < 3.0: ivs.append(iv * 100)
@@ -14766,7 +14766,7 @@ def _hp_model_put_call_wall(ticker, conn, spot):
     try:
         ld = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         if ld.empty or spot <= 0:
             return {"signal": "NEUTRAL", "prob": 50, "reason": "No data"}
@@ -14847,7 +14847,7 @@ def high_prob_signals_engine(ticker, conn, spy_ret=0.0):
 
     spot_df = pd.read_sql(
         "SELECT close FROM stock_daily WHERE ticker=?"
-        " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+        " ORDER BY trade_date DESC LIMIT 1",
         conn, params=(ticker.upper(),))
     spot = float(spot_df["close"].iloc[0]) if not spot_df.empty else 0.0
 
@@ -14981,7 +14981,7 @@ def high_prob_signals_engine(ticker, conn, spy_ret=0.0):
     warn    = "⚠️ Prob <80% — reduce size or wait." if below80 else ""
 
     try:
-        tod = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%m-%d-%Y")
+        tod = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d")
         for name, res in models.items():
             conn.execute(
                 "INSERT OR REPLACE INTO signal_accuracy (ticker, trade_date, model_name, signal, prob)"
@@ -15015,7 +15015,7 @@ async def high_prob_detail(query, ticker):
         try:
             spy_px = pd.read_sql(
                 "SELECT close FROM stock_daily WHERE ticker='SPY'"
-                " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 2",
+                " ORDER BY trade_date DESC LIMIT 2",
                 conn)
             spy_ret = (float(spy_px["close"].iloc[0]) / float(spy_px["close"].iloc[1]) - 1) * 100 \
                       if len(spy_px) >= 2 else 0.0
@@ -15194,7 +15194,7 @@ _QUARTER_MONTHS = {3, 6, 9, 12}
 def _opex_latest_date(conn, ticker):
     try:
         d = pd.read_sql("SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker,))
         return d["trade_date_now"].iloc[0] if not d.empty else None
     except Exception:
@@ -15203,7 +15203,7 @@ def _opex_latest_date(conn, ticker):
 def _opex_spot(conn, ticker):
     try:
         s = pd.read_sql("SELECT close FROM stock_daily WHERE ticker=?"
-            " ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date DESC LIMIT 1",
             conn, params=(ticker,))
         if not s.empty and float(s["close"].iloc[0]) > 0:
             return float(s["close"].iloc[0])
@@ -15212,7 +15212,7 @@ def _opex_spot(conn, ticker):
     return 0.0
 
 def _opex_parse_date(s):
-    for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
         try:
             return datetime.strptime(str(s), fmt).date()
         except ValueError:
@@ -15259,7 +15259,7 @@ def opex_radar(conn, tickers=None):
             a["oi"] += oi
     if not agg:
         return {}
-    rows = sorted(({"dt": k, "date": k.strftime("%m-%d-%Y"), **v} for k, v in agg.items()),
+    rows = sorted(({"dt": k, "date": k.strftime("%Y-%m-%d"), **v} for k, v in agg.items()),
                   key=lambda x: x["dt"])
     near = [r for r in rows if r["dte"] <= 45] or rows
     major = dict(max(near, key=lambda x: x["notional"]))
@@ -15668,7 +15668,7 @@ def _iv_rank(conn, tk):
             spot_by = {str(d): float(x) for d, x in zip(sd["trade_date"], sd["close"])}
 
             def _pdt(x):
-                for f in ("%m-%d-%Y", "%Y-%m-%d"):
+                for f in ("%Y-%m-%d", "%Y-%m-%d"):
                     try:
                         return datetime.strptime(str(x), f)
                     except Exception:
@@ -15753,7 +15753,7 @@ def _plan_prem(conn, tk, K, exp, typ):
     try:
         pr = pd.read_sql(
             f"SELECT {col} AS last FROM options_change WHERE UPPER(ticker)=? AND strike=? AND expiry_date=? "
-            "ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            "ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(tk.upper(), float(K), mdy))
         if not pr.empty and pr.iloc[0]["last"] and float(pr.iloc[0]["last"]) > 0:
             return float(pr.iloc[0]["last"])
@@ -15787,8 +15787,7 @@ def _plan_oi_flow(conn, tk, spot):
         df = pd.read_sql(
             "SELECT strike, expiry_date, change_OI_Call, change_OI_Put, vol_Call_now, vol_Put_now "
             "FROM options_change WHERE UPPER(ticker)=? AND trade_date_now=(SELECT trade_date_now "
-            "FROM options_change WHERE UPPER(ticker)=? ORDER BY substr(trade_date_now,7,4)||"
-            "substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1)",
+            "FROM options_change WHERE UPPER(ticker)=? ORDER BY trade_date_now DESC LIMIT 1)",
             conn, params=(tk.upper(), tk.upper()))
     except Exception:
         return None
@@ -15820,7 +15819,7 @@ def _plan_oi_flow(conn, tk, spot):
         pass
 
     def _ek(s):
-        for f in ("%m-%d-%Y", "%Y-%m-%d"):
+        for f in ("%Y-%m-%d", "%Y-%m-%d"):
             try:
                 return datetime.strptime(str(s), f)
             except Exception:
@@ -15886,7 +15885,7 @@ def _plan_trust(conn, tk, hold=5, thr=0.005):
     Backtests OI-bias / momentum / RSI from DB and pulls the 24-model's resolved accuracy."""
     out = []
     try:
-        sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+        sk = "trade_date"
         sd = pd.read_sql(f"SELECT trade_date, close FROM stock_daily WHERE ticker=? ORDER BY {sk}",
                          conn, params=(tk.upper(),))
         if len(sd) >= 30:
@@ -16052,7 +16051,7 @@ def _pl_tickets(legs, spot, cw, pw, r=0.045):
 def _pl_beta(conn, tk, lookback=60):
     """Beta of ticker vs SPY from stock_daily (defaults to 1.0)."""
     try:
-        sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+        sk = "trade_date"
         a = pd.read_sql(f"SELECT trade_date,close FROM stock_daily WHERE ticker=? ORDER BY {sk}", conn, params=(tk.upper(),))
         s = pd.read_sql(f"SELECT trade_date,close FROM stock_daily WHERE ticker='SPY' ORDER BY {sk}", conn)
     except Exception:
@@ -16112,7 +16111,7 @@ def _next_day_plan(conn):
             typ = "call" if str(t["option_type"]).lower().startswith("c") else "put"
             K = float(t["strike"] or 0); qty = int(t["quantity"] or 0); exp = str(t["expiry"])
             dte = None
-            for fmt in ("%Y-%m-%d", "%m-%d-%Y"):
+            for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
                 try:
                     dte = (datetime.strptime(exp, fmt) - datetime.now()).days; break
                 except Exception:
@@ -16433,7 +16432,7 @@ def wrap_facts(conn, universe_cap=120):
         except Exception:
             rows = []
     if not rows:  # DB EOD fallback
-        sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+        sk = "trade_date"
         for t in tks:
             try:
                 c = pd.read_sql(f"SELECT close FROM stock_daily WHERE ticker=? ORDER BY {sk} DESC LIMIT 2",
@@ -16464,7 +16463,7 @@ def wrap_facts(conn, universe_cap=120):
             pass
 
     try:
-        sk = "substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2)"
+        sk = "trade_date_now"
         snap = conn.execute(f"SELECT trade_date_now FROM options_change ORDER BY {sk} DESC LIMIT 1").fetchone()
         if snap:
             d0 = snap[0]
@@ -17191,7 +17190,7 @@ def _plan_legs_for(conn, tk):
         typ = "call" if str(t["option_type"]).lower().startswith("c") else "put"
         K = float(t["strike"] or 0); qty = int(t["quantity"] or 0); exp = str(t["expiry"])
         dte = None
-        for fmt in ("%Y-%m-%d", "%m-%d-%Y"):
+        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
             try:
                 dte = (datetime.strptime(exp, fmt) - datetime.now()).days; break
             except Exception:
@@ -17211,7 +17210,7 @@ def _plan_legs_for(conn, tk):
 
 def _plan_price_hist(tk, n=40):
     """Last n daily closes for a ticker from stock_daily (oldest→newest)."""
-    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    sk = "trade_date"
     conn = get_conn()
     try:
         d = pd.read_sql(f"SELECT close FROM stock_daily WHERE ticker=? ORDER BY {sk} DESC LIMIT ?",
@@ -17311,7 +17310,7 @@ async def plan_chart_view(query, tk):
 
 def _beta_to_spy_bot(conn, tk, lookback=60):
     """Beta of a ticker vs SPY from stock_daily daily returns (or 1.0 fallback)."""
-    sk = "substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2)"
+    sk = "trade_date"
     try:
         a = pd.read_sql(f"SELECT trade_date,close FROM stock_daily WHERE ticker=? ORDER BY {sk}",
                         conn, params=(tk.upper(),))
@@ -17604,7 +17603,7 @@ def event_journal_log(conn, event_key, ticker=None, direction=None, note=""):
     if not ticker:
         return None
     px = _last_price(ticker)
-    today = datetime.now().strftime("%m-%d-%Y")
+    today = datetime.now().strftime("%Y-%m-%d")
     try:
         conn.execute(
             "INSERT INTO event_journal (event_key, ticker, direction, entry_price, entry_date, status, note)"
@@ -17730,7 +17729,7 @@ def bookmark_save(conn, kind, label, content):
     _setup_bookmarks(conn)
     try:
         conn.execute("INSERT INTO bookmarks (kind,label,content,created) VALUES (?,?,?,?)",
-                     (kind, label, content, datetime.now().strftime("%m-%d-%Y %H:%M")))
+                     (kind, label, content, datetime.now().strftime("%Y-%m-%d %H:%M")))
         conn.commit()
         return True
     except Exception:
@@ -17965,9 +17964,9 @@ def _fmt_squeeze_inline(sq):
 
 
 def _to_mdy(s):
-    for f in ("%Y-%m-%d", "%m-%d-%Y"):
+    for f in ("%Y-%m-%d", "%Y-%m-%d"):
         try:
-            return datetime.strptime(str(s)[:10], f).strftime("%m-%d-%Y")
+            return datetime.strptime(str(s)[:10], f).strftime("%Y-%m-%d")
         except ValueError:
             continue
     return None
@@ -18544,7 +18543,7 @@ def _oi_key_levels(ticker: str, conn, trade_date: str = None) -> dict:
         # Get latest trade date if not provided
         if not trade_date:
             r = pd.read_sql("""SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
-                ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+                ORDER BY trade_date_now DESC
                 LIMIT 1""", conn, params=(tk,))
             if r.empty: return {}
             trade_date = r["trade_date_now"].iloc[0]
@@ -18620,12 +18619,12 @@ def _compute_vanna_charm(ticker, conn, spot, want_exp=None):
     try:
         ld = pd.read_sql(
             "SELECT trade_date_now FROM options_change WHERE ticker=?"
-            " ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC LIMIT 1",
+            " ORDER BY trade_date_now DESC LIMIT 1",
             conn, params=(ticker,))
         if ld.empty:
             return out
         date_str = ld["trade_date_now"].iloc[0]
-        ref = datetime.strptime(date_str, "%m-%d-%Y").date()
+        ref = datetime.strptime(date_str, "%Y-%m-%d").date()
     except Exception:
         return out
     try:
@@ -18950,14 +18949,14 @@ async def momentum_command(update, ctx):
         conn.close()
     await update.message.reply_text(txt, parse_mode=H, reply_markup=_kb_momentum())
 
-_FOMC_DATES = ["01-28-2026", "03-18-2026", "04-29-2026", "06-17-2026",
-               "07-29-2026", "09-16-2026", "10-28-2026", "12-09-2026"]
+_FOMC_DATES = ["2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+               "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"]
 def _fomc_context():
     today = datetime.now().date()
     nxt = None
     for d in _FOMC_DATES:
         try:
-            dd = datetime.strptime(d, "%m-%d-%Y").date()
+            dd = datetime.strptime(d, "%Y-%m-%d").date()
         except Exception:
             continue
         if dd >= today:

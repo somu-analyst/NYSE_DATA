@@ -67,7 +67,7 @@ def yf_ticker_fix(ticker):
 
 
 def current_load_date():
-    return datetime.now().strftime("%m-%d-%Y")
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 def print_progress_bar(current, total, bar_length=50, prefix="Progress"):
@@ -651,7 +651,7 @@ def fetch_option_chain(ticker, company_name, asset_type, trade_day_str_db, trade
                     continue
 
                 # expiry_date as MM-DD-YYYY
-                expiry_mmddyyyy = datetime.strptime(exp, "%Y-%m-%d").strftime("%m-%d-%Y")
+                expiry_mmddyyyy = datetime.strptime(exp, "%Y-%m-%d").strftime("%Y-%m-%d")
                 calls['expiry_date'] = expiry_mmddyyyy
                 puts['expiry_date'] = expiry_mmddyyyy
 
@@ -682,7 +682,7 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
 
     print(f"Starting options chain collection (Yahoo, 1 ticker at a time) for {trade_day.strftime('%Y-%m-%d')}")
     trade_day_str_file = trade_day.strftime('%d%b%Y')   # for filenames
-    trade_day_str_db = trade_day.strftime('%m-%d-%Y')   # for DB/CSV
+    trade_day_str_db = trade_day.strftime('%Y-%m-%d')   # for DB/CSV
 
     # Checkpoint files for resume support
     checkpoint_json = os.path.join(US_CHARTS_DIR, f"Options_Strike_CallPut_{trade_day_str_file}_checkpoint.json")
@@ -777,9 +777,9 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
     # expiry_date already MM-DD-YYYY from fetch_option_chain; ensure consistent format
     df_final["expiry_date"] = pd.to_datetime(
         df_final["expiry_date"].astype(str),
-        format="%m-%d-%Y",
+        format="%Y-%m-%d",
         errors="coerce"
-    ).dt.strftime("%m-%d-%Y")
+    ).dt.strftime("%Y-%m-%d")
 
     cols = list(df_final.columns)
     first_cols = [c for c in ["ticker", "asset_type", "company_name"] if c in cols]
@@ -883,7 +883,7 @@ def compute_oi_vol_change(trade_day):
     """
     print(f"Computing open interest and volume changes for {trade_day.strftime('%Y-%m-%d')}...")
 
-    trade_date_now_db = trade_day.strftime("%m-%d-%Y")  # matches trade_date in options_daily
+    trade_date_now_db = trade_day.strftime("%Y-%m-%d")  # matches trade_date in options_daily
 
     conn = sqlite3.connect(DB_PATH)
 
@@ -947,11 +947,11 @@ def compute_oi_vol_change(trade_day):
     df_now['expiry_date'] = pd.to_datetime(
         df_now['expiry_date'].astype(str),
         errors='coerce'
-    ).dt.strftime("%m-%d-%Y")
+    ).dt.strftime("%Y-%m-%d")
     df_prev['expiry_date'] = pd.to_datetime(
         df_prev['expiry_date'].astype(str),
         errors='coerce'
-    ).dt.strftime("%m-%d-%Y")
+    ).dt.strftime("%Y-%m-%d")
 
     df_now['strike'] = pd.to_numeric(df_now['strike'], errors='coerce')
     df_prev['strike'] = pd.to_numeric(df_prev['strike'], errors='coerce')
@@ -1052,7 +1052,7 @@ def compute_oi_vol_change(trade_day):
 
 # ============= STOCK_DAILY (OHLC + PCR) =============
 def build_stock_daily(trade_day, all_tickers):
-    trade_day_str_db = trade_day.strftime("%m-%d-%Y")
+    trade_day_str_db = trade_day.strftime("%Y-%m-%d")
     print(f"Building stock_daily for {trade_day_str_db}...")
 
     session = curl_requests.Session(impersonate="chrome")

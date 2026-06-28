@@ -6,7 +6,7 @@ Track major events, earnings, dividends, OPEX, Federal announcements, etc.
 
 MARKET_EVENTS = {
     # February 2026
-    "02-09-2026": {
+    "2026-02-09": {
         "type": "Market Reversal",
         "severity": "CRITICAL",
         "description": "Significant market reversal - Fed signals",
@@ -15,21 +15,21 @@ MARKET_EVENTS = {
     },
     
     # January 2026
-    "01-28-2026": {
+    "2026-01-28": {
         "type": "Market Fall",
         "severity": "HIGH",
         "description": "January volatility spike",
         "impact": "Fear 80",
         "result": "⚠️ Partially blocked"
     },
-    "01-13-2026": {
+    "2026-01-13": {
         "type": "OPEX + Market Crash",
         "severity": "CRITICAL",
         "description": "Options expiration + market selloff",
         "impact": "Fear 100",
         "result": "✅ BLOCKED by fear filter"
     },
-    "01-07-2026": {
+    "2026-01-07": {
         "type": "Market Fall",
         "severity": "CRITICAL",
         "description": "Major market decline - Fed concerns",
@@ -38,14 +38,14 @@ MARKET_EVENTS = {
     },
     
     # December 2025
-    "12-22-2025": {
+    "2025-12-22": {
         "type": "Pre-holiday Volatility",
         "severity": "HIGH",
         "description": "Year-end market volatility before holidays",
         "impact": "Fear 100",
         "result": "✅ BLOCKED by fear filter"
     },
-    "12-19-2025": {
+    "2025-12-19": {
         "type": "Fed Decision",
         "severity": "HIGH",
         "description": "Federal Reserve interest rate decision",
@@ -54,7 +54,7 @@ MARKET_EVENTS = {
     },
     
     # Major Earnings Dates (Sample)
-    "02-24-2026": {
+    "2026-02-24": {
         "type": "Earnings Week",
         "severity": "MEDIUM",
         "description": "Multiple S&P 500 companies reporting earnings",
@@ -62,7 +62,7 @@ MARKET_EVENTS = {
         "impact": "Potential volatility",
         "result": "Monitor IV"
     },
-    "02-27-2026": {
+    "2026-02-27": {
         "type": "Jobs Report",
         "severity": "HIGH",
         "description": "Non-farm payroll employment data",
@@ -71,7 +71,7 @@ MARKET_EVENTS = {
     },
     
     # Dividends
-    "02-15-2026": {
+    "2026-02-15": {
         "type": "Dividend Payment",
         "severity": "LOW",
         "description": "SPY dividend payment date (ex-div: 02-13)",
@@ -84,7 +84,7 @@ MARKET_EVENTS = {
 FEAR_FILTER_SUCCESS = {
     "blocked_days": [
         {
-            "date": "12-22-2025",
+            "date": "2025-12-22",
             "fear": 100,
             "reason": "Pre-holiday volatility",
             "market_action": "Volatile close",
@@ -92,7 +92,7 @@ FEAR_FILTER_SUCCESS = {
             "avoided_loss": "$2,847"
         },
         {
-            "date": "01-07-2025",
+            "date": "2025-01-07",
             "fear": 100,
             "reason": "Market fall detected",
             "market_action": "-2.3% SPY decline",
@@ -100,7 +100,7 @@ FEAR_FILTER_SUCCESS = {
             "avoided_loss": "$1,520"
         },
         {
-            "date": "01-13-2026",
+            "date": "2026-01-13",
             "fear": 100,
             "reason": "OPEX + market crash",
             "market_action": "-1.8% market decline",
@@ -108,7 +108,7 @@ FEAR_FILTER_SUCCESS = {
             "avoided_loss": "$3,200"
         },
         {
-            "date": "01-14-2026",
+            "date": "2026-01-14",
             "fear": 95,
             "reason": "Continued volatility",
             "market_action": "Volatile range",
@@ -116,7 +116,7 @@ FEAR_FILTER_SUCCESS = {
             "avoided_loss": "$980"
         },
         {
-            "date": "02-09-2026",
+            "date": "2026-02-09",
             "fear": 100,
             "reason": "Market reversal signal",
             "market_action": "-2.1% decline",

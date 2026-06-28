@@ -120,7 +120,7 @@ def _latest_date(ticker: str) -> str:
     try:
         r = conn.execute(
             """SELECT trade_date_now FROM options_change WHERE ticker=?
-               ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+               ORDER BY trade_date_now DESC
                LIMIT 1""",
             (ticker.upper(),),
         ).fetchone()
@@ -134,9 +134,9 @@ def _prev_date(ticker: str, ref_date: str) -> str:
     try:
         r = conn.execute(
             """SELECT DISTINCT trade_date_now FROM options_change WHERE ticker=?
-               AND substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2)
-                 < substr(?,7,4)||substr(?,1,2)||substr(?,4,2)
-               ORDER BY substr(trade_date_now,7,4)||substr(trade_date_now,1,2)||substr(trade_date_now,4,2) DESC
+               AND trade_date_now
+                 < ?
+               ORDER BY trade_date_now DESC
                LIMIT 1""",
             (ticker.upper(), ref_date, ref_date, ref_date),
         ).fetchone()
@@ -213,7 +213,7 @@ def _oi_signal_verdict(ticker: str, today_date: str, prev_date: str) -> str:
             conn, params=(ticker.upper(), prev_date))
         sd = pd.read_sql(
             "SELECT close FROM stock_daily WHERE ticker=? "
-            "ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+            "ORDER BY trade_date DESC LIMIT 1",
             conn, params=(ticker.upper(),))
         kl = _oi_key_levels(ticker.upper(), conn)
         conn.close()
@@ -392,7 +392,7 @@ def _oi_strike_breakdown_data(ticker: str, date: str) -> dict:
         )
         sd = pd.read_sql(
             "SELECT close FROM stock_daily WHERE ticker=? "
-            "ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC LIMIT 1",
+            "ORDER BY trade_date DESC LIMIT 1",
             conn, params=(ticker.upper(),),
         )
         kl = _oi_key_levels(ticker.upper(), conn)
@@ -557,7 +557,7 @@ def _market_overview_data() -> str:
             """SELECT trade_date, bull_score, bear_score,
                       call_notional_oi, put_notional_oi, avg_spot
                FROM us_analytics_daily
-               ORDER BY substr(trade_date,7,4)||substr(trade_date,1,2)||substr(trade_date,4,2) DESC
+               ORDER BY trade_date DESC
                LIMIT 5""",
             conn,
         )

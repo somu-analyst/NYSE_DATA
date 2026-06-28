@@ -60,8 +60,8 @@ class AbnormalActivityDetector:
         conn.close()
         
         # Calculate days to expiry
-        df['expiry_date'] = pd.to_datetime(df['expiry_date'], format='%m-%d-%Y', errors='coerce')
-        trade_dt = pd.to_datetime(trade_date, format='%m-%d-%Y')
+        df['expiry_date'] = pd.to_datetime(df['expiry_date'], format='%Y-%m-%d', errors='coerce')
+        trade_dt = pd.to_datetime(trade_date, format='%Y-%m-%d')
         df['days_to_expiry'] = (df['expiry_date'] - trade_dt).dt.days
         
         return df

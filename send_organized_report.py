@@ -308,8 +308,8 @@ def get_options_flow_table():
         # Convert date to MM-DD-YYYY format
         from datetime import datetime
         try:
-            date_obj = datetime.strptime(latest_date, '%m-%d-%Y')
-            display_date = date_obj.strftime('%m-%d-%Y')
+            date_obj = datetime.strptime(latest_date, '%Y-%m-%d')
+            display_date = date_obj.strftime('%Y-%m-%d')
         except:
             display_date = latest_date
         

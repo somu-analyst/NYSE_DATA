@@ -660,7 +660,7 @@ def render_market_header():
     """Render sticky market context header with fear metrics and upcoming events"""
     try:
         # Get fear score for today
-        today_str = datetime.now().strftime("%m-%d-%Y")
+        today_str = datetime.now().strftime("%Y-%m-%d")
         fear_data = pd.read_sql("""
             SELECT pct_change_OI_Put FROM options_change 
             WHERE ticker = 'SPY' AND trade_date_now = ?
@@ -799,7 +799,7 @@ with st.sidebar:
 
         # Today's events
 
-        today_str = datetime.now().strftime("%m-%d-%Y")
+        today_str = datetime.now().strftime("%Y-%m-%d")
 
         today_event = get_events_for_date(today_str)
 
@@ -983,7 +983,7 @@ with col_date:
             conn
         )
         if not available_dates.empty:
-            available_dates['trade_date_now'] = pd.to_datetime(available_dates['trade_date_now'], format='%m-%d-%Y')
+            available_dates['trade_date_now'] = pd.to_datetime(available_dates['trade_date_now'], format='%Y-%m-%d')
             latest_date = available_dates['trade_date_now'].max()
             min_date = available_dates['trade_date_now'].min()
             
@@ -996,11 +996,11 @@ with col_date:
             )
             
             # Store in session state for use across tabs
-            st.session_state['selected_global_date'] = selected_global_date.strftime('%m-%d-%Y')
+            st.session_state['selected_global_date'] = selected_global_date.strftime('%Y-%m-%d')
         else:
-            st.session_state['selected_global_date'] = datetime.now().strftime('%m-%d-%Y')
+            st.session_state['selected_global_date'] = datetime.now().strftime('%Y-%m-%d')
     except:
-        st.session_state['selected_global_date'] = datetime.now().strftime('%m-%d-%Y')
+        st.session_state['selected_global_date'] = datetime.now().strftime('%Y-%m-%d')
 
 st.markdown("---")
 
@@ -3241,7 +3241,7 @@ elif selected_tab == "⚠️ Unusual Activity":
 
         if not available_dates.empty:
 
-            available_dates['trade_date_now'] = pd.to_datetime(available_dates['trade_date_now'], format='%m-%d-%Y')
+            available_dates['trade_date_now'] = pd.to_datetime(available_dates['trade_date_now'], format='%Y-%m-%d')
 
             latest_date = available_dates['trade_date_now'].max()
 
@@ -3255,7 +3255,7 @@ elif selected_tab == "⚠️ Unusual Activity":
 
                 try:
 
-                    default_date = datetime.strptime(st.session_state['selected_global_date'], '%m-%d-%Y').date()
+                    default_date = datetime.strptime(st.session_state['selected_global_date'], '%Y-%m-%d').date()
 
                 except:
 
@@ -3299,7 +3299,7 @@ elif selected_tab == "⚠️ Unusual Activity":
 
             # Convert to string format
 
-            selected_date_str = selected_date.strftime('%m-%d-%Y')
+            selected_date_str = selected_date.strftime('%Y-%m-%d')
 
             
 
@@ -3317,7 +3317,7 @@ elif selected_tab == "⚠️ Unusual Activity":
 
                 selected_date = closest_date
 
-                selected_date_str = selected_date.strftime('%m-%d-%Y')
+                selected_date_str = selected_date.strftime('%Y-%m-%d')
 
         else:
 
@@ -3493,11 +3493,11 @@ elif selected_tab == "⚠️ Unusual Activity":
 
                     with st.spinner("Checking how signals performed..."):
 
-                        signal_date = pd.to_datetime(selected_date_str, format='%m-%d-%Y')
+                        signal_date = pd.to_datetime(selected_date_str, format='%Y-%m-%d')
 
-                        next_day = (signal_date + timedelta(days=1)).strftime('%m-%d-%Y')
+                        next_day = (signal_date + timedelta(days=1)).strftime('%Y-%m-%d')
 
-                        future_date = (signal_date + timedelta(days=7)).strftime('%m-%d-%Y')
+                        future_date = (signal_date + timedelta(days=7)).strftime('%Y-%m-%d')
 
                         
 
@@ -4414,9 +4414,9 @@ elif selected_tab == "🎯 Options Flow Alerts":
 
     
     # Use the global date from header
-    analysis_date_str = st.session_state.get('selected_global_date', datetime.now().strftime('%m-%d-%Y'))
-    analysis_date = datetime.strptime(analysis_date_str, '%m-%d-%Y')
-    next_day_str = (analysis_date + timedelta(days=1)).strftime("%m-%d-%Y")
+    analysis_date_str = st.session_state.get('selected_global_date', datetime.now().strftime('%Y-%m-%d'))
+    analysis_date = datetime.strptime(analysis_date_str, '%Y-%m-%d')
+    next_day_str = (analysis_date + timedelta(days=1)).strftime("%Y-%m-%d")
     
     # Display the selected date info
     col1, col2, col3 = st.columns([3, 1, 1])
@@ -5509,7 +5509,7 @@ elif selected_tab == "📍 Selling Tracker":
 
         sample_exits = pd.DataFrame({
 
-            'Date': ['02-20-2026', '02-19-2026', '02-18-2026', '02-17-2026'],
+            'Date': ['2026-02-20', '2026-02-19', '2026-02-18', '2026-02-17'],
 
             'Ticker': ['SPY', 'QQQ', 'TSLA', 'SPY'],
 
