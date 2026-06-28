@@ -11,6 +11,7 @@
 - Git: commit to `main` directly (no feature branches) only when asked.
 
 ## 🧭 Working method (think → act, save tokens)
+<!-- Condensed; full long-form detail in .claude/rules/workflow.md (loads contextually). -->
 - **Graph first:** if `graphify-out/GRAPH_REPORT.md` exists, read it before `Glob`/`Grep` to locate god-files, subsystems, and reusable code. If absent, generate it via `/graphify` (or `graphifyy` CLI) — don't assume a graph exists.
 - **Think before coding:** restate the task in one line, weigh ≤2 approaches and pick the simplest, state assumptions, make surgical/local edits, define how you'll verify, and stop to ask when genuinely confused.
 - **Token-aware:** usage is tracked (ccusage / claude-monitor). Prefer short, file-scoped spec-style prompts; avoid re-running expensive scans/builds; reuse cached context; disable unused tools/MCP servers; for big jobs outline the plan + token impact before staging.
