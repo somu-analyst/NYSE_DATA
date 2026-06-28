@@ -31,8 +31,21 @@
 ## 🗺️ Repo map
 - **Entrypoints:** `telegram_bot_optimized.py` (bot) · `dashboard.py` (Streamlit) · `run_all_offhours.py` (EOD scheduler) · `NSE.py` (separate India-market bot).
 - **Data layer:** `NYSE_YFin.py` (fetch/enrich → DB) · `NYSE_Telegram.py` (daily report + charts) · `eod_pipeline/` (config/db/providers/symbols/pipeline modular fetch).
-- **`_lib/` (imported by bot & reports):** event writeups (`event_writeup_engine`, `event_writeup_bot_hooks`) · news (`market_news_aggregator`, `market_news_enhanced`, `news_and_earnings`, `market_events_db`) · flow/positions (`options_flow_detector`, `options_tracker`, `portfolio_analytics`, `abnormal_activity_detector`, `abnormal_detector`) · misc (`asset_classifier`, `schema_adapter`, `suggestion_engine`, `tax_calculator`, `telegram_rich_formatter`).
 - **Aux scripts:** `send_organized_report.py` (organized report sender; uses `_lib` + event-writeup helpers) · `build_optimized.py` (bot builder) · `bot_optimized.py` / `streamlit_dashboard.py` (launchers) · `run_event_writeups.py`.
+
+### `_lib/` modules (one-liners — find the file before grepping the bot)
+- `event_writeup_engine` — automated pre/post-market event narratives (macro releases, earnings, intraday regime breaks). `event_writeup_bot_hooks` — Telegram scheduling hooks (ET times) for those writeups.
+- `market_events_db` — store/track major events: earnings, dividends, OPEX, Fed. `news_and_earnings` — Finnhub news/earnings/dividends/events.
+- `market_news_aggregator` — news+data across stocks/indices/commodities/FX/crypto. `market_news_enhanced` — premium-source news with links.
+- `options_flow_detector` — rule-based institutional-repositioning detector. `abnormal_activity_detector` — unusual options vol/OI spikes. `abnormal_detector` — monitors open positions for adverse price/options moves.
+- `options_tracker` — trade entry/exit, Greeks, risk mgmt (portfolio core). `portfolio_analytics` — XIRR, allocation, sector, benchmark. `suggestion_engine` — hold/buy/sell/exit recs. `tax_calculator` — cap gains/losses, wash sales, liability.
+- `asset_classifier` — Stock/ETF/Index classification. `schema_adapter` — normalize `options_daily` schema for analytics modules. `telegram_rich_formatter` — rich options-flow alert formatting.
+
+### Bot commands (registered in `telegram_bot_optimized.py`)
+- `/start` `/menu` entry + command list · `/gex` signed GEX profile (walls, zero-gamma flip) · `/vanna` vanna exposure · `/opex` OPEX / max pain · `/regime` market regime (VIX term structure) · `/squeeze` squeeze scan.
+- Scanners: `/spreads` · `/wheel` (CSP) · `/hiprob` high-prob ensemble · `/momentum` momentum ranks.
+- Narratives/data: `/wrap` market wrap · `/briefing` daily briefing · `/macro` macro (BLS+yields) · `/earnings` earnings/news · `/event` event writeup · `/logevent` add event.
+- Tools: `/plan` trade planner · `/journal` trade/event journal · `/bookmarks` saved items · `/tv` TradingView chart bridge.
 
 ## Tables (Telegram) — ALWAYS use the shared helper
 - `_pipe_table(headers, rows, right_cols=None, title=None, legend=None)` → Excel-style `<pre>`, **emoji/width-aware** (`_disp_w`: emoji/CJK=2) so columns align at the same index. `title` (bold+stars) and `legend` (italic key) render OUTSIDE `<pre>`.
@@ -60,6 +73,14 @@
 - Gamma Walls: call+put OI ≥ 2× mean OI · Max Pain: min Σ ITM loss per expiry
 - Put Skew: skip expiries where call < $0.50 · VIX/VIX3M >1.05 BACKWARDATION, <0.95 CONTANGO
 - Spreads score = 0.40·POP + 0.25·R/R + 0.20·cushion + 0.15·liquidity; drop legs `maxp/maxl≤0.05`, credit `net/width<0.05`, `rr<0.10`. NaN IV is truthy → guard `not (iv>0)`.
+
+## 🔬 Signal validation ("test" = prove it would've been right)
+Running ≠ tested. To validate a signal, backtest it against DB history and report hit-rate + avg forward return, not just "no crash."
+1. **Pull historical fires** of the signal from `options_change`/`stock_daily` (or recompute it per past `trade_date`). Date sort key: `substr(d,7,4)||substr(d,1,2)||substr(d,4,2)` (dates are `MM-DD-YYYY`).
+2. **Join forward return:** for each fire on day *t*, get `stock_daily.close` at *t+N* (N≈3/5/10) for the same ticker → `fwd_ret = close_{t+N}/close_t - 1`.
+3. **Score by bucket:** hit-rate = % of fires where `sign(fwd_ret)` matches the call (LONG→up); also avg `fwd_ret`. Compare vs the unconditional baseline over the same window.
+4. **Persist** results to `signal_accuracy` and let adaptive weights flow to `signal_weights` (the ensemble reads these).
+5. **Report** as a `_pipe_table` (signal · N · hit% · avg fwd · vs base). Flag thin samples — current ~6-mo hit-rates are weak/low-N, so don't over-claim.
 
 ## Streamlit caching
 - `@st.cache_data(ttl=60)` yfinance: `_cached_history/_cached_price/load_oi_for_date/load_stock_daily`; `ttl=30` `_cached_trades`. Auto-close OPEN trades where expiry < today on portfolio load.

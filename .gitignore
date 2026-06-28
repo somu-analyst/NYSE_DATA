@@ -233,7 +233,9 @@ logs/
 
 # IDE and workspace settings
 .vscode/
-.claude/
+.claude/*
+!.claude/rules/
+!.claude/rules/**
 *.code-workspace
 
 # Misc runtime
