@@ -28,7 +28,7 @@
 - **Dashboard:** `streamlit run dashboard.py`.
 - **EOD pipeline:** `run_all_offhours.py` = NY-time-gated scheduler (pre-mkt 00:00–09:00 → prev trading day; post-close 17:00+ → today; keeps Windows awake). Launches JOB1 `NYSE_YFin.py` (yfinance/curl_cffi fetch → writes `US_data.db`) then JOB2 `NYSE_Telegram.py` (OI/price/vol PNGs + Excel + send). Newer modular path: `eod_pipeline/` via `run_eod_pipeline.py`.
 - **Tests:** `pytest tests/` (`test_formatting`, `test_sanitize`, `test_event_writeup`, `test_core`). Plus "test" = validate signal correctness vs DB history (see Efficiency rules).
-- **Parallel `core/`:** clean, read-only, importable analytics — never touches the bot. `python -m core.validate --ticker SPY` backtests a signal (hit-rate vs baseline); see `core/README.md`. Port pure logic here one function at a time.
+- **Parallel `core/`:** clean, read-only, importable analytics — never touches the bot. `python -m core.validate --ticker SPY --signal mean_reversion` backtests any registered signal (hit-rate vs baseline); `python -m core.gex --ticker SPY --spot <px>` = signed GEX/walls/zero-gamma (pure port of `_compute_gex`, scipy-free via `core.options_math`). See `core/README.md`. Port pure logic here one function at a time.
 - **Slash commands** (`.claude/commands/`): `/validate-signal [ticker]` · `/usage [daily|weekly|monthly]` (ccusage) · `/build-bot` · `/map <feature>` · `/recap`.
 
 ## 🗺️ Repo map

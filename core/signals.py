@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from core.registry import register
+
 
 def zscore(s: pd.Series, lookback: int = 20) -> pd.Series:
     """Trailing rolling z-score over `lookback` rows (population std)."""
@@ -16,6 +18,7 @@ def zscore(s: pd.Series, lookback: int = 20) -> pd.Series:
     return (s - mean) / std.replace(0, pd.NA)
 
 
+@register("mean_reversion")
 def mean_reversion_composite(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
     """1.5*PCR_z - Price_z - NetOI_z. Expects columns: pcr_oi, close, net_oi.
 

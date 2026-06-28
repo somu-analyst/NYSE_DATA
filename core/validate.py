@@ -16,6 +16,7 @@ import argparse
 
 import pandas as pd
 
+from core import registry, signals  # noqa: F401  (import registers signals)
 from core.db import get_conn
 from core.dates import sort_key
 from core.signals import mean_reversion_composite
@@ -41,10 +42,11 @@ def load_features(conn, ticker: str) -> pd.DataFrame:
     return df
 
 
-def backtest(df: pd.DataFrame, lookback: int = 20, horizon: int = 5,
+def backtest(df: pd.DataFrame, signal_fn=None, lookback: int = 20, horizon: int = 5,
              threshold: float = 3.0) -> tuple[dict, pd.DataFrame]:
     df = df.copy()
-    df["composite"] = mean_reversion_composite(df, lookback)
+    signal_fn = signal_fn or mean_reversion_composite
+    df["composite"] = signal_fn(df, lookback)
     df["fwd_ret"] = df["close"].shift(-horizon) / df["close"] - 1.0
     valid = df.dropna(subset=["composite", "fwd_ret"])
     fires = valid[valid["composite"] >= threshold]
@@ -67,12 +69,15 @@ def _fmt_pct(x: float, signed: bool = False) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Backtest the mean-reversion signal vs DB history.")
+    ap = argparse.ArgumentParser(description="Backtest a registered signal vs DB history.")
     ap.add_argument("--ticker", default="SPY")
+    ap.add_argument("--signal", default="mean_reversion", help=f"one of: {', '.join(registry.names())}")
     ap.add_argument("--lookback", type=int, default=20)
     ap.add_argument("--horizon", type=int, default=5)
     ap.add_argument("--threshold", type=float, default=3.0)
     args = ap.parse_args()
+
+    signal_fn = registry.get(args.signal)
 
     with get_conn() as conn:
         df = load_features(conn, args.ticker)
@@ -81,10 +86,10 @@ def main() -> None:
         print(f"No stock_daily rows for {args.ticker}")
         return
 
-    res, _ = backtest(df, args.lookback, args.horizon, args.threshold)
+    res, _ = backtest(df, signal_fn, args.lookback, args.horizon, args.threshold)
     edge = (res["hit_rate"] - res["baseline_up_rate"]) if res["n_fires"] else float("nan")
 
-    print(f"\nMean-Reversion composite (>= {args.threshold} -> LONG)")
+    print(f"\nSignal '{args.signal}' (>= {args.threshold} -> LONG)")
     print(f"{args.ticker} | lookback {args.lookback}d | horizon {args.horizon}d\n")
     print(f"  days evaluated   : {res['n_days']}")
     print(f"  signal fires     : {res['n_fires']}")
