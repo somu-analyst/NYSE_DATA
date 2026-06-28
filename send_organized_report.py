@@ -596,8 +596,8 @@ def get_important_events():
         report += "```\n\n"
         
         # ========== LAST WEEK EVENTS ==========
-        from economic_data_tracker import get_recent_economic_releases
-        
+        from event_writeup_engine import get_recent_economic_releases
+
         recent_releases = get_recent_economic_releases()
         
         if recent_releases:

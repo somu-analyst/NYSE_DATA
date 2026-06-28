@@ -1933,28 +1933,61 @@ def mono(text):
     return f"<pre>{text}</pre>"
 
 
-def _pipe_table(header_cols, rows_data, right_cols=None, title=None):
-    """NSE allinone-style table in <pre>.
-    Format (matches Live PCR bot):
-      header1     | header2  | header3
-      ------------|----------|--------
-      val1        | val2     | val3
-    All text is html.escape()-safe (no HTML tags inside).
-    right_cols = set of column indices to right-align."""
+def _disp_w(s):
+    """Display width of a string in Telegram's monospace <pre>.
+    Emoji & CJK/full-width glyphs render ~2 cells wide; variation selectors &
+    combining marks render 0. Counting these correctly is what keeps columns
+    starting at the same index (Excel-style) even when cells contain emoji."""
+    import unicodedata as _ud
+    w = 0
+    for ch in str(s):
+        o = ord(ch)
+        if 0xFE00 <= o <= 0xFE0F or 0x0300 <= o <= 0x036F or o == 0x200D:
+            continue  # variation selector / combining mark / zero-width joiner
+        if (0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF or 0x2B00 <= o <= 0x2BFF
+                or 0x1F1E6 <= o <= 0x1F1FF or o in (0x2190, 0x2191, 0x2192, 0x2193,
+                0x25B2, 0x25BC, 0x25C6, 0x2705, 0x274C, 0x26A0, 0x2B50)
+                or _ud.east_asian_width(ch) in ("W", "F")):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _pipe_table(header_cols, rows_data, right_cols=None, title=None, legend=None):
+    """Excel-style fixed-width table in <pre> — columns align at the same index.
+
+    Best practices baked in (Telegram <pre> = monospace):
+      • width is measured in DISPLAY cells (emoji/CJK = 2) so emoji never shift columns
+      • header + data share identical column widths -> headers line up over their values
+      • `right_cols` right-aligns numeric columns; everything else left-aligns
+      • `title` (bold w/ stars/emoji) and `legend` (italic key) render OUTSIDE <pre>
+        so they aren't squished by the monospace grid
+    Keep status emoji in column 0 (uniform GRN/RED/YEL family) for the cleanest look.
+    """
     import html as _html
     right_cols = right_cols or set()
+    n = len(header_cols)
     all_rows = [list(header_cols)] + [list(r) for r in rows_data]
-    widths = [max(len(str(r[c])) for r in all_rows) for c in range(len(header_cols))]
+    widths = [max(_disp_w(r[c]) for r in all_rows) for c in range(n)]
+
+    def _pad(v, c):
+        s = str(v)
+        gap = " " * max(0, widths[c] - _disp_w(s))
+        return (gap + s) if c in right_cols else (s + gap)
+
     def _fmt(r):
-        cells = [f"{str(r[c]):>{widths[c]}}" if c in right_cols
-                 else f"{str(r[c]):<{widths[c]}}" for c in range(len(widths))]
-        return " | ".join(cells)
+        return " | ".join(_pad(r[c], c) for c in range(n))
+
     sep = "-+-".join("-" * w for w in widths)
-    lines = []
+    body = "<pre>" + _html.escape("\n".join([_fmt(header_cols), sep] + [_fmt(r) for r in rows_data])) + "</pre>"
+    out = []
     if title:
-        lines.append(title)
-    lines += [_fmt(header_cols), sep] + [_fmt(r) for r in rows_data]
-    return "<pre>" + _html.escape("\n".join(lines)) + "</pre>"
+        out.append(f"<b>{title}</b>")
+    out.append(body)
+    if legend:
+        out.append(f"<i>{legend}</i>")
+    return "\n".join(out)
 
 
 
@@ -10113,6 +10146,40 @@ def _format_trade_signal(rec: dict, direction: str) -> str:
         ])
 
 
+def _scanner_table(records, direction):
+    """Excel-style fixed-width table of scanner picks (keeps every field, scrolls like a sheet)."""
+    rows = []
+    for r in records:
+        close = r["close"]; atr = r.get("atr", close * 0.02)
+        r5 = r.get("ret_5d", 0); r10 = r.get("ret_10d", 0); r20 = r.get("ret_20d", 0)
+        vr = r.get("vol_rat", 1.0); pcr = r.get("pcr", 1.0)
+        l20 = r.get("low_20d", close); h20 = r.get("high_20d", close)
+        ss = _signal_strength(r, direction)
+        if direction == "BULL":
+            cons = r.get("consec_up", 0)
+            stop = round(max(close - atr * 1.8, l20 * 0.99), 2)
+            t1 = round(close + atr * 2.0, 2); t2 = round(close + atr * 4.5, 2)
+            entry = f"{close-atr*0.3:.1f}-{close+atr*0.2:.1f}"
+            rr = (t1 - close) / max(close - stop, 0.01)
+            hedge = f"B{close*0.97:.0f}p/S{stop*0.97:.0f}p"
+            tag = "UNSTOP" if r5 > 15 else ("RUNNER" if r5 > 7 else "BUILD")
+        else:
+            cons = r.get("consec_dn", 0)
+            stop = round(min(close + atr * 1.8, h20 * 1.01), 2)
+            t1 = round(close - atr * 2.0, 2); t2 = round(close - atr * 4.5, 2)
+            entry = f"{close-atr*0.2:.1f}-{close+atr*0.3:.1f}"
+            rr = (close - t1) / max(stop - close, 0.01)
+            hedge = f"B{close*1.03:.0f}c/S{stop*1.01:.0f}c"
+            tag = "KNIFE" if r5 < -15 else ("BRKDN" if r5 < -7 else "WEAK")
+        rows.append((r["ticker"], f"{close:.2f}", tag, str(ss), f"{r5:+.0f}", f"{r10:+.0f}",
+                     f"{r20:+.0f}", f"{vr:.1f}x", str(cons), f"{pcr:.2f}", f"{l20:.0f}",
+                     f"{h20:.0f}", entry, f"{stop:.2f}", f"1:{rr:.1f}", f"{t1:.2f}", f"{t2:.2f}", hedge))
+    hdr_cols = ("Tk", "Px", "Tag", "S", "5d", "10d", "20d", "Vol", "Cn", "PCR", "Lo", "Hi",
+                "Entry", "Stop", "RR", "T1", "T2", "Hedge")
+    return (_pipe_table(hdr_cols, rows, right_cols={1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 16})
+            + "\n<i>S=strength/10 · Cn=consec days · Vol=×avg · prices=$ · Hedge=spread ≥21DTE</i>")
+
+
 async def scanner_menu(query):
     """On-demand live momentum scanner from Telegram button."""
     _loading = await query.message.reply_text("🔍 Scanning 60+ tickers (~30s)...", parse_mode=H)
@@ -10131,14 +10198,12 @@ async def scanner_menu(query):
     parts.append("<i>Live data · 60+ tickers · yfinance</i>")
     if bull:
         parts.append(f"\n{'━'*28}\n🟢 <b>BULLS / UNSTOPPABLE ({len(bull)})</b>")
-        for rec in bull:
-            parts.append("\n" + _format_trade_signal(rec, "BULL"))
+        parts.append(_scanner_table(bull, "BULL"))
     else:
         parts.append("\n🟢 No strong bull momentum right now.")
     if bear:
         parts.append(f"\n{'━'*28}\n🔴 <b>BEARS / FALLING ({len(bear)})</b>")
-        for rec in bear:
-            parts.append("\n" + _format_trade_signal(rec, "BEAR"))
+        parts.append(_scanner_table(bear, "BEAR"))
     else:
         parts.append("\n🔴 No strong breakdown signals right now.")
     parts.append("\n<i>⚠️ Algo signals only — verify with OI + news before trading.</i>")
@@ -10456,12 +10521,10 @@ async def intraday_alert(ctx: ContextTypes.DEFAULT_TYPE):
             parts.append("🚀 <b>TOP MOMENTUM SIGNALS</b>")
         if _scan_bull:
             parts.append("🟢 <b>BULL RUNNERS</b>")
-            for _sr in _scan_bull:
-                parts.append(_format_trade_signal(_sr, "BULL"))
+            parts.append(_scanner_table(_scan_bull, "BULL"))
         if _scan_bear:
             parts.append("🔴 <b>FALLING / BREAKDOWN</b>")
-            for _sr in _scan_bear:
-                parts.append(_format_trade_signal(_sr, "BEAR"))
+            parts.append(_scanner_table(_scan_bear, "BEAR"))
         if _scan_bull or _scan_bear:
             parts.append("<i>⚠️ Algo signals — verify with OI + news before trading.</i>")
     except Exception as _se:

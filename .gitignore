@@ -241,3 +241,7 @@ deleted/
 bk/
 streamlit/
 _rewrite_portfolio.py
+ohlc_checkpoint.json
+run_all_offhours_last_ok.txt
+.kimchi/
+US_data-bk.db
