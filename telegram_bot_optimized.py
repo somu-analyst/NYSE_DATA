@@ -22353,7 +22353,7 @@ def _macro_keyless():
 
 
 _AV_MACRO_SERIES = [
-    ("REAL_GDP", "Real GDP", "&interval=annual", "$B"),
+    ("REAL_GDP", "Real GDP", "&interval=quarterly", "$B"),
     ("INFLATION", "Inflation", "", "%"),
     ("RETAIL_SALES", "Retail Sales", "", "$M"),
     ("DURABLES", "Durables", "", "$M"),
@@ -22387,7 +22387,7 @@ def _av_macro():
             d = _j.loads(_u.urlopen(url, timeout=12).read().decode())
             data = d.get("data", [])
             if data:
-                rows.append(f"{name:<13}{float(data[0]['value']):>12,.1f} {unit}"); ok = True
+                rows.append(f"{name:<13}{float(data[0]['value']):>12,.1f} {unit} ·{data[0].get('date','')[:7]}"); ok = True
             _t.sleep(1.3)
         except Exception:
             continue

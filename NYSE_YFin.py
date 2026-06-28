@@ -806,17 +806,12 @@ def merge_calls_puts_per_strike_parallel(trade_day, company_name_map, all_ticker
     if not df_daily.empty and "trade_date" in df_daily.columns:
         trade_date_db = df_daily["trade_date"].iloc[0]
         try:
-            conn.execute(f"DELETE FROM {TABLE_OPTIONS_RAW} WHERE trade_date = ?", (trade_date_db,))
-        except Exception:
-            pass
-        try:
             conn.execute(f"DELETE FROM {TABLE_OPTIONS} WHERE trade_date = ?", (trade_date_db,))
         except Exception:
             pass
         conn.commit()
 
-    df_raw.to_sql(TABLE_OPTIONS_RAW, conn, if_exists="append", index=False)
-    print(f"Appended {len(df_raw)} rows to {TABLE_OPTIONS_RAW}")
+    # options_raw retired: it was a strict subset of options_daily (no analytics consumer).
     df_daily.to_sql(TABLE_OPTIONS, conn, if_exists="append", index=False)
     print(f"Appended {len(df_daily)} rows to {TABLE_OPTIONS}")
 
