@@ -4,11 +4,20 @@
 ![Streamlit](https://img.shields.io/badge/Streamlit-web%20terminal-FF4B4B?logo=streamlit&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-bot-26A5E4?logo=telegram&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-US__data.db-003B57?logo=sqlite&logoColor=white)
+![tests](https://github.com/somu-analyst/NYSE_DATA/actions/workflows/tests.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Status](https://img.shields.io/badge/status-active-success)
 
 > An end-to-end **US options analytics platform** that turns raw NYSE/CBOE options-chain data into actionable, *explained* trade intelligence — delivered through both a **Streamlit web terminal** and a **Telegram bot**.
 
 Built on Open Interest flow, dealer gamma positioning, a 24-model signal ensemble, options-pricing math (Black–Scholes + Monte Carlo), and a forward-tested **signal-accuracy** layer that keeps every signal honest.
+
+> ⭐ **If this is useful, a star helps others find it.**
+
+### Why it's different
+- 🧠 **Explained, not black-box** — every verdict shows the *why* (OI intent, gamma regime, term structure), not just a number.
+- 🎯 **Adaptive accuracy** — each of 24 models is weighted by its *recent* forward hit-rate (logged in `signal_accuracy`), so what's been right lately counts for more.
+- 📱💻 **One engine, two surfaces** — the same analytics delivered to a Telegram bot *and* a Streamlit terminal.
 
 ---
 
@@ -202,8 +211,8 @@ The runtime is intentionally lean — only what the bot and the EOD data pull ac
 use lives in the root. Everything else (the parallel `core/` analytics package, test
 suite, original build source, and superseded apps) is kept under `archive/`.
 
-See **[architecture.md](architecture.md)** for component-level flowcharts (OI pipeline,
-EOD vs live views, async performance pattern, message-size handling).
+See **[docs/architecture.md](docs/architecture.md)** for component-level flowcharts (OI
+pipeline, EOD vs live views, async performance pattern, message-size handling).
 
 ---
 

@@ -223,4 +223,4 @@ If work may be continued in another model or tool:
 - If a task is likely to move between Claude, Gemini, or another agent, prefer a handoff-friendly
   structure over long chat-based context.
 
-(Templates for these files already exist at the repo root: `PLAN.md`, `LOG.md`, `NEXT.md`.)
+(Templates for these files live in `docs/`: `docs/PLAN.md`, `docs/LOG.md`, `docs/NEXT.md`.)
