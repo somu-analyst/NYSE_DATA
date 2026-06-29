@@ -193,6 +193,7 @@ The dashboard reads from `US_data.db`; the EOD/live ingestion scripts populate i
 ```
 NYSE_DATA/
 ├── telegram_bot_optimized.py    # ⭐ the running Telegram bot (edit directly)
+├── telegram_bot.py              # full bot source + shared signal engine (dashboard imports it)
 ├── dashboard.py                 # Streamlit web terminal (all pages + signal engine)
 ├── run_all_offhours.py          # EOD data-pull scheduler → NYSE_YFin + NYSE_Telegram
 ├── NYSE_YFin.py                 # fetch/enrich options + price → US_data.db

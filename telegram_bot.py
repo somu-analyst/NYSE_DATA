@@ -1,10 +1,11 @@
 # =============================================================================
-# ARCHIVED — ORIGINAL BUILD SOURCE (not in the runtime path)
+# telegram_bot.py — full bot source AND the shared SIGNAL ENGINE.
 # -----------------------------------------------------------------------------
-# This is the ORIGINAL, duplicate-laden bot source. The production bot,
-# telegram_bot_optimized.py, was generated from this file by build_optimized.py.
-# The runtime is telegram_bot_optimized.py — edit THAT directly.
-# Kept here for history/reference only (also imported by archive/tests/).
+# The Telegram runtime is telegram_bot_optimized.py (originally generated from
+# this file). BUT dashboard.py imports THIS module at runtime for the 24-model
+# engine (high_prob_signals_engine + model fns) — see dashboard.py ~L17050 — so
+# it MUST stay at the repo root. Edit Telegram runtime logic in
+# telegram_bot_optimized.py; keep engine functions the dashboard uses in sync here.
 # =============================================================================
 async def group_stock_detail(query, ticker):
     """Show all open option positions for a stock with per-leg advice (close vs keep)."""

@@ -3,7 +3,7 @@
 ## ⚡ Efficiency rules (read first — saves tokens / avoids limits)
 - **Canonical files:** `telegram_bot_optimized.py` (~23k lines, THE running bot) · `dashboard.py` (Streamlit). Edit these directly — no patch/helper scripts.
 - **NEVER read whole big files.** `telegram_bot_optimized.py`/`dashboard.py` are huge → use `Grep` to locate, then `Read` with `offset`/`limit`. Don't re-read a file you just edited.
-- `telegram_bot_optimized.py` is now the **sole** bot source — edit it directly. The original `telegram_bot.py` + `build_optimized.py` (rebuild path) are retired under `archive/`; only revive them for a full dedup rebuild.
+- `telegram_bot_optimized.py` = the Telegram runtime (edit directly). `telegram_bot.py` stays in root too — **`dashboard.py` imports it at runtime** for the 24-model engine (`high_prob_signals_engine`), so keep shared engine fns in sync. `build_optimized.py` (old rebuild path) is retired under `archive/`.
 - Dates are `MM-DD-YYYY` strings → sort with `substr(d,7,4)||substr(d,1,2)||substr(d,4,2)`.
 - `datetime.utcnow()` → `datetime.now(timezone.utc).replace(tzinfo=None)` (3.12+).
 - Dead/NULL cols: `vol_rank_call/put`, `money_coi_*`. SPY PCR can spike 11+ on expiry (not signal).
@@ -24,7 +24,7 @@
 
 ## ▶️ Run · build · test
 - **Bot (runtime):** `python telegram_bot_optimized.py` → `main()` (≈L23203) → `app.run_polling`; token from `token.txt`. This is the live process — edit it directly for runtime fixes.
-- **Rebuild (retired):** `telegram_bot_optimized.py` was originally generated from `telegram_bot.py` by `build_optimized.py` — both now in `archive/`. Edit `telegram_bot_optimized.py` directly; only revive the pair (run under WSL: `python3 archive/build_optimized.py`, after fixing its hardcoded `/mnt/c/...` paths) for a one-off full dedup rebuild.
+- **Rebuild (retired):** `telegram_bot_optimized.py` was originally generated from `telegram_bot.py` by `build_optimized.py` (now in `archive/`). Edit `telegram_bot_optimized.py` directly; only revive `archive/build_optimized.py` (run under WSL, fix its `/mnt/c/...` paths) for a one-off full dedup rebuild. Note `telegram_bot.py` itself stays in root (dashboard engine).
 - **Dashboard:** `streamlit run dashboard.py`.
 - **EOD pipeline:** `run_all_offhours.py` = NY-time-gated scheduler (pre-mkt 00:00–09:00 → prev trading day; post-close 17:00+ → today; keeps Windows awake). Launches JOB1 `NYSE_YFin.py` (yfinance/curl_cffi fetch → writes `US_data.db`) then JOB2 `NYSE_Telegram.py` (OI/price/vol PNGs + Excel + send).
 - **Tests / parallel `core/` / migrations:** moved to `archive/` (see below). Run from there, e.g. `cd archive && python -m core.validate --ticker SPY` or `pytest archive/tests/`.
@@ -32,7 +32,8 @@
 ## 🗺️ Repo map
 - **Entrypoints (root):** `telegram_bot_optimized.py` (bot) · `dashboard.py` (Streamlit, launched by bot) · `run_all_offhours.py` (EOD scheduler → `NYSE_YFin.py` + `NYSE_Telegram.py`).
 - **Data layer:** `NYSE_YFin.py` (fetch/enrich → DB) · `NYSE_Telegram.py` (daily report + charts).
-- **`archive/`** (not wired into the running bot): original build pair `telegram_bot.py` + `build_optimized.py`; duplicates/standalone `bot_optimized.py`, `streamlit_dashboard.py`, `send_organized_report.py`, `run_event_writeups.py`, `run_eod_pipeline.py`+`eod_pipeline/`, `NSE.py`; tools `core/`, `tests/`, `migrations/`; and `_lib/{abnormal_activity_detector,market_events_db,options_flow_detector,telegram_rich_formatter}`.
+- **Shared engine:** `telegram_bot.py` (root) — full bot source; `dashboard.py` imports it for the 24-model engine. `build_optimized.py` (the old builder) is the only half of the pair in `archive/`.
+- **`archive/`** (not wired into the running bot): `build_optimized.py`; duplicates/standalone `bot_optimized.py`, `streamlit_dashboard.py`, `send_organized_report.py`, `run_event_writeups.py`, `run_eod_pipeline.py`+`eod_pipeline/`, `NSE.py`; tools `core/`, `tests/`, `migrations/`; and `_lib/{abnormal_activity_detector,market_events_db,options_flow_detector,telegram_rich_formatter}`.
 
 ### `_lib/` modules (root — the 7 the bot actually loads)
 - `event_writeup_engine` — automated pre/post-market event narratives (macro releases, earnings, intraday regime breaks). `event_writeup_bot_hooks` — Telegram scheduling hooks (ET times) for those writeups.
