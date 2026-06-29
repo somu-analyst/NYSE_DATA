@@ -12528,11 +12528,16 @@ async def ai_chat_handler(update, context):
             parse_mode=H)
         return
 
-    # ── Build context: open positions ────────────────────────────
+    # ── Build context: open positions + live WAN-streamer signals ──
     pos_ctx = ""
+    wan_ctx = ""
     try:
         conn = get_conn()
         open_pos = pd.read_sql("SELECT * FROM trades WHERE status='OPEN' LIMIT 20", conn)
+        try:
+            wan_ctx = _wan_ai_context(_wan_get_snapshot(conn, _wan_spy_ret(conn)))
+        except Exception:
+            log.debug("wan ai-context failed", exc_info=True)
         conn.close()
         if not open_pos.empty:
             lines = []
@@ -12551,8 +12556,10 @@ async def ai_chat_handler(update, context):
         "You help the user understand options trading, risk management, greeks, strategies, and market analysis. "
         "Be concise (max 300 words), direct, and use simple language. "
         "Format for Telegram HTML: use <b>bold</b> for key terms. No markdown, only HTML tags. "
-        "If the user asks about their positions, use the context provided.\n\n"
-        + pos_ctx
+        "If the user asks about their positions or the bot's current signals, use the context provided. "
+        "When asked why a ticker is bullish/bearish, explain using the WAN-streamer signal context "
+        "(confidence, prob, vote counts, agreeing models) — do not invent numbers not in the context.\n\n"
+        + pos_ctx + ("\n\n" + wan_ctx if wan_ctx else "")
     )
 
     typing_msg = await update.message.reply_text("🤖 Thinking…")
@@ -23199,6 +23206,156 @@ async def vanna_view(query):
     await query.message.reply_text("\n\n".join(msgs), parse_mode=H, reply_markup=HUB_MENU_KB)
 
 
+# ── WAN-STREAMER ─────────────────────────────────────────────────
+# "Wide-Area Network" signal streamer: continuously polls the 24-model
+# ensemble across the watchlist and streams each newly-fired actionable
+# signal to Telegram. Deduped per calendar day via alert_dedup so each
+# distinct TICKER|SIGNAL|CONF fires at most once/day (survives restarts).
+WAN_STREAM_TICKERS = DEFAULT_TICKERS          # compact watchlist (engine reads DB only)
+WAN_MIN_PROB       = 70.0                     # don't stream low-conviction noise
+WAN_OK_CONF        = ("HIGH", "MEDIUM")       # confidence gate
+
+
+def _wan_scan(conn, spy_ret=0.0):
+    """Run the ensemble across WAN_STREAM_TICKERS; return actionable signals
+    (BULL/BEAR, conf in WAN_OK_CONF, prob >= WAN_MIN_PROB) sorted by prob desc.
+    Pure read of the DB — no network. Shared by the streamer job and /wan."""
+    out = []
+    for tk in WAN_STREAM_TICKERS:
+        try:
+            r = high_prob_signals_engine(tk, conn, spy_ret)
+        except Exception:
+            log.debug("wan scan failed for %s", tk, exc_info=True)
+            continue
+        if (r.get("signal") in ("BULL", "BEAR")
+                and r.get("conf") in WAN_OK_CONF
+                and float(r.get("prob", 0)) >= WAN_MIN_PROB):
+            out.append(r)
+    out.sort(key=lambda r: float(r.get("prob", 0)), reverse=True)
+    return out
+
+
+def _wan_spy_ret(conn):
+    """SPY 1-day return (%) for the ensemble market overlay; 0.0 on failure."""
+    try:
+        spy = pd.read_sql(
+            "SELECT close FROM stock_daily WHERE ticker='SPY'"
+            " ORDER BY trade_date DESC LIMIT 2", conn)
+        if len(spy) >= 2:
+            return (float(spy["close"].iloc[0]) / float(spy["close"].iloc[1]) - 1) * 100
+    except Exception:
+        log.debug("wan spy_ret failed", exc_info=True)
+    return 0.0
+
+
+# Shared snapshot cache — written by the streamer job / /wan, read by AI chat.
+_WAN_SNAPSHOT = {"ts": None, "signals": []}
+
+
+def _wan_get_snapshot(conn, spy_ret=0.0, max_age_sec=900):
+    """Return the cached actionable-signal snapshot, recomputing if stale/empty.
+    Keeps AI chat instant on warm cache; the streamer refreshes it every 15 min."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    ts = _WAN_SNAPSHOT["ts"]
+    if ts is not None and (now - ts).total_seconds() < max_age_sec:
+        return _WAN_SNAPSHOT["signals"]
+    sigs = _wan_scan(conn, spy_ret)
+    _WAN_SNAPSHOT["ts"] = now
+    _WAN_SNAPSHOT["signals"] = sigs
+    return sigs
+
+
+def _wan_ai_context(signals):
+    """Compact text summary of live signals for the AI chat system prompt,
+    incl. which models agree so the assistant can explain *why*."""
+    if not signals:
+        return "WAN-streamer: no actionable ensemble signals right now."
+    lines = ["Live WAN-streamer ensemble signals (the bot's current actionable setups):"]
+    for r in signals:
+        models = r.get("models", {}) or {}
+        agree = [n for n, m in models.items() if m.get("signal") == r["signal"]]
+        lines.append(
+            f"- {r['ticker']}: {r['signal']} ({r['conf']} conf), prob {float(r['prob']):.0f}%, "
+            f"spot ${r['spot']}. Strategy: {str(r.get('strategy',''))[:90]}. "
+            f"Bull votes {r.get('bull_v','?')}/{r.get('total_m','?')}, bear {r.get('bear_v','?')}. "
+            f"Models agreeing: {', '.join(agree[:8]) if agree else 'n/a'}.")
+    return "\n".join(lines)
+
+
+def _wan_table(rows):
+    """Render actionable signals as a uniform _pipe_table. Emoji in col 0."""
+    _hdrs = ("ST", "Tkr", "Dir", "Cf", "Pr%")
+    _data = []
+    for r in rows:
+        emoji = "🟢" if r["signal"] == "BULL" else "🔴"
+        cf    = "H" if r["conf"] == "HIGH" else "M"
+        _data.append((emoji, r["ticker"], r["signal"], cf, f"{float(r['prob']):.0f}"))
+    return _pipe_table(_hdrs, _data, right_cols={4},
+                       legend="🟢 bull · 🔴 bear · Cf H=high/M=med")
+
+
+async def wan_streamer_alert(ctx: ContextTypes.DEFAULT_TYPE):
+    """Streamer job: push newly-fired actionable ensemble signals to Telegram.
+    Market-hours / weekday gated. One alert per TICKER|SIGNAL|CONF per day."""
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    if now_utc.weekday() >= 5:
+        return
+    hour_min = now_utc.hour * 60 + now_utc.minute
+    if not (14 * 60 + 30 <= hour_min <= 21 * 60):
+        return
+
+    _, chat_id = load_creds()
+    conn = get_conn()
+    try:
+        _ensure_alert_dedup_table(conn)
+        spy_ret = _wan_spy_ret(conn)
+        # Force a fresh scan and refresh the shared cache for AI chat.
+        _WAN_SNAPSHOT["ts"] = None
+        signals = _wan_get_snapshot(conn, spy_ret)
+        today_str = (now_utc - timedelta(hours=5)).date().isoformat()
+        fresh = [r for r in signals
+                 if not _alert_already_sent(
+                     conn, today_str, f"{r['ticker']}|{r['signal']}|{r['conf']}", "wan_stream")]
+    except Exception as e:
+        log.warning(f"wan_streamer scan failed: {e}")
+        conn.close(); return
+    finally:
+        conn.close()
+
+    if not fresh:
+        return
+
+    now_et = now_utc - timedelta(hours=5)
+    parts = [hdr(f"📡 WAN-STREAMER · {now_et.strftime('%H:%M ET')}"),
+             f"<i>{len(fresh)} new signal(s)</i>",
+             _wan_table(fresh)]
+    try:
+        await ctx.bot.send_message(chat_id=int(chat_id), text="\n".join(parts), parse_mode=H)
+    except Exception as e:
+        log.warning(f"wan_streamer send failed: {e}")
+
+
+async def wan_command(update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/wan — on-demand snapshot of the current actionable signal stream
+    (ignores dedup; shows everything live)."""
+    msg = await update.message.reply_text("📡 Scanning watchlist…", parse_mode=H)
+    conn = get_conn()
+    try:
+        _WAN_SNAPSHOT["ts"] = None  # force fresh + refresh cache for AI chat
+        signals = _wan_get_snapshot(conn, _wan_spy_ret(conn))
+    except Exception as e:
+        await msg.edit_text(f"⚠️ WAN scan failed: {e}")
+        conn.close(); return
+    finally:
+        conn.close()
+
+    if not signals:
+        await msg.edit_text("📡 <b>WAN-STREAMER</b>\nNo actionable signals right now.", parse_mode=H)
+        return
+    parts = [hdr("📡 WAN-STREAMER · live"), _wan_table(signals)]
+    await msg.edit_text("\n".join(parts), parse_mode=H)
+
+
 def main():
     _acquire_lock()
     token, chat_id = load_creds()
@@ -23231,6 +23388,7 @@ def main():
     app.add_handler(CommandHandler("earnings", earnings_command))
     app.add_handler(CommandHandler("vanna", vanna_command))
     app.add_handler(CommandHandler("squeeze", squeeze_command))
+    app.add_handler(CommandHandler("wan", wan_command))
 
     # Button callbacks
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -23256,6 +23414,9 @@ def main():
         job_queue.run_repeating(position_alerts, interval=300, first=90)
         log.info("Scheduled 5-min smart position alerts")
         log.info("Scheduled 10-min position health monitor")
+        # WAN-streamer: 15-min ensemble signal stream (market-hours gated, daily dedup)
+        job_queue.run_repeating(wan_streamer_alert, interval=900, first=120)
+        log.info("Scheduled 15-min WAN-streamer ensemble signal stream")
 
         # Event writeup system — pre/post macro briefs + anomaly scan
         try:

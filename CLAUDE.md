@@ -46,6 +46,7 @@
 - Scanners: `/spreads` · `/wheel` (CSP) · `/hiprob` high-prob ensemble · `/momentum` momentum ranks.
 - Narratives/data: `/wrap` market wrap · `/briefing` daily briefing · `/macro` macro (BLS+yields) · `/earnings` earnings/news · `/event` event writeup · `/logevent` add event.
 - Tools: `/plan` trade planner · `/journal` trade/event journal · `/bookmarks` saved items · `/tv` TradingView chart bridge.
+- `/wan` WAN-streamer: live snapshot of actionable 24-model ensemble signals (BULL/BEAR, conf≥MED, prob≥70). Also runs as a 15-min `run_repeating` job (market-hours, daily dedup) that pushes new fires; its cached snapshot feeds `ai_chat_handler`, so plain-text questions like "why is NVDA bullish?" are answered with the live signal context.
 
 ## Tables (Telegram) — ALWAYS use the shared helper
 - `_pipe_table(headers, rows, right_cols=None, title=None, legend=None)` → Excel-style `<pre>`, **emoji/width-aware** (`_disp_w`: emoji/CJK=2) so columns align at the same index. `title` (bold+stars) and `legend` (italic key) render OUTSIDE `<pre>`.
