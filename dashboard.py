@@ -13102,8 +13102,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": _fm,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
                         "Prev Cls": (round(l["prev_close"], 2) if l.get("prev_close") else None),
-                        "Hi/Lo": (f"${l['day_hi']:.2f}/${l['day_lo']:.2f}" if l.get("day_hi") and l.get("day_lo") else "—"),
                         "Est Open": _ftopen_disp, "Day L–H": f"${_folo:.2f}–${_fohi:.2f}",
+                        "Hi/Lo": (f"${l['day_hi']:.2f}/${l['day_lo']:.2f}" if l.get("day_hi") and l.get("day_lo") else "—"),
                         "Close @": _fclimit, "Max P": _fmt_maxp(_flb), "Max L": _fmt_maxl(_flb),
                         "P&L %": round(_fpp), "P&L $": round(l["pnl"]), "Action": _faction,
                     })
@@ -13579,8 +13579,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": money,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
                         "Prev Cls": (round(l["prev_close"], 2) if l.get("prev_close") else None),
-                        "Hi/Lo": (f"${l['day_hi']:.2f}/${l['day_lo']:.2f}" if l.get("day_hi") and l.get("day_lo") else "—"),
                         "Est Open": _topen_disp, "Day L–H": f"${_olo:.2f}–${_ohi:.2f}",
+                        "Hi/Lo": (f"${l['day_hi']:.2f}/${l['day_lo']:.2f}" if l.get("day_hi") and l.get("day_lo") else "—"),
                         "Close @": _climit, "Max P": _fmt_maxp(_lb), "Max L": _fmt_maxl(_lb),
                         "P&L %": round(pnl_pct), "P&L $": round(l["pnl"]), "Action": action,
                     })
