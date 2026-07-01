@@ -2221,7 +2221,7 @@ def _oi_idea_metrics(conn, ticker, strike, direction, spot, r=0.045):
     cand = []
     for _, rr in rows.iterrows():
         ed = None
-        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
             try:
                 ed = datetime.strptime(str(rr["expiry_date"]), fmt); break
             except Exception:
@@ -2285,7 +2285,7 @@ def _backtest_oi_conviction(ticker, lookback=7, hold_days=5, min_conv=6, max_ide
         return {"n": 0, "error": "not enough history"}, pd.DataFrame()
 
     def _parse(d):
-        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
             try:
                 return datetime.strptime(str(d), fmt)
             except Exception:
@@ -2863,7 +2863,7 @@ def _gp_oi_analytics(tk, spot):
 
     # ── across-strike: biggest ΔOI strikes (front-most expiry only) ──
     def _exp_key(s):
-        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
             try:
                 return datetime.strptime(str(s), fmt)
             except Exception:
@@ -4069,7 +4069,7 @@ def _iv_rank(ticker, r=0.045):
     spot_by = {str(d): float(c) for d, c in zip(sd["trade_date"], sd["close"])}
 
     def _pd_(x):
-        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
             try:
                 return datetime.strptime(str(x), fmt)
             except Exception:
@@ -4159,7 +4159,7 @@ def _roll_suggestion(conn, leg):
         # target expiry: nearest with 25-45 DTE (further out than the current leg)
         exps = {}
         for _, rr in ch.iterrows():
-            for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+            for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
                 try:
                     ed = datetime.strptime(str(rr["expiry_date"]), fmt); break
                 except Exception:
@@ -11766,7 +11766,7 @@ Real edge comes from discipline and filters — not a higher strike.
                     _spots[_tk] = float(_sp[0]) if _sp else None
                 _spot_v = _spots[_tk]
                 _dte = None
-                for _fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+                for _fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
                     try:
                         _dte = (datetime.strptime(str(_r["expiry"]), _fmt) - datetime.now()).days
                         break
@@ -12747,11 +12747,20 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             except Exception:
                 return None
 
-        def _gp_to_mdy(s):
-            for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
-                try: return datetime.strptime(str(s), fmt).strftime("%Y-%m-%d")
+        # DB stores dates ISO (YYYY-MM-DD); accept US formats too so a hand-entered trade date
+        # never silently drops the position. Always normalize to ISO for DB lookups.
+        _DATE_FMTS = ("%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%b-%Y", "%d-%b-%y")
+
+        def _gp_parse_date(s):
+            _s = str(s).strip().split()[0] if str(s).strip() else ""
+            for fmt in _DATE_FMTS:
+                try: return datetime.strptime(_s, fmt).date()
                 except Exception: pass
             return None
+
+        def _gp_to_mdy(s):
+            d = _gp_parse_date(s)
+            return d.strftime("%Y-%m-%d") if d else None
 
         def _gp_premium(tk, K, exp_mdy, typ):
             col = "lastPrice_Call_now" if typ == "call" else "lastPrice_Put_now"
@@ -12777,19 +12786,15 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _exp = str(_t["expiry"])
             _exp_mdy = _gp_to_mdy(_exp)
             _eod_spot = _gp_spot(_tk)
-            _dte = None
-            for _fmt in ("%Y-%m-%d", "%Y-%m-%d"):
-                try:
-                    # date-only diff: an option expiring tomorrow is 1 DTE all day, not 0 in the afternoon
-                    _dte = (datetime.strptime(_exp, _fmt).date() - datetime.now().date()).days; break
-                except Exception:
-                    pass
+            # date-only diff: an option expiring tomorrow is 1 DTE all day, not 0 in the afternoon
+            _exp_date = _gp_parse_date(_exp)
+            _dte = (_exp_date - datetime.now().date()).days if _exp_date else None
             if _eod_spot is None or _dte is None or _K <= 0 or _qty == 0:
                 continue
             _T = max(_dte, 0) / 365.0
             _entry = float(_t["entry_price"] or 0)
             _prem = _gp_premium(_tk, _K, _exp_mdy, _typ)
-            # IV back-solved from the EOD premium at the EOD spot (stable anchor)
+            # IV back-solved from the EOD premium at the EOD spot (stable anchor; refined to live below)
             _iv = _implied_vol(_prem, _eod_spot, _K, _T, _R, _typ) if (_prem and _T > 0) else (float(_t["entry_iv"] or 0) or 0.30)
             # AH-aware spot: when toggle on, analyze at the after-hours / pre-market price
             _ahd = _get_ah_price(_tk) if _gp_use_ah else None
@@ -12797,9 +12802,29 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _spot = _ahd["spot_ah"] if _ah_on else _eod_spot
             if _ah_on and not any(n.startswith(_tk + " ") for n in _ah_notes):
                 _ah_notes.append(f"{_tk} {_ahd['label']} ${_ahd['spot_ah']:.2f} ({_ahd['ah_chg_pct']:+.1f}% vs EOD ${_eod_spot:.2f})")
-            _g = bs_greeks(_spot, _K, _T, _R, _iv, _typ) if _T > 0 else {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "price": (_prem or _entry)}
-            # current value: AH-repriced via BS when AH on, else EOD market premium
-            _cur = _g.get("price", _prem or _entry) if _ah_on else (_prem if _prem else _g.get("price", _entry))
+            # Live market mid + IV (yfinance bid/ask). When the market is open this is the REAL option
+            # quote — use it for "Now" AND re-anchor IV to it so the Greeks, Est Open and Day L–H range
+            # stay consistent with the live price instead of drifting off a stale EOD premium.
+            _live_mid = _live_iv = None
+            if _gp_use_ah and _T > 0 and _exp_mdy:
+                _live_mid, _live_iv = _fetch_option_mid(_tk, _exp_mdy, _K, _typ)
+            # Only refine IV from the live quote when there's a REAL market mid (bid & ask both live).
+            # After hours _fetch_option_mid returns mid=None yet yfinance still reports a stale/low
+            # impliedVolatility — trusting it would wrongly reprice OTM legs to ~$0. Keep the stable
+            # DB-solved IV in that case so Est Open / Day-range stay correct.
+            if _live_mid and _live_mid > 0:
+                if _live_iv and _live_iv > 0.02:
+                    _iv = _live_iv
+                elif _T > 0:
+                    _iv = _implied_vol(_live_mid, _spot, _K, _T, _R, _typ) or _iv
+            _g = bs_greeks(_spot, _K, _T, _R, _iv, _typ) if _T > 0 else {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "price": (_live_mid or _prem or _entry)}
+            # current value ("Now"): real live mid → AH-repriced BS → EOD DB last price.
+            if _live_mid and _live_mid > 0:
+                _cur = _live_mid
+            elif _ah_on:
+                _cur = _g.get("price", _prem or _entry)
+            else:
+                _cur = _prem if _prem else _g.get("price", _entry)
             _m = _qty * 100                                   # signed contract multiplier
             _side = "short" if _qty < 0 else "long"
             _be = (_K + _entry) if _typ == "call" else (_K - _entry)   # long breakeven ref
@@ -13014,7 +13039,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
         st.session_state["_live_tickers"] = list(_by_tk)
 
         _gp_layout = st.radio(
-            "Layout", ["📊 By stock", "📋 All positions (one table)"],
+            "Layout", ["📋 All positions (one table)", "📊 By stock"],
             horizontal=True, key="gp_layout", label_visibility="collapsed")
 
         if _gp_layout.startswith("📋"):
@@ -13038,9 +13063,13 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     # next-session economics (est open, 1σ day range, fill-limit to close)
                     _fTn = max(l["dte"], 0) / 365.0
                     _fsig = l["spot"] * l["iv"] * (1 / 252.0) ** 0.5
+                    _fbase = bs_greeks(l["spot"], l["K"], _fTn, _R, l["iv"], l["typ"])["price"]
                     _fvu = bs_greeks(l["spot"] + _fsig, l["K"], _fTn, _R, l["iv"], l["typ"])["price"]
                     _fvd = bs_greeks(max(l["spot"] - _fsig, 0.01), l["K"], _fTn, _R, l["iv"], l["typ"])["price"]
-                    _folo, _fohi = min(_fvu, _fvd), max(_fvu, _fvd)
+                    # anchor the modeled ±1σ swing to the real current price ("Now") so the range
+                    # always brackets it, instead of floating around a pure-model base.
+                    _folo = max(l["cur"] + min(_fvu, _fvd) - _fbase, 0.01)
+                    _fohi = max(l["cur"] + max(_fvu, _fvd) - _fbase, _folo)
                     _ftopen = bs_greeks(l["spot"], l["K"], max(l["dte"] - 1, 0) / 365.0, _R, l["iv"], l["typ"])["price"]
                     _ftopen_disp = ("expired" if l["dte"] < 0 else "exp today" if l["dte"] == 0 else
                                     "~$0.00" if _ftopen < 0.005 else f"${_ftopen:.2f}")
@@ -13096,7 +13125,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                              "P&L $": st.column_config.NumberColumn(format="$%d")})
             _ftot = sum(r["P&L $"] for r in _flat)
             st.caption(f"All **{len(_flat)}** legs across **{len(_by_tk)}** tickers · total open "
-                       f"P&L **${_ftot:,.0f}**.  **Est Open** = value after 1 day decay (*expired*=0DTE, "
+                       f"P&L **${_ftot:,.0f}**.  **Now** = live option mid (bid/ask) when the market's "
+                       "open, else the last close.  **Est Open** = value after 1 day decay (*expired*=0DTE, "
                        "*~\\$0.00*=deep-OTM) · **Day L–H** = 1σ daily range · **Close @** = marketable limit "
                        "to close. Switch to *By stock* for levels, signals, scenarios & deep analysis.")
             st.markdown("---")
@@ -13501,9 +13531,13 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     # next-session economics: est. open, expected day range (1σ), fill-limit to close
                     _Tn = max(l["dte"], 0) / 365.0
                     _sig = l["spot"] * l["iv"] * (1 / 252.0) ** 0.5
+                    _base = bs_greeks(l["spot"], l["K"], _Tn, _R, l["iv"], l["typ"])["price"]
                     _vu = bs_greeks(l["spot"] + _sig, l["K"], _Tn, _R, l["iv"], l["typ"])["price"]
                     _vd = bs_greeks(max(l["spot"] - _sig, 0.01), l["K"], _Tn, _R, l["iv"], l["typ"])["price"]
-                    _olo, _ohi = min(_vu, _vd), max(_vu, _vd)
+                    # anchor the modeled ±1σ swing to the real current price ("Now") so the range
+                    # always brackets it, instead of floating around a pure-model base.
+                    _olo = max(l["cur"] + min(_vu, _vd) - _base, 0.01)
+                    _ohi = max(l["cur"] + max(_vu, _vd) - _base, _olo)
                     _topen = bs_greeks(l["spot"], l["K"], max(l["dte"] - 1, 0) / 365.0, _R, l["iv"], l["typ"])["price"]
                     # label clearly: <0 truly expired; 0 = expires today; sub-penny reads "~0"
                     if l["dte"] < 0:
@@ -13528,7 +13562,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     })
                 st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True,
                              column_config={"P&L %": st.column_config.NumberColumn(format="%d%%")})
-                st.caption("**Est Open** = modeled value at the next session if price is flat (one day of "
+                st.caption("**Now** = live option mid (bid/ask) when the market's open, else the last "
+                           "close. **Est Open** = modeled value at the next session if price is flat (one day of "
                            "decay). *expired* = 0DTE; *~\\$0.00* = deep-OTM. **Day L–H** = 1σ daily range. "
                            "**Close @** = marketable limit to close. **Max P / Max L** = theoretical "
                            "max profit / loss for that leg held to expiry (*Unlimited* = uncapped).")
@@ -18247,7 +18282,7 @@ def _smartmoney_screen():
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     def _dte(e):
-        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
             try:
                 return (_dt.datetime.strptime(str(e), fmt).date() - _dt.date.today()).days
             except Exception:

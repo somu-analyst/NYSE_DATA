@@ -15221,7 +15221,7 @@ def _opex_spot(conn, ticker):
     return 0.0
 
 def _opex_parse_date(s):
-    for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
         try:
             return datetime.strptime(str(s), fmt).date()
         except ValueError:
@@ -15677,7 +15677,7 @@ def _iv_rank(conn, tk):
             spot_by = {str(d): float(x) for d, x in zip(sd["trade_date"], sd["close"])}
 
             def _pdt(x):
-                for f in ("%Y-%m-%d", "%Y-%m-%d"):
+                for f in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
                     try:
                         return datetime.strptime(str(x), f)
                     except Exception:
@@ -15828,7 +15828,7 @@ def _plan_oi_flow(conn, tk, spot):
         pass
 
     def _ek(s):
-        for f in ("%Y-%m-%d", "%Y-%m-%d"):
+        for f in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
             try:
                 return datetime.strptime(str(s), f)
             except Exception:
@@ -16120,7 +16120,7 @@ def _next_day_plan(conn):
             typ = "call" if str(t["option_type"]).lower().startswith("c") else "put"
             K = float(t["strike"] or 0); qty = int(t["quantity"] or 0); exp = str(t["expiry"])
             dte = None
-            for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+            for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
                 try:
                     dte = (datetime.strptime(exp, fmt) - datetime.now()).days; break
                 except Exception:
@@ -17199,7 +17199,7 @@ def _plan_legs_for(conn, tk):
         typ = "call" if str(t["option_type"]).lower().startswith("c") else "put"
         K = float(t["strike"] or 0); qty = int(t["quantity"] or 0); exp = str(t["expiry"])
         dte = None
-        for fmt in ("%Y-%m-%d", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
             try:
                 dte = (datetime.strptime(exp, fmt) - datetime.now()).days; break
             except Exception:
@@ -17973,7 +17973,7 @@ def _fmt_squeeze_inline(sq):
 
 
 def _to_mdy(s):
-    for f in ("%Y-%m-%d", "%Y-%m-%d"):
+    for f in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
         try:
             return datetime.strptime(str(s)[:10], f).strftime("%Y-%m-%d")
         except ValueError:
