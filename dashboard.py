@@ -12762,6 +12762,23 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             d = _gp_parse_date(s)
             return d.strftime("%Y-%m-%d") if d else None
 
+        def _gp_ohlc(tk, K, exp_mdy, typ):
+            """(prev_close, day_high, day_low) for the option leg from the latest EOD row."""
+            p = "call" if typ == "call" else "put"
+            try:
+                r = pd.read_sql(
+                    f"SELECT {p}_close_now AS c, {p}_high_now AS h, {p}_low_now AS lo "
+                    "FROM options_change WHERE UPPER(ticker)=? AND strike=? AND expiry_date=? "
+                    "ORDER BY trade_date_now DESC LIMIT 1",
+                    _gp_conn, params=(tk.upper(), float(K), exp_mdy))
+                if not r.empty:
+                    row = r.iloc[0]
+                    g = lambda v: float(v) if v is not None and float(v) > 0 else None
+                    return g(row["c"]), g(row["h"]), g(row["lo"])
+            except Exception:
+                pass
+            return None, None, None
+
         def _gp_premium(tk, K, exp_mdy, typ):
             col = "lastPrice_Call_now" if typ == "call" else "lastPrice_Put_now"
             try:
@@ -12794,6 +12811,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _T = max(_dte, 0) / 365.0
             _entry = float(_t["entry_price"] or 0)
             _prem = _gp_premium(_tk, _K, _exp_mdy, _typ)
+            _prev_cls, _day_hi, _day_lo = _gp_ohlc(_tk, _K, _exp_mdy, _typ)
             # IV back-solved from the EOD premium at the EOD spot (stable anchor; refined to live below)
             _iv = _implied_vol(_prem, _eod_spot, _K, _T, _R, _typ) if (_prem and _T > 0) else (float(_t["entry_iv"] or 0) or 0.30)
             # AH-aware spot: when toggle on, analyze at the after-hours / pre-market price
@@ -12832,6 +12850,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                 "ticker": _tk, "typ": _typ, "K": _K, "qty": _qty, "side": _side,
                 "exp": _exp, "exp_mdy": _exp_mdy, "dte": _dte, "spot": _spot, "eod_spot": _eod_spot,
                 "iv": _iv, "entry": _entry, "cur": _cur, "g": _g, "m": _m, "be": _be,
+                "prev_close": _prev_cls, "day_hi": _day_hi, "day_lo": _day_lo,
                 "pnl": (_cur - _entry) * _m,
                 "pos_delta": _g["delta"] * _m, "pos_theta": _g["theta"] * _m,
                 "pos_vega": _g["vega"] * _m, "pos_gamma": _g["gamma"] * _m,
@@ -13082,6 +13101,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${_kf(l['K'])}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": _fm,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
+                        "Prev Cls": (round(l["prev_close"], 2) if l.get("prev_close") else None),
+                        "Hi/Lo": (f"${l['day_hi']:.2f}/${l['day_lo']:.2f}" if l.get("day_hi") and l.get("day_lo") else "—"),
                         "Est Open": _ftopen_disp, "Day L–H": f"${_folo:.2f}–${_fohi:.2f}",
                         "Close @": _fclimit, "Max P": _fmt_maxp(_flb), "Max L": _fmt_maxl(_flb),
                         "P&L %": round(_fpp), "P&L $": round(l["pnl"]), "Action": _faction,
@@ -13126,7 +13147,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
             _ftot = sum(r["P&L $"] for r in _flat)
             st.caption(f"All **{len(_flat)}** legs across **{len(_by_tk)}** tickers · total open "
                        f"P&L **${_ftot:,.0f}**.  **Now** = live option mid (bid/ask) when the market's "
-                       "open, else the last close.  **Est Open** = value after 1 day decay (*expired*=0DTE, "
+                       "open, else the last close.  **Prev Cls** = prior session close · **Hi/Lo** = that "
+                       "day's option high/low.  **Est Open** = value after 1 day decay (*expired*=0DTE, "
                        "*~\\$0.00*=deep-OTM) · **Day L–H** = 1σ daily range · **Close @** = marketable limit "
                        "to close. Switch to *By stock* for levels, signals, scenarios & deep analysis.")
             st.markdown("---")
@@ -13556,6 +13578,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${_kf(l['K'])}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": money,
                         "Entry": round(l["entry"], 2), "Now": round(l["cur"], 2),
+                        "Prev Cls": (round(l["prev_close"], 2) if l.get("prev_close") else None),
+                        "Hi/Lo": (f"${l['day_hi']:.2f}/${l['day_lo']:.2f}" if l.get("day_hi") and l.get("day_lo") else "—"),
                         "Est Open": _topen_disp, "Day L–H": f"${_olo:.2f}–${_ohi:.2f}",
                         "Close @": _climit, "Max P": _fmt_maxp(_lb), "Max L": _fmt_maxl(_lb),
                         "P&L %": round(pnl_pct), "P&L $": round(l["pnl"]), "Action": action,
