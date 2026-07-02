@@ -13097,7 +13097,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                                 else f"BUY ≥ ${l['cur'] + _fbuf:.2f}")
                     _flb = _combo_bounds([l], l["spot"])
                     _fpa = _pos_analytics([l], l["spot"])
-                    _fwin = f"{_fpa['pop']:.0f}%" if _fpa else "—"
+                    _fwin = (f"{'🟢' if _fpa['pop'] >= 60 else '🟡' if _fpa['pop'] >= 40 else '🔴'} "
+                             f"{_fpa['pop']:.0f}%") if _fpa else "—"
                     _flat.append({
                         "Ticker": _ftk, "Spot": round(l["spot"], 2),
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${_kf(l['K'])}{l['typ'][0].upper()}",
@@ -13152,7 +13153,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                        "open, else the last close.  **Prev Cls** = prior session close · **Hi/Lo** = that "
                        "day's option high/low.  **Est Open** = value after 1 day decay (*expired*=0DTE, "
                        "*~\\$0.00*=deep-OTM) · **Day L–H** = 1σ daily range · **Close @** = marketable limit "
-                       "to close. Switch to *By stock* for levels, signals, scenarios & deep analysis.")
+                       "to close · **Win %** = P(profit from entry) 🟢≥60 🟡40–60 🔴<40. "
+                       "Switch to *By stock* for levels, signals, scenarios & deep analysis.")
             st.markdown("---")
             st.caption("📖 Full per-stock analysis (levels · signals · sentiment · scenarios · deep "
                        "analysis) for **every** position follows below.")
@@ -13577,7 +13579,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                                else f"BUY ≥ ${l['cur'] + _buf:.2f}")
                     _lb = _combo_bounds([l], l["spot"])
                     _pa = _pos_analytics([l], l["spot"])
-                    _win = f"{_pa['pop']:.0f}%" if _pa else "—"
+                    _win = (f"{'🟢' if _pa['pop'] >= 60 else '🟡' if _pa['pop'] >= 40 else '🔴'} "
+                            f"{_pa['pop']:.0f}%") if _pa else "—"
                     _rows.append({
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${_kf(l['K'])}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": money,
