@@ -13096,6 +13096,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _fclimit = (f"SELL ≤ ${max(l['cur'] - _fbuf, 0.01):.2f}" if l["side"] == "long"
                                 else f"BUY ≥ ${l['cur'] + _fbuf:.2f}")
                     _flb = _combo_bounds([l], l["spot"])
+                    _fpa = _pos_analytics([l], l["spot"])
+                    _fwin = f"{_fpa['pop']:.0f}%" if _fpa else "—"
                     _flat.append({
                         "Ticker": _ftk, "Spot": round(l["spot"], 2),
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${_kf(l['K'])}{l['typ'][0].upper()}",
@@ -13104,7 +13106,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         "Prev Cls": (round(l["prev_close"], 2) if l.get("prev_close") else None),
                         "Est Open": _ftopen_disp, "Day L–H": f"${_folo:.2f}–${_fohi:.2f}",
                         "Hi/Lo": (f"${l['day_hi']:.2f}/${l['day_lo']:.2f}" if l.get("day_hi") and l.get("day_lo") else "—"),
-                        "Close @": _fclimit, "Max P": _fmt_maxp(_flb), "Max L": _fmt_maxl(_flb),
+                        "Close @": _fclimit, "Max P": _fmt_maxp(_flb), "Max L": _fmt_maxl(_flb), "Win %": _fwin,
                         "P&L %": round(_fpp), "P&L $": round(l["pnl"]), "Action": _faction,
                     })
             # ── ticker + portfolio summary (max P/L, P&L, POP, EV) ──
@@ -13574,6 +13576,8 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                     _climit = (f"SELL ≤ ${max(l['cur'] - _buf, 0.01):.2f}" if l["side"] == "long"
                                else f"BUY ≥ ${l['cur'] + _buf:.2f}")
                     _lb = _combo_bounds([l], l["spot"])
+                    _pa = _pos_analytics([l], l["spot"])
+                    _win = f"{_pa['pop']:.0f}%" if _pa else "—"
                     _rows.append({
                         "Leg": f"{l['side']} {abs(l['qty'])}× ${_kf(l['K'])}{l['typ'][0].upper()}",
                         "Exp": l["exp"][:10], "DTE": l["dte"], "Money": money,
@@ -13581,7 +13585,7 @@ Positive = portfolio is net profitable. Negative = review which legs to cut firs
                         "Prev Cls": (round(l["prev_close"], 2) if l.get("prev_close") else None),
                         "Est Open": _topen_disp, "Day L–H": f"${_olo:.2f}–${_ohi:.2f}",
                         "Hi/Lo": (f"${l['day_hi']:.2f}/${l['day_lo']:.2f}" if l.get("day_hi") and l.get("day_lo") else "—"),
-                        "Close @": _climit, "Max P": _fmt_maxp(_lb), "Max L": _fmt_maxl(_lb),
+                        "Close @": _climit, "Max P": _fmt_maxp(_lb), "Max L": _fmt_maxl(_lb), "Win %": _win,
                         "P&L %": round(pnl_pct), "P&L $": round(l["pnl"]), "Action": action,
                     })
                 st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True,
